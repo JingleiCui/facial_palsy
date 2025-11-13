@@ -1,17 +1,17 @@
 """
 动作模块 - 自动注册所有动作类
 """
-from neutral_face import NeutralFaceAction
-from spontaneous_eye_blink import SpontaneousEyeBlinkAction
-from voluntary_eye_blink import VoluntaryEyeBlinkAction
-from close_eye_softly import CloseEyeSoftlyAction
-from close_eye_hardly import CloseEyeHardlyAction
-from raise_eyebrow import RaiseEyebrowAction
-from smile import SmileAction
-from shrug_nose import ShrugNoseAction
-from show_teeth import ShowTeethAction
-from blow_cheek import BlowCheekAction
-from lip_pucker import LipPuckerAction
+from .neutral_face import NeutralFaceAction
+from .spontaneous_eye_blink import SpontaneousEyeBlinkAction
+from .voluntary_eye_blink import VoluntaryEyeBlinkAction
+from .close_eye_softly import CloseEyeSoftlyAction
+from .close_eye_hardly import CloseEyeHardlyAction
+from .raise_eyebrow import RaiseEyebrowAction
+from .smile import SmileAction
+from .shrug_nose import ShrugNoseAction
+from .show_teeth import ShowTeethAction
+from .blow_cheek import BlowCheekAction
+from .lip_pucker import LipPuckerAction
 
 # 动作注册表：动作名 -> 动作类
 ACTION_REGISTRY = {
