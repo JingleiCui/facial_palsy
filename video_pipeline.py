@@ -11,8 +11,6 @@ from pathlib import Path
 from datetime import datetime
 import sys
 
-# 添加项目路径
-sys.path.append('/mnt/project')
 
 from core.landmark_extractor import LandmarkExtractor
 from action_feature_integrator import ActionFeatureIntegrator
@@ -31,9 +29,9 @@ from actions.blow_cheek import BlowCheekAction
 from actions.lip_pucker import LipPuckerAction
 
 
-class VideoPipelineV2:
+class VideoPipeline:
     """
-    视频处理Pipeline V2
+    视频处理Pipeline
 
     关键改进:
     1. 使用现有的动作类(actions/*.py)
@@ -469,34 +467,36 @@ class VideoPipelineV2:
 
 
 def main():
-    """主函数"""
-    import argparse
+    """主函数：方便在 PyCharm 里一键运行"""
 
-    parser = argparse.ArgumentParser(description='视频处理Pipeline V2')
-    parser.add_argument('--db', type=str, default='facialPalsy_old.db',
-                        help='数据库路径')
-    parser.add_argument('--keyframe-dir', type=str,
-                        default='/Users/cuijinglei/Documents/facialPalsy_old/pipeline/keyframes',
-                        help='关键帧保存目录')
-    parser.add_argument('--examination-id', type=str, default=None,
-                        help='处理指定的examination')
-    parser.add_argument('--video-id', type=int, default=None,
-                        help='处理单个视频')
-    parser.add_argument('--batch', action='store_true',
-                        help='批量处理所有examinations')
+    # 1️⃣ 基本路径配置 —— 按实际路径改，不用命令行了
+    db_path = 'facialPalsy.db'
+    keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes'
 
-    args = parser.parse_args()
+    # 2️⃣ 选择运行模式（**只需要改这里几行变量**）
+    # 说明：
+    #   - 如果只想处理某一个 examination：把 examination_id 改成具体 ID（例如 'XW000001_20240101'）
+    #   - 如果只想处理某个视频：把 video_id 改成具体 video_id（整数），比如 123
+    #   - 如果想批量处理所有未处理的 examinations：保持 run_batch = True 即可
+    examination_id = None   # 例如：'XW000001_20240101'，默认 None
+    video_id = None         # 例如：123，默认 None
+    run_batch = True        # 默认批量处理所有未处理的 examinations
 
-    pipeline = VideoPipelineV2(args.db, args.keyframe_dir)
+    # 3️⃣ 初始化 Pipeline
+    pipeline = VideoPipeline(db_path, keyframe_dir)
 
-    if args.examination_id:
-        pipeline.process_examination(args.examination_id)
-    elif args.video_id:
-        pipeline.process_video(args.video_id)
-    elif args.batch:
+    # 4️⃣ 根据上面配置决定怎么跑
+    if examination_id is not None:
+        # 处理一个完整的检查（推荐，因为会先用 NeutralFace 做对比）
+        pipeline.process_examination(examination_id)
+    elif video_id is not None:
+        # 只处理单个视频（不会自动处理同一个检查下的其他动作）
+        pipeline.process_video(video_id)
+    elif run_batch:
+        # 批量处理所有未处理的 examinations
         pipeline.process_all_examinations()
     else:
-        print("请指定 --examination-id, --video-id 或 --batch")
+        print("当前没有配置任何处理任务，请在 main() 中设置 examination_id / video_id 或 run_batch = True")
 
 
 if __name__ == '__main__':
