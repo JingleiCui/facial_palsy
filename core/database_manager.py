@@ -1,35 +1,32 @@
 """
-pn“¡h - €„pn“Í\¥ã
+
 """
 import sqlite3
 
 
 class DatabaseManager:
-    """pn“¡h"""
 
     def __init__(self, db_path):
         """
-        Ë
 
         Args:
-            db_path: pn“ï„
+            db_path:
         """
         self.db_path = db_path
 
     def get_connection(self):
-        """·Öpn“Þ¥"""
+
         return sqlite3.connect(self.db_path)
 
     def execute_query(self, query, params=None):
         """
-        gLåâ
 
         Args:
-            query: SQLåâíå
-            params: Âp
+            query: SQL
+            params:
 
         Returns:
-            list: åâÓœ
+            list:
         """
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -46,14 +43,14 @@ class DatabaseManager:
 
     def execute_update(self, query, params=None):
         """
-        gLô°
+        gL
 
         Args:
-            query: SQLô°íå
-            params: Âp
+            query: SQL
+            params:
 
         Returns:
-            int: ×qÍ„Lp
+            int:
         """
         conn = self.get_connection()
         cursor = conn.cursor()

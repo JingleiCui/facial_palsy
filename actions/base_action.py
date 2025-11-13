@@ -9,7 +9,7 @@ from facialPalsy.core.geometry_utils import *
 class BaseAction(ABC):
     """动作基类"""
 
-    def __init__(self, action_name, action_config):
+    def __init__(self, action_name=None, action_config=None):
         """
         初始化
 
@@ -17,7 +17,25 @@ class BaseAction(ABC):
             action_name: 动作名称（英文）
             action_config: 动作配置字典
         """
-        self.action_name = action_name
+        # 1) 自动推一个英文名: NeutralFaceAction -> "NeutralFace"
+        if action_name is None:
+            cls_name = self.__class__.__name__
+            if cls_name.endswith("Action"):
+                action_name = cls_name[:-6]
+            self.action_name = action_name
+        else:
+            self.action_name = action_name
+
+        # 2) 如果没提供配置，就给一个兜底配置
+        if action_config is None:
+            action_config = {
+                # 你现在 pipeline 又不用 BaseAction.action_id，
+                # 所以先给 None 占位即可
+                "action_id": None,
+                # 中文名先用英文名占位，将来要的话再从 config 表里读
+                "name_cn": self.action_name,
+            }
+
         self.action_config = action_config
         self.action_id = action_config['action_id']
         self.name_cn = action_config['name_cn']

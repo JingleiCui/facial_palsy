@@ -3,7 +3,7 @@
 """
 import numpy as np
 from geometry_utils import *
-from config import STATIC_FEATURE_DIM, DYNAMIC_FEATURE_DIM
+from ..config import STATIC_FEATURE_DIM, DYNAMIC_FEATURE_DIM
 
 
 class FeatureExtractor:
