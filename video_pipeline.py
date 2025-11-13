@@ -47,7 +47,7 @@ class VideoPipeline:
     4. 支持动作特异性特征
     """
 
-    def __init__(self, db_path, keyframe_root_dir):
+    def __init__(self, db_path, model_path, keyframe_root_dir):
         """
         Args:
             db_path: 数据库路径
@@ -58,7 +58,7 @@ class VideoPipeline:
         self.keyframe_root_dir.mkdir(parents=True, exist_ok=True)
 
         # 初始化landmark提取器
-        self.landmark_extractor = LandmarkExtractor()
+        self.landmark_extractor = LandmarkExtractor(model_path)
 
         # 初始化特征整合器
         self.feature_integrator = ActionFeatureIntegrator()
@@ -478,6 +478,7 @@ def main():
 
     # 1️⃣ 基本路径配置 —— 按实际路径改，不用命令行了
     db_path = 'facialPalsy.db'
+    model_path = '/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task'
     keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes'
 
     # 2️⃣ 选择运行模式（**只需要改这里几行变量**）
@@ -490,7 +491,7 @@ def main():
     run_batch = True        # 默认批量处理所有未处理的 examinations
 
     # 3️⃣ 初始化 Pipeline
-    pipeline = VideoPipeline(db_path, keyframe_dir)
+    pipeline = VideoPipeline(db_path, model_path, keyframe_dir)
 
     # 4️⃣ 根据上面配置决定怎么跑
     if examination_id is not None:

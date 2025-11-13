@@ -3,7 +3,7 @@
 峰值帧检测逻辑: 检测眼睛开合度最小的帧
 """
 import numpy as np
-from base_action import BaseAction
+from .base_action import BaseAction
 from ..core.geometry_utils import *
 
 
