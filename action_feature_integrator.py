@@ -3,21 +3,19 @@
 将动作特定的原始指标转换为统一的特征向量
 """
 import numpy as np
-import sys
-
 
 # 导入所有动作类
-from actions.neutral_face import NeutralFaceAction
-from actions.spontaneous_eye_blink import SpontaneousEyeBlinkAction
-from actions.voluntary_eye_blink import VoluntaryEyeBlinkAction
-from actions.close_eye_softly import CloseEyeSoftlyAction
-from actions.close_eye_hardly import CloseEyeHardlyAction
-from actions.raise_eyebrow import RaiseEyebrowAction
-from actions.smile import SmileAction
-from actions.shrug_nose import ShrugNoseAction
-from actions.show_teeth import ShowTeethAction
-from actions.blow_cheek import BlowCheekAction
-from actions.lip_pucker import LipPuckerAction
+from facialPalsy.actions.neutral_face import NeutralFaceAction
+from facialPalsy.actions.spontaneous_eye_blink import SpontaneousEyeBlinkAction
+from facialPalsy.actions.voluntary_eye_blink import VoluntaryEyeBlinkAction
+from facialPalsy.actions.close_eye_softly import CloseEyeSoftlyAction
+from facialPalsy.actions.close_eye_hardly import CloseEyeHardlyAction
+from facialPalsy.actions.raise_eyebrow import RaiseEyebrowAction
+from facialPalsy.actions.smile import SmileAction
+from facialPalsy.actions.shrug_nose import ShrugNoseAction
+from facialPalsy.actions.show_teeth import ShowTeethAction
+from facialPalsy.actions.blow_cheek import BlowCheekAction
+from facialPalsy.actions.lip_pucker import LipPuckerAction
 
 
 class ActionFeatureIntegrator:

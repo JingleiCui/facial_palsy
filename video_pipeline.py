@@ -3,30 +3,37 @@
 保留每个动作的特定特征,不强制统一维度
 """
 import os
+import sys
+from pathlib import Path
+
+# 添加项目根目录到 Python 路径
+# 这样可以直接运行 video_pipeline.py,同时支持相对导入
+current_dir = Path(__file__).resolve().parent
+parent_dir = current_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
+
 import cv2
 import numpy as np
 import sqlite3
 import json
-from pathlib import Path
 from datetime import datetime
-import sys
 
-
-from core.landmark_extractor import LandmarkExtractor
-from action_feature_integrator import ActionFeatureIntegrator
+from facialPalsy.core.landmark_extractor import LandmarkExtractor
+from facialPalsy.action_feature_integrator import ActionFeatureIntegrator
 
 # 导入动作类
-from actions.neutral_face import NeutralFaceAction
-from actions.spontaneous_eye_blink import SpontaneousEyeBlinkAction
-from actions.voluntary_eye_blink import VoluntaryEyeBlinkAction
-from actions.close_eye_softly import CloseEyeSoftlyAction
-from actions.close_eye_hardly import CloseEyeHardlyAction
-from actions.raise_eyebrow import RaiseEyebrowAction
-from actions.smile import SmileAction
-from actions.shrug_nose import ShrugNoseAction
-from actions.show_teeth import ShowTeethAction
-from actions.blow_cheek import BlowCheekAction
-from actions.lip_pucker import LipPuckerAction
+from facialPalsy.actions.neutral_face import NeutralFaceAction
+from facialPalsy.actions.spontaneous_eye_blink import SpontaneousEyeBlinkAction
+from facialPalsy.actions.voluntary_eye_blink import VoluntaryEyeBlinkAction
+from facialPalsy.actions.close_eye_softly import CloseEyeSoftlyAction
+from facialPalsy.actions.close_eye_hardly import CloseEyeHardlyAction
+from facialPalsy.actions.raise_eyebrow import RaiseEyebrowAction
+from facialPalsy.actions.smile import SmileAction
+from facialPalsy.actions.shrug_nose import ShrugNoseAction
+from facialPalsy.actions.show_teeth import ShowTeethAction
+from facialPalsy.actions.blow_cheek import BlowCheekAction
+from facialPalsy.actions.lip_pucker import LipPuckerAction
 
 
 class VideoPipeline:

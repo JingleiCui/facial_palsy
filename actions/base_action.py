@@ -3,7 +3,7 @@
 """
 from abc import ABC, abstractmethod
 import numpy as np
-from ..core.geometry_utils import *
+from facialPalsy.core.geometry_utils import *
 
 
 class BaseAction(ABC):
