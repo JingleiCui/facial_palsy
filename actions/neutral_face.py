@@ -49,7 +49,7 @@ class NeutralFaceAction(BaseAction):
         most_stable_idx = np.argmin(stabilities) + 1
         return middle_indices[most_stable_idx]
 
-    def extract_indicators(self, landmarks, w, h):
+    def extract_indicators(self, landmarks, w, h, neutral_indicators=None):
         """
         提取静息状态的一级指标（原始像素值）
         这些指标将作为其他动作的基准

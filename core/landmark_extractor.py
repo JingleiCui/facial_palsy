@@ -41,6 +41,12 @@ class LandmarkExtractor:
         if self.landmarker:
             self.landmarker.close()
 
+    def _ensure_landmarker(self):
+        """确保 self.landmarker 已经初始化"""
+        if self.landmarker is None:
+            FaceLandmarker = mp.tasks.vision.FaceLandmarker
+            self.landmarker = FaceLandmarker.create_from_options(self.options)
+
     def extract_from_frame(self, frame):
         """
         从单帧图像提取关键点
@@ -52,7 +58,7 @@ class LandmarkExtractor:
             face_landmarks: MediaPipe landmarks对象，如果未检测到返回None
         """
         if self.landmarker is None:
-            raise RuntimeError("请使用 with 语句调用 LandmarkExtractor")
+            self._ensure_landmarker()
 
         # 转换为RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

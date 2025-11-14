@@ -313,7 +313,7 @@ def import_metadata(
                             INSERT INTO video_files (
                                 examination_id,
                                 action_id,
-                                video_file_path,
+                                file_path,
                                 relative_path,
                                 video_file_index,
                                 start_time_str,

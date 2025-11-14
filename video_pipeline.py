@@ -372,7 +372,7 @@ class VideoPipeline:
                 break
 
             # MediaPipe提取 - 返回2D landmarks对象
-            landmarks = self.landmark_extractor.extract(frame)
+            landmarks = self.landmark_extractor.extract_from_frame(frame)
 
             landmarks_seq.append(landmarks)
             frames_seq.append(frame)
@@ -411,12 +411,36 @@ class VideoPipeline:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # 将特征向量转为BLOB
-        feature_blob = feature_vector.tobytes()
+        # 先查出动作名称，方便和 action_key_indicators 对齐
+        video_info = self._get_video_info(video_id)
+        action_name = video_info['action_name_en']
 
-        # 将指标转为JSON
-        indicators_json = json.dumps(normalized_indicators)
-        dynamic_json = json.dumps(normalized_dynamic_features)
+        # 根据动作定义，把 dict 映射成有序的 static / dynamic 数组
+        key_indicators = self.feature_integrator.action_key_indicators.get(action_name, None)
+        if key_indicators is None:
+            # 理论上不会发生，如果发生就直接跳过存储，避免数据库写入垃圾
+            print(f"  [WARN] 未在 action_key_indicators 中找到 {action_name}，跳过入库")
+            return
+
+        static_names = key_indicators['static']
+        dynamic_names = key_indicators['dynamic']
+
+        # normalized_indicators / normalized_dynamic_features 都是 dict
+        # 这里按“预先定义好的顺序”取值，保证训练阶段能按相同顺序还原
+        static_vals = [
+            float(normalized_indicators.get(name, 0.0))
+            for name in static_names
+        ]
+        dynamic_vals = [
+            float(normalized_dynamic_features.get(name, 0.0))
+            for name in dynamic_names
+        ]
+
+        static_arr = np.array(static_vals, dtype=np.float32)
+        dynamic_arr = np.array(dynamic_vals, dtype=np.float32)
+
+        static_blob = static_arr.tobytes()
+        dynamic_blob = dynamic_arr.tobytes()
 
         try:
             cursor.execute("""
@@ -425,20 +449,16 @@ class VideoPipeline:
                     peak_frame_idx,
                     peak_frame_path,
                     unit_length,
-                    feature_vector,
-                    feature_dim,
-                    indicators_json,
-                    dynamic_features_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    static_features,
+                    dynamic_features
+                ) VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 video_id,
                 peak_frame_idx,
                 peak_frame_path,
                 unit_length,
-                feature_blob,
-                len(feature_vector),
-                indicators_json,
-                dynamic_json
+                static_blob,
+                dynamic_blob
             ))
 
             conn.commit()
@@ -450,20 +470,16 @@ class VideoPipeline:
                 SET peak_frame_idx = ?,
                     peak_frame_path = ?,
                     unit_length = ?,
-                    feature_vector = ?,
-                    feature_dim = ?,
-                    indicators_json = ?,
-                    dynamic_features_json = ?,
+                    static_features = ?,
+                    dynamic_features = ?,
                     processed_at = CURRENT_TIMESTAMP
                 WHERE video_id = ?
             """, (
                 peak_frame_idx,
                 peak_frame_path,
                 unit_length,
-                feature_blob,
-                len(feature_vector),
-                indicators_json,
-                dynamic_json,
+                static_blob,
+                dynamic_blob,
                 video_id
             ))
 

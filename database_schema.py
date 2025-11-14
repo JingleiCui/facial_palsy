@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS patients (
     notes TEXT                                -- 可选备注（不含隐私）
 );
 
-CREATE INDEX idx_patients_created ON patients(created_at);
+CREATE INDEX IF NOT EXISTS idx_patients_created ON patients(created_at);
 
 
 -- 1.2 检查表 (Examination = Session，一次完整的检测)
@@ -56,10 +56,10 @@ CREATE TABLE IF NOT EXISTS examinations (
     FOREIGN KEY (patient_id) REFERENCES patients(patient_id)
 );
 
-CREATE INDEX idx_exam_patient ON examinations(patient_id);
-CREATE INDEX idx_exam_datetime ON examinations(capture_datetime);
-CREATE INDEX idx_exam_has_labels ON examinations(has_labels);
-CREATE INDEX idx_exam_valid ON examinations(is_valid);
+CREATE INDEX IF NOT EXISTS idx_exam_patient ON examinations(patient_id);
+CREATE INDEX IF NOT EXISTS idx_exam_datetime ON examinations(capture_datetime);
+CREATE INDEX IF NOT EXISTS idx_exam_has_labels ON examinations(has_labels);
+CREATE INDEX IF NOT EXISTS idx_exam_valid ON examinations(is_valid);
 
 
 -- 1.3 动作类型映射表 (11个核心动作，已标准化)
@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS action_types (
 );
 
 -- 插入11个核心动作（名称已标准化，与JSON一致）
-INSERT INTO action_types (action_name_en, action_name_cn, display_order) VALUES
+INSERT OR IGNORE INTO action_types (action_name_en, action_name_cn, display_order) VALUES
 ('NeutralFace', '静息', 1),
 ('SpontaneousEyeBlink', '自然眨眼', 2),
 ('VoluntaryEyeBlink', '自主眨眼', 3),
@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS video_files (
     action_id INTEGER NOT NULL,
     
     -- 文件路径
-    video_file_path TEXT NOT NULL,            -- 完整绝对路径
+    file_path TEXT NOT NULL,            -- 完整绝对路径
     relative_path TEXT,                       -- 相对路径（相对于video_root_dir）
     
     -- 视频属性
@@ -119,9 +119,9 @@ CREATE TABLE IF NOT EXISTS video_files (
     FOREIGN KEY (action_id) REFERENCES action_types(action_id)
 );
 
-CREATE INDEX idx_video_exam ON video_files(examination_id);
-CREATE INDEX idx_video_action ON video_files(action_id);
-CREATE INDEX idx_video_exists ON video_files(file_exists);
+CREATE INDEX IF NOT EXISTS idx_video_exam ON video_files(examination_id);
+CREATE INDEX IF NOT EXISTS idx_video_action ON video_files(action_id);
+CREATE INDEX IF NOT EXISTS idx_video_exists ON video_files(file_exists);
 
 
 -- 2.2 帧文件表 (存储峰值帧等关键帧)
@@ -149,8 +149,8 @@ CREATE TABLE IF NOT EXISTS frame_files (
     FOREIGN KEY (video_id) REFERENCES video_files(video_id)
 );
 
-CREATE INDEX idx_frame_exam_action ON frame_files(examination_id, action_id);
-CREATE INDEX idx_frame_type ON frame_files(frame_type);
+CREATE INDEX IF NOT EXISTS idx_frame_exam_action ON frame_files(examination_id, action_id);
+CREATE INDEX IF NOT EXISTS idx_frame_type ON frame_files(frame_type);
 
 
 -- 2.3 特征文件表 (存储提取的特征)
@@ -179,8 +179,8 @@ CREATE TABLE IF NOT EXISTS feature_files (
     FOREIGN KEY (action_id) REFERENCES action_types(action_id)
 );
 
-CREATE INDEX idx_feature_exam_action ON feature_files(examination_id, action_id);
-CREATE INDEX idx_feature_type ON feature_files(feature_type);
+CREATE INDEX IF NOT EXISTS idx_feature_exam_action ON feature_files(examination_id, action_id);
+CREATE INDEX IF NOT EXISTS idx_feature_type ON feature_files(feature_type);
 
 
 -- ============================================================
@@ -215,8 +215,8 @@ CREATE TABLE IF NOT EXISTS examination_labels (
     FOREIGN KEY (examination_id) REFERENCES examinations(examination_id)
 );
 
-CREATE INDEX idx_exam_labels_has_palsy ON examination_labels(has_palsy);
-CREATE INDEX idx_exam_labels_hb ON examination_labels(hb_grade);
+CREATE INDEX IF NOT EXISTS idx_exam_labels_has_palsy ON examination_labels(has_palsy);
+CREATE INDEX IF NOT EXISTS idx_exam_labels_hb ON examination_labels(hb_grade);
 
 
 -- 3.2 动作级标签 (Action-Level Labels)
@@ -246,9 +246,9 @@ CREATE TABLE IF NOT EXISTS action_labels (
     FOREIGN KEY (action_id) REFERENCES action_types(action_id)
 );
 
-CREATE INDEX idx_action_labels_exam ON action_labels(examination_id);
-CREATE INDEX idx_action_labels_action ON action_labels(action_id);
-CREATE INDEX idx_action_labels_severity ON action_labels(severity_score);
+CREATE INDEX IF NOT EXISTS idx_action_labels_exam ON action_labels(examination_id);
+CREATE INDEX IF NOT EXISTS idx_action_labels_action ON action_labels(action_id);
+CREATE INDEX IF NOT EXISTS idx_action_labels_severity ON action_labels(severity_score);
 
 
 -- ============================================================
@@ -288,8 +288,8 @@ CREATE TABLE IF NOT EXISTS dataset_members (
     FOREIGN KEY (examination_id) REFERENCES examinations(examination_id)
 );
 
-CREATE INDEX idx_members_split ON dataset_members(split_id);
-CREATE INDEX idx_members_exam ON dataset_members(examination_id);
+CREATE INDEX IF NOT EXISTS idx_members_split ON dataset_members(split_id);
+CREATE INDEX IF NOT EXISTS idx_members_exam ON dataset_members(examination_id);
 
 
 -- ============================================================
@@ -326,8 +326,8 @@ CREATE TABLE IF NOT EXISTS examination_predictions (
     FOREIGN KEY (examination_id) REFERENCES examinations(examination_id)
 );
 
-CREATE INDEX idx_pred_exam ON examination_predictions(examination_id);
-CREATE INDEX idx_pred_model ON examination_predictions(model_name, model_version);
+CREATE INDEX IF NOT EXISTS idx_pred_exam ON examination_predictions(examination_id);
+CREATE INDEX IF NOT EXISTS idx_pred_model ON examination_predictions(model_name, model_version);
 
 
 -- 5.2 动作级预测结果
@@ -354,8 +354,8 @@ CREATE TABLE IF NOT EXISTS action_predictions (
     FOREIGN KEY (action_id) REFERENCES action_types(action_id)
 );
 
-CREATE INDEX idx_action_pred_exam ON action_predictions(examination_id);
-CREATE INDEX idx_action_pred_model ON action_predictions(model_name, model_version);
+CREATE INDEX IF NOT EXISTS idx_action_pred_exam ON action_predictions(examination_id);
+CREATE INDEX IF NOT EXISTS idx_action_pred_model ON action_predictions(model_name, model_version);
 
 
 -- ============================================================
@@ -377,8 +377,8 @@ CREATE TABLE IF NOT EXISTS import_logs (
     import_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_import_type ON import_logs(import_type);
-CREATE INDEX idx_import_time ON import_logs(import_timestamp);
+CREATE INDEX IF NOT EXISTS idx_import_type ON import_logs(import_type);
+CREATE INDEX IF NOT EXISTS idx_import_time ON import_logs(import_timestamp);
 
 
 -- ============================================================
@@ -492,7 +492,7 @@ CREATE TABLE IF NOT EXISTS video_features (
     FOREIGN KEY (video_id) REFERENCES video_files(video_id)
 );
 
-CREATE INDEX idx_video_features_video ON video_features(video_id);
+CREATE INDEX IF NOT EXISTS idx_video_features_video ON video_features(video_id);
 
 
 -- 8.2 简化视频视图 (用于process_videos.py)
