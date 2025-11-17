@@ -434,7 +434,6 @@ CREATE TABLE IF NOT EXISTS video_features (
     
     -- 处理信息
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    processing_time_ms REAL,                      -- 处理耗时(毫秒)
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 

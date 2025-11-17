@@ -129,7 +129,7 @@ class VisualFeatureExtractor:
 
         Args:
             db_path: 数据库路径
-            segmented_root: 分割图像根目录
+            segmented_root: 分割图像根目录（现在仅用于日志显示，路径以DB为准）
             batch_size: 批处理大小(用于显示,实际逐个处理)
             force_reprocess: 是否强制重新处理已处理的样本
         """
@@ -143,11 +143,11 @@ class VisualFeatureExtractor:
                     vf.video_id,
                     vf.examination_id,
                     at.action_name_en,
-                    vfeat.peak_frame_path
+                    vfeat.peak_frame_segmented_path
                 FROM video_files vf
                 INNER JOIN action_types at ON vf.action_id = at.action_id
                 INNER JOIN video_features vfeat ON vf.video_id = vfeat.video_id
-                WHERE vfeat.peak_frame_path IS NOT NULL
+                WHERE vfeat.peak_frame_segmented_path IS NOT NULL
                 ORDER BY vf.video_id
             """
         else:
@@ -156,12 +156,12 @@ class VisualFeatureExtractor:
                     vf.video_id,
                     vf.examination_id,
                     at.action_name_en,
-                    vfeat.peak_frame_path
+                    vfeat.peak_frame_segmented_path
                 FROM video_files vf
                 INNER JOIN action_types at ON vf.action_id = at.action_id
                 INNER JOIN video_features vfeat ON vf.video_id = vfeat.video_id
-                WHERE vfeat.peak_frame_path IS NOT NULL
-                  AND vfeat.visual_features_1280d IS NULL
+                WHERE vfeat.peak_frame_segmented_path IS NOT NULL
+                  AND vfeat.visual_features IS NULL
                 ORDER BY vf.video_id
             """
 
@@ -182,34 +182,22 @@ class VisualFeatureExtractor:
         skip_count = 0
 
         # 逐个处理
-        for video_id, exam_id, action_name, peak_frame_path in tqdm(samples, desc="提取视觉特征"):
+        for video_id, exam_id, action_name, seg_path in tqdm(samples, desc="提取视觉特征"):
             try:
-                # 构建分割图像路径
-                peak_frame_path = Path(peak_frame_path)
+                if not seg_path:
+                    print(f"\n[ERROR] video_id={video_id} 的 peak_frame_segmented_path 为空")
+                    fail_count += 1
+                    continue
 
-                # 分割图像路径: keyframes_segmented/ActionName/exam_id_action_segmented.png
-                segmented_filename = f"{peak_frame_path.stem}_segmented.png"
-                segmented_path = segmented_root / action_name / segmented_filename
+                image_path = Path(seg_path)
 
-                # 检查分割图像是否存在
-                if not segmented_path.exists():
-                    # 如果分割图像不存在,使用原图
-                    print(f"\n[WARN] 分割图像不存在,使用原图: {video_id}")
-                    use_segmented = 0
-                    image_path = peak_frame_path
-
-                    if not image_path.exists():
-                        print(f"[ERROR] 原图也不存在: {image_path}")
-                        fail_count += 1
-                        continue
-                else:
-                    use_segmented = 1
-                    image_path = segmented_path
+                if not image_path.exists():
+                    print(f"\n[ERROR] 分割图像不存在: {image_path}")
+                    fail_count += 1
+                    continue
 
                 # 提取特征
-                start_time = datetime.now()
                 features = self.extract_from_image(image_path)
-                processing_time = (datetime.now() - start_time).total_seconds() * 1000
 
                 # 验证维度
                 if features.shape[0] != 1280:
@@ -221,9 +209,7 @@ class VisualFeatureExtractor:
                 self._save_to_database(
                     cursor=cursor,
                     video_id=video_id,
-                    features=features,
-                    use_segmented=use_segmented,
-                    processing_time=processing_time
+                    features=features
                 )
 
                 success_count += 1
@@ -253,9 +239,7 @@ class VisualFeatureExtractor:
         self,
         cursor,
         video_id: int,
-        features: np.ndarray,
-        use_segmented: int,
-        processing_time: float
+        features: np.ndarray
     ):
         """
         保存特征到数据库
@@ -264,8 +248,6 @@ class VisualFeatureExtractor:
             cursor: 数据库游标
             video_id: 视频ID
             features: 1280维特征
-            use_segmented: 是否使用分割图像
-            processing_time: 处理耗时(毫秒)
         """
         # 转换为BLOB
         features_blob = features.astype(np.float32).tobytes()
@@ -273,15 +255,11 @@ class VisualFeatureExtractor:
         # 更新数据库
         cursor.execute("""
             UPDATE video_features
-            SET visual_features_1280d = ?,
-                use_segmented = ?,
-                visual_processed_at = CURRENT_TIMESTAMP,
-                processing_time_ms = ?
+            SET visual_features = ?,
+                processed_at = CURRENT_TIMESTAMP
             WHERE video_id = ?
         """, (
             features_blob,
-            use_segmented,
-            processing_time,
             video_id
         ))
 
@@ -305,18 +283,18 @@ def load_visual_features_from_db(
 
     if video_ids is None:
         query = """
-            SELECT video_id, visual_features_1280d
+            SELECT video_id, visual_features
             FROM video_features
-            WHERE visual_features_1280d IS NOT NULL
+            WHERE visual_features IS NOT NULL
         """
         cursor.execute(query)
     else:
         placeholders = ','.join('?' * len(video_ids))
         query = f"""
-            SELECT video_id, visual_features_1280d
+            SELECT video_id, visual_features
             FROM video_features
             WHERE video_id IN ({placeholders})
-              AND visual_features_1280d IS NOT NULL
+              AND visual_features IS NOT NULL
         """
         cursor.execute(query, video_ids)
 
@@ -339,56 +317,39 @@ def main():
     """
     主函数 - 批量提取视觉特征
     """
-    import argparse
+    db_path = 'facialPalsy.db'
+    segmented_root = Path('/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes_segmented')
 
-    parser = argparse.ArgumentParser(description='批量提取视觉特征')
-    parser.add_argument(
-        '--db-path',
-        type=str,
-        default='facialPalsy.db',
-        help='数据库路径'
-    )
-    parser.add_argument(
-        '--segmented-root',
-        type=str,
-        default='/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes_segmented',
-        help='分割图像根目录'
-    )
-    parser.add_argument(
-        '--device',
-        type=str,
-        default=None,
-        choices=['mps', 'cpu'],
-        help='计算设备'
-    )
-    parser.add_argument(
-        '--force',
-        action='store_true',
-        help='强制重新处理已处理的样本'
-    )
+    # device:
+    #   None  → 自动检测（优先 mps, 否则 cpu）
+    #   'mps' → 强制走 Apple GPU（如果不可用会报错）
+    #   'cpu' → 强制走 CPU
+    device = None
 
-    args = parser.parse_args()
+    # 是否强制重新处理已提取过视觉特征的样本
+    force_reprocess = False
 
     print("=" * 60)
     print("视觉特征提取 V2.0")
     print("=" * 60)
     print(f"\n配置:")
-    print(f"  数据库: {args.db_path}")
-    print(f"  分割图像: {args.segmented_root}")
-    print(f"  设备: {args.device or 'auto'}")
-    print(f"  强制重处理: {args.force}")
+    print(f"  数据库: {db_path}")
+    print(f"  分割图像: {segmented_root}")
+    print(f"  设备: {device or 'auto'}")
+    print(f"  强制重处理: {force_reprocess}")
 
     # 初始化提取器
-    extractor = VisualFeatureExtractor(device=args.device)
+    extractor = VisualFeatureExtractor(device=device)
 
     # 批量处理
     extractor.batch_extract_from_database(
-        db_path=args.db_path,
-        segmented_root=Path(args.segmented_root),
-        force_reprocess=args.force
+        db_path=db_path,
+        segmented_root=segmented_root,
+        force_reprocess=force_reprocess
     )
 
-    print("\n✅ 处理完成!")
+
+print("\n 处理完成!")
 
 
 if __name__ == "__main__":

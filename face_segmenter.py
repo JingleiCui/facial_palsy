@@ -10,6 +10,53 @@ from pathlib import Path
 from typing import Optional, Tuple
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+import sqlite3
+
+def to_segmented_path(peak_path: str) -> str:
+    """
+    根据原始峰值帧路径构造分割后图像路径
+
+    规则:
+    /.../pipeline/keyframes/ActionName/xxx.jpg
+      → /.../pipeline/keyframes_segmented/ActionName/xxx_segmented.png
+    """
+    raw = Path(peak_path)
+    # /keyframes/ → /keyframes_segmented/
+    seg_dir = str(raw).replace("/keyframes/", "/keyframes_segmented/")
+    # 文件名加 _segmented.png
+    seg = Path(seg_dir).with_name(raw.stem + "_segmented.png")
+    return str(seg)
+
+def update_segmented_paths(db_path: str):
+    """
+    批量更新 video_features 表中的 peak_frame_segmented_path 字段
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    # 读取所有已有 peak_frame_path 的记录
+    cur.execute("SELECT video_id, peak_frame_path FROM video_features")
+    rows = cur.fetchall()
+
+    updated = 0
+
+    for video_id, peak_path in rows:
+        # 避免 peak_frame_path 为空
+        if not peak_path:
+            continue
+
+        seg_path = to_segmented_path(peak_path)
+        cur.execute("""
+            UPDATE video_features
+            SET peak_frame_segmented_path = ?
+            WHERE video_id = ?
+        """, (seg_path, video_id))
+        updated += 1
+
+    conn.commit()
+    conn.close()
+
+    print(f"[FaceSegmenter] 已更新 {updated} 条 peak_frame_segmented_path")
 
 
 class FaceSegmenter:
@@ -202,12 +249,13 @@ class FaceSegmenter:
 
 def main():
     """
-    测试脚本 - 批量处理keyframes
+    测试脚本 - 批量处理keyframes + 更新数据库中的 segmented 路径
     """
     # 配置路径
     KEYFRAMES_DIR = Path("/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes")
     OUTPUT_DIR = Path("/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes_segmented")
     MODEL_PATH = "/Users/cuijinglei/PycharmProjects/medicalProject/models/selfie_multiclass_256x256.tflite"
+    DB_PATH = "facialPalsy.db"
 
     # 创建分割器
     segmenter = FaceSegmenter(model_path=MODEL_PATH)
@@ -218,8 +266,10 @@ def main():
         output_dir=OUTPUT_DIR,
         pattern="*.jpg"
     )
+    # 分割完成后，批量更新 video_features 表中的 peak_frame_segmented_path
+    update_segmented_paths(DB_PATH)
 
-    print("\n✅ 人脸分割完成!")
+    print("\n 人脸分割完成!")
 
 
 if __name__ == "__main__":
