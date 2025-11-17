@@ -144,8 +144,6 @@ def import_metadata(
     if reset_tables:
         print("⚠️  清空相关表...")
         cursor.execute("DELETE FROM video_files;")
-        cursor.execute("DELETE FROM frame_files;")
-        cursor.execute("DELETE FROM feature_files;")
         cursor.execute("DELETE FROM examinations;")
         cursor.execute("DELETE FROM patients;")
         conn.commit()

@@ -123,66 +123,6 @@ CREATE INDEX IF NOT EXISTS idx_video_exam ON video_files(examination_id);
 CREATE INDEX IF NOT EXISTS idx_video_action ON video_files(action_id);
 CREATE INDEX IF NOT EXISTS idx_video_exists ON video_files(file_exists);
 
-
--- 2.2 帧文件表 (存储峰值帧等关键帧)
-CREATE TABLE IF NOT EXISTS frame_files (
-    frame_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    examination_id TEXT NOT NULL,
-    action_id INTEGER NOT NULL,
-    video_id INTEGER,                         -- 可选：关联到视频
-    
-    -- 帧信息
-    frame_type TEXT NOT NULL,                 -- 'peak', 'neutral', 'start', 'end'
-    frame_number INTEGER,                     -- 帧号
-    
-    -- 文件路径
-    frame_file_path TEXT NOT NULL,            -- 图像文件路径
-    
-    -- 状态
-    file_exists INTEGER DEFAULT 0,
-    file_size_bytes INTEGER,
-    
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    FOREIGN KEY (examination_id) REFERENCES examinations(examination_id),
-    FOREIGN KEY (action_id) REFERENCES action_types(action_id),
-    FOREIGN KEY (video_id) REFERENCES video_files(video_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_frame_exam_action ON frame_files(examination_id, action_id);
-CREATE INDEX IF NOT EXISTS idx_frame_type ON frame_files(frame_type);
-
-
--- 2.3 特征文件表 (存储提取的特征)
-CREATE TABLE IF NOT EXISTS feature_files (
-    feature_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    examination_id TEXT NOT NULL,
-    action_id INTEGER NOT NULL,
-    
-    -- 特征类型
-    feature_type TEXT NOT NULL,               -- 'static', 'dynamic', 'visual', 'combined'
-    feature_version TEXT DEFAULT 'v1.0',      -- 特征提取版本
-    
-    -- 文件路径
-    feature_file_path TEXT NOT NULL,          -- .npy 或 .pkl 文件路径
-    
-    -- 特征维度
-    feature_dim INTEGER,                      -- 特征维度
-    
-    -- 状态
-    file_exists INTEGER DEFAULT 0,
-    file_size_bytes INTEGER,
-    
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    FOREIGN KEY (examination_id) REFERENCES examinations(examination_id),
-    FOREIGN KEY (action_id) REFERENCES action_types(action_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_feature_exam_action ON feature_files(examination_id, action_id);
-CREATE INDEX IF NOT EXISTS idx_feature_type ON feature_files(feature_type);
-
-
 -- ============================================================
 -- 3. 标签表 (来自 labels.xlsx)
 -- ============================================================
@@ -421,21 +361,19 @@ SELECT
     at.action_name_en,
     at.action_name_cn,
     
-    vf.video_file_path,
+    vf.file_path,
     vf.file_exists AS video_exists,
     
     al.severity_score,
     al.label_source,
     
-    ff.frame_file_path AS peak_frame_path
+    vfeat.peak_frame_path
     
 FROM video_files vf
 INNER JOIN action_types at ON vf.action_id = at.action_id
 LEFT JOIN action_labels al ON vf.examination_id = al.examination_id 
     AND vf.action_id = al.action_id
-LEFT JOIN frame_files ff ON vf.examination_id = ff.examination_id 
-    AND vf.action_id = ff.action_id 
-    AND ff.frame_type = 'peak';
+LEFT JOIN video_features vfeat ON vf.video_id = vfeat.video_id;
 
 
 -- 7.3 数据集统计视图
@@ -475,14 +413,25 @@ CREATE TABLE IF NOT EXISTS video_features (
     -- 峰值帧信息
     peak_frame_idx INTEGER NOT NULL,              -- 峰值帧索引
     peak_frame_path TEXT,                         -- 峰值帧图像路径
+    peak_frame_segmented_path TEXT,
 
     -- 归一化单位长度
     unit_length REAL,                             -- 两眼内眦距离
 
-    -- 几何特征 (存储为二进制BLOB)
-    static_features BLOB NOT NULL,                -- 静态特征 (32维)
-    dynamic_features BLOB NOT NULL,               -- 动态特征 (16维)
-
+    -- 几何特征 (存储为二进制BLOB，维度随动作而变)
+    static_features BLOB NOT NULL,                -- 静态特征
+    dynamic_features BLOB NOT NULL,               -- 动态特征
+    static_dim INTEGER,   -- 实际维度
+    dynamic_dim INTEGER,
+    
+    -- 视觉特征
+    visual_features BLOB,
+    
+    -- 融合特征
+    geo_refined_features BLOB,      -- 静/动几何做 cross/self attention 后的几何特征
+    visual_guided_features BLOB,    -- 几何引导后的视觉特征
+    fused_action_features BLOB,     -- 最终多模态融合后的动作级特征
+    
     -- 处理信息
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     processing_time_ms REAL,                      -- 处理耗时(毫秒)
@@ -501,7 +450,7 @@ SELECT
     vf.video_id,
     vf.examination_id,
     vf.action_id,
-    vf.video_file_path AS file_path,
+    vf.file_path,
     vf.start_frame,
     vf.end_frame,
     vf.fps,

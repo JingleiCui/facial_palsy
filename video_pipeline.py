@@ -442,6 +442,9 @@ class VideoPipeline:
         static_blob = static_arr.tobytes()
         dynamic_blob = dynamic_arr.tobytes()
 
+        static_dim = len(static_vals)
+        dynamic_dim = len(dynamic_vals)
+
         try:
             cursor.execute("""
                 INSERT INTO video_features (
@@ -450,15 +453,19 @@ class VideoPipeline:
                     peak_frame_path,
                     unit_length,
                     static_features,
-                    dynamic_features
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    dynamic_features,
+                    static_dim,
+                    dynamic_dim
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 video_id,
                 peak_frame_idx,
                 peak_frame_path,
                 unit_length,
                 static_blob,
-                dynamic_blob
+                dynamic_blob,
+                static_dim,
+                dynamic_dim
             ))
 
             conn.commit()
@@ -472,6 +479,8 @@ class VideoPipeline:
                     unit_length = ?,
                     static_features = ?,
                     dynamic_features = ?,
+                    static_dim = ?,
+                    dynamic_dim = ?,
                     processed_at = CURRENT_TIMESTAMP
                 WHERE video_id = ?
             """, (
@@ -480,6 +489,8 @@ class VideoPipeline:
                 unit_length,
                 static_blob,
                 dynamic_blob,
+                static_dim,
+                dynamic_dim,
                 video_id
             ))
 
@@ -492,12 +503,12 @@ class VideoPipeline:
 def main():
     """主函数：方便在 PyCharm 里一键运行"""
 
-    # 1️⃣ 基本路径配置 —— 按实际路径改，不用命令行了
+    # 基本路径配置
     db_path = 'facialPalsy.db'
     model_path = '/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task'
     keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes'
 
-    # 2️⃣ 选择运行模式（**只需要改这里几行变量**）
+    #  选择运行模式
     # 说明：
     #   - 如果只想处理某一个 examination：把 examination_id 改成具体 ID（例如 'XW000001_20240101'）
     #   - 如果只想处理某个视频：把 video_id 改成具体 video_id（整数），比如 123
@@ -506,10 +517,10 @@ def main():
     video_id = None         # 例如：123，默认 None
     run_batch = True        # 默认批量处理所有未处理的 examinations
 
-    # 3️⃣ 初始化 Pipeline
+    # 初始化 Pipeline
     pipeline = VideoPipeline(db_path, model_path, keyframe_dir)
 
-    # 4️⃣ 根据上面配置决定怎么跑
+    # 根据上面配置决定怎么跑
     if examination_id is not None:
         # 处理一个完整的检查（推荐，因为会先用 NeutralFace 做对比）
         pipeline.process_examination(examination_id)
