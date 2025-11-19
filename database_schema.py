@@ -430,6 +430,7 @@ CREATE TABLE IF NOT EXISTS video_features (
     -- 融合特征
     geo_refined_features BLOB,      -- 静/动几何做 cross/self attention 后的几何特征
     visual_guided_features BLOB,    -- 几何引导后的视觉特征
+    visual_global_features BLOB, 
     fused_action_features BLOB,     -- 最终多模态融合后的动作级特征
     
     -- 处理信息
