@@ -1,5 +1,5 @@
 """
-H-GFA Net V2.0 - 重新设计的网络架构
+H-GFA Net - 网络架构
 ===================================
 
 主要更新:
@@ -250,12 +250,12 @@ class SimpleMFA(nn.Module):
 
 
 # =============================================================================
-# H-GFA Net V2 主模型
+# H-GFA Net 主模型
 # =============================================================================
 
-class HGFANetV2(nn.Module):
+class HGFANet(nn.Module):
     """
-    H-GFA Net V2.0 - 层次化几何引导特征注意力网络
+    H-GFA Net - 层次化几何引导特征注意力网络
 
     支持多模态特征融合和多任务学习
     """
@@ -457,7 +457,7 @@ class HGFANetV2(nn.Module):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
         print("\n" + "=" * 60)
-        print("H-GFA Net V2.0")
+        print("H-GFA Net")
         print("=" * 60)
         print(f"动作数量: {len(self.action_dims)}")
         print(f"任务列表: {self.task_names}")
@@ -685,24 +685,24 @@ class HGFANetV2(nn.Module):
 # 工厂函数
 # =============================================================================
 
-def create_hgfa_net_v2(
+def create_hgfa_net(
         device: str = 'cpu',
         task_names: Optional[List[str]] = None
-) -> HGFANetV2:
+) -> HGFANet:
     """
-    创建 H-GFA Net V2 模型
+    创建 H-GFA Net 模型
 
     Args:
         device: 设备
         task_names: 任务列表
 
     Returns:
-        HGFANetV2 模型实例
+        HGFANet模型实例
     """
     if task_names is None:
         task_names = ['severity', 'hb_grading', 'sunnybrook']
 
-    model = HGFANetV2(
+    model = HGFANet(
         task_names=task_names,
         device=device
     )
@@ -715,7 +715,7 @@ def create_hgfa_net_v2(
 # =============================================================================
 
 if __name__ == '__main__':
-    print("测试 H-GFA Net V2...")
+    print("测试 H-GFA Net")
 
     # 检测设备
     if torch.backends.mps.is_available():
@@ -726,7 +726,7 @@ if __name__ == '__main__':
     print(f"使用设备: {device}")
 
     # 创建模型
-    model = create_hgfa_net_v2(device=device)
+    model = create_hgfa_net(device=device)
 
     # 模拟输入
     batch_size = 4
