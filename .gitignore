@@ -14,6 +14,8 @@ env/
 
 models/
 
+docs/
+
 # PyCharm
 .idea/
 

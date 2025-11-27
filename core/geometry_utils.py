@@ -151,23 +151,26 @@ def get_lip_area(landmarks, w, h, upper=True, left=True):
 # 角度
 def get_horizontal_line(landmarks, w, h):
     """水平参考线"""
-    pupil_left = get_point(landmarks, PUPIL_LEFT, w, h)
-    pupil_right = get_point(landmarks, PUPIL_RIGHT, w, h)
-    return (pupil_left, pupil_right)
+    left_inner = get_point(landmarks, EYE_INNER_CANTHUS_LEFT, w, h)
+    right_inner = get_point(landmarks, EYE_INNER_CANTHUS_RIGHT, w, h)
+    return (left_inner, right_inner)
 
 
 def get_vertical_line(landmarks, w, h):
     """垂直参考线"""
-    pupil_left = get_point(landmarks, PUPIL_LEFT, w, h)
-    pupil_right = get_point(landmarks, PUPIL_RIGHT, w, h)
-    mid_x = (pupil_left[0] + pupil_right[0]) / 2
-    mid_y = (pupil_left[1] + pupil_right[1]) / 2
-    dx = pupil_right[0] - pupil_left[0]
-    dy = pupil_right[1] - pupil_left[1]
+    left_inner = get_point(landmarks, EYE_INNER_CANTHUS_LEFT, w, h)
+    right_inner = get_point(landmarks, EYE_INNER_CANTHUS_RIGHT, w, h)
+    # 计算两个内眦点的中点
+    mid_x = (left_inner[0] + right_inner[0]) / 2
+    mid_y = (left_inner[1] + right_inner[1]) / 2
+
+    # 计算垂直于内眦连线的方向
+    dx = right_inner[0] - left_inner[0]
+    dy = right_inner[1] - left_inner[1]
     magnitude = (dx**2 + dy**2)**0.5
     perp_dx = dy / magnitude
     perp_dy = -dx / magnitude
-    half_length = 500
+    half_length = 200
     x1 = int(mid_x - perp_dx * half_length)
     y1 = int(mid_y - perp_dy * half_length)
     x2 = int(mid_x + perp_dx * half_length)
@@ -262,6 +265,12 @@ def normalize_indicators(indicators, unit_length):
                 normalized[key] = value / (unit_length ** 2)
             elif any(x in key.lower() for x in ['angle', 'ratio', 'disparity', '_pct', 'percentage']):
                 normalized[key] = value
+            elif 'velocity' in key.lower():
+                # 速度类指标除以单位长度（已包含时间因素）
+                normalized[key] = value / unit_length
+            elif 'smoothness' in key.lower() or 'jerk' in key.lower():
+                # 平滑度/jerk指标除以单位长度的立方
+                normalized[key] = value / (unit_length ** 3)
             else:
                 normalized[key] = value / unit_length
         else:
