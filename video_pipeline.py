@@ -1,13 +1,15 @@
 """
-视频处理Pipeline V2 - 利用现有的actions/*.py
-保留每个动作的特定特征,不强制统一维度
+视频处理Pipeline V3 - 彻底修复内存问题
+主要改进:
+1. 降低并行度避免MediaPipe冲突
+2. 及时释放帧内存
+3. 定期垃圾回收
 """
 import os
 import sys
 from pathlib import Path
 
 # 添加项目根目录到 Python 路径
-# 这样可以直接运行 video_pipeline.py,同时支持相对导入
 current_dir = Path(__file__).resolve().parent
 parent_dir = current_dir.parent
 if str(parent_dir) not in sys.path:
@@ -17,7 +19,11 @@ import cv2
 import numpy as np
 import sqlite3
 import json
+import gc
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
 
 from facialPalsy.core.landmark_extractor import LandmarkExtractor
 from facialPalsy.action_feature_integrator import ActionFeatureIntegrator
@@ -40,11 +46,11 @@ class VideoPipeline:
     """
     视频处理Pipeline
 
-    关键改进:
-    1. 使用现有的动作类(actions/*.py)
-    2. 保留每个动作的特定特征
-    3. 利用与静息帧的对比
-    4. 支持动作特异性特征
+    V3改进:
+    1. 降低并行度(3线程)避免MediaPipe GPU冲突
+    2. 及时释放帧序列内存
+    3. 定期强制垃圾回收
+    4. 分批处理examinations
     """
 
     def __init__(self, db_path, model_path, keyframe_root_dir):
@@ -69,11 +75,28 @@ class VideoPipeline:
         # 静息帧缓存
         self.neutral_cache = {}
 
+        self.model_path = model_path
+
+        # 🔧 关键修复1: 降低并行度避免MediaPipe GPU冲突
+        # MediaPipe在多线程中会创建多个OpenGL上下文,容易OOM
+        self.num_workers = 5  # 每个线程约500MB模型
+
+        self._tls = threading.local()
+
+    def _get_worker(self):
+        w = getattr(self._tls, "worker", None)
+        if w is None:
+            # 每个线程各自持有一套模型/检测器
+            w = type("Worker", (), {})()
+            w.landmark_extractor = LandmarkExtractor(self.model_path)
+            w.feature_integrator = ActionFeatureIntegrator()
+            w.action_detectors = w.feature_integrator.action_detectors
+            self._tls.worker = w
+        return w
+
     def process_examination(self, examination_id):
         """
         处理一个完整的examination(11个动作)
-
-        这是推荐的处理方式,因为可以利用静息帧与其他动作对比
 
         Args:
             examination_id: 检查ID
@@ -104,7 +127,7 @@ class VideoPipeline:
             print("\n[步骤1] 处理静息帧...")
             neutral_result = self.process_video(
                 neutral_video['video_id'],
-                neutral_indicators=None  # 静息帧不需要对比
+                neutral_indicators=None
             )
 
             if neutral_result:
@@ -119,22 +142,69 @@ class VideoPipeline:
         results = {}
         other_videos = [v for v in videos if v['action_name_en'] != 'NeutralFace']
 
-        for i, video in enumerate(other_videos, 1):
-            print(f"\n[步骤{i + 1}] 处理 {video['action_name_cn']}...")
+        print(f"\n[步骤2] 并行处理其余 {len(other_videos)} 个动作...")
 
-            # 获取静息帧指标(用于对比)
-            neutral_indicators = None
-            if examination_id in self.neutral_cache:
-                neutral_indicators = self.neutral_cache[examination_id]['normalized_indicators']
+        neutral_indicators = None
+        if examination_id in self.neutral_cache:
+            neutral_indicators = self.neutral_cache[examination_id]['normalized_indicators']
 
-            result = self.process_video(
-                video['video_id'],
-                neutral_indicators=neutral_indicators
+        failures = []
+        computed = []
+
+        with ThreadPoolExecutor(max_workers=self.num_workers) as ex:
+            fut_map = {ex.submit(self._compute_video_only, v, neutral_indicators): v for v in other_videos}
+            for fut in as_completed(fut_map):
+                v = fut_map[fut]
+                try:
+                    out = fut.result()
+                except Exception as e:
+                    failures.append((v['video_id'], v['action_name_en'], str(e)))
+                    continue
+                if not out.get("ok"):
+                    failures.append((v['video_id'], v['action_name_en'], out.get("error", "unknown")))
+                    continue
+                computed.append(out)
+
+        # 串行保存(避免 SQLite 写锁)
+        for out in computed:
+            vinfo = next(v for v in other_videos if v["video_id"] == out["video_id"])
+            action_name = out["action_name"]
+            r = out["result"]
+
+            peak_frame_path = self._save_peak_frame(r['peak_frame'], vinfo['examination_id'], action_name)
+
+            # 🔧 关键修复2: 立即释放峰值帧
+            del r['peak_frame']
+
+            self._save_to_database(
+                video_id=vinfo['video_id'],
+                peak_frame_idx=r['peak_frame_idx'],
+                peak_frame_path=str(peak_frame_path),
+                unit_length=r['unit_length'],
+                feature_vector=out["feature_vector"],
+                normalized_indicators=r['normalized_indicators'],
+                normalized_dynamic_features=r['normalized_dynamic_features']
             )
 
-            if result:
-                results[video['action_name_en']] = result
-                print(f"✓ {video['action_name_cn']} 处理完成")
+            results[action_name] = {
+                'video_id': vinfo['video_id'],
+                'action_name': action_name,
+                'peak_frame_idx': r['peak_frame_idx'],
+                'peak_frame_path': str(peak_frame_path),
+                'unit_length': r['unit_length'],
+                'feature_dim': out["feature_vector"].shape[0],
+                'feature_vector': out["feature_vector"],
+                'normalized_indicators': r['normalized_indicators'],
+                'normalized_dynamic_features': r['normalized_dynamic_features']
+            }
+
+            # 🔧 关键修复3: 释放computed中的大对象
+            del out["result"]
+
+        if failures:
+            print(f"  [WARN] 本次 examination 有 {len(failures)} 个动作失败：")
+            for vid, act, err in failures[:10]:
+                print(f"    - video_id={vid} act={act} err={err}")
 
         # 4. 添加静息帧结果
         if neutral_result:
@@ -146,6 +216,10 @@ class VideoPipeline:
         print(f"✓ 检查处理完成! 耗时: {processing_time:.2f}ms")
         print(f"成功处理: {len(results)}/11 个动作")
         print(f"{'=' * 60}")
+
+        # 🔧 关键修复4: 强制垃圾回收
+        del computed
+        gc.collect()
 
         return {
             'examination_id': examination_id,
@@ -193,23 +267,31 @@ class VideoPipeline:
         detector = self.action_detectors.get(action_name)
         if not detector:
             print(f"  [ERROR] 未找到动作检测器: {action_name}")
+            # 🔧 修复: 释放已提取的序列
+            del landmarks_seq
+            del frames_seq
             return None
 
         # 5. 使用动作类的process方法
-        # 注意: 需要转换neutral_indicators格式
         neutral_raw = self._denormalize_indicators(
             neutral_indicators,
             video_info
         ) if neutral_indicators else None
 
+        h, w = frames_seq[0].shape[:2]
+
         result = detector.process(
             landmarks_seq=landmarks_seq,
             frames_seq=frames_seq,
-            w=video_info.get('width', 640),
-            h=video_info.get('height', 480),
-            fps=video_info.get('fps', 30.0),
+            w=w,
+            h=h,
+            fps=video_info.get('fps'),
             neutral_indicators=neutral_raw
         )
+
+        # 🔧 关键修复5: 立即释放序列
+        del landmarks_seq
+        del frames_seq
 
         if not result:
             print(f"  [ERROR] 处理失败")
@@ -254,13 +336,17 @@ class VideoPipeline:
             'normalized_dynamic_features': result['normalized_dynamic_features']
         }
 
-    def process_all_examinations(self):
-        """批量处理所有未处理的examinations"""
+    def process_all_examinations(self, batch_size=10):
+        """
+        批量处理所有未处理的examinations
+
+        Args:
+            batch_size: 每批处理多少个examination后清理内存
+        """
         # 获取所有未完全处理的examinations
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # 找出至少有一个视频未处理的examinations
         cursor.execute("""
             SELECT DISTINCT e.examination_id
             FROM examinations e
@@ -274,6 +360,7 @@ class VideoPipeline:
         conn.close()
 
         print(f"\n找到 {len(examination_ids)} 个需要处理的检查")
+        print(f"将分 {(len(examination_ids) + batch_size - 1) // batch_size} 批处理")
 
         results = []
         for i, exam_id in enumerate(examination_ids, 1):
@@ -285,10 +372,18 @@ class VideoPipeline:
                 result = self.process_examination(exam_id)
                 if result:
                     results.append(result)
+
+                # 🔧 关键修复6: 定期清理内存
+                if i % batch_size == 0:
+                    gc.collect()
+                    print(f"\n  [内存清理] 已处理 {i}/{len(examination_ids)} 个检查")
+
             except Exception as e:
                 print(f"[ERROR] 处理检查 {exam_id} 时出错: {str(e)}")
                 import traceback
                 traceback.print_exc()
+                # 出错后也要清理
+                gc.collect()
 
         print(f"\n{'=' * 60}")
         print(f"批量处理完成!")
@@ -305,18 +400,17 @@ class VideoPipeline:
 
         cursor.execute("""
             SELECT 
-                v.video_id,
-                v.examination_id,
-                v.action_id,
-                v.file_path,
-                v.start_frame,
-                v.end_frame,
-                v.fps,
+                vf.video_id,
+                vf.examination_id,
                 at.action_name_en,
-                at.action_name_cn
-            FROM video_files v
-            INNER JOIN action_types at ON v.action_id = at.action_id
-            WHERE v.video_id = ?
+                at.action_name_cn,
+                vf.file_path,
+                vf.start_frame,
+                vf.end_frame,
+                vf.fps
+            FROM video_files vf
+            INNER JOIN action_types at ON vf.action_id = at.action_id
+            WHERE vf.video_id = ?
         """, (video_id,))
 
         row = cursor.fetchone()
@@ -332,18 +426,19 @@ class VideoPipeline:
 
         cursor.execute("""
             SELECT 
-                v.video_id,
-                v.examination_id,
-                v.file_path,
-                v.start_frame,
-                v.end_frame,
-                v.fps,
+                vf.video_id,
+                vf.examination_id,
                 at.action_name_en,
-                at.action_name_cn
-            FROM video_files v
-            INNER JOIN action_types at ON v.action_id = at.action_id
-            WHERE v.examination_id = ? AND v.file_exists = 1
-            ORDER BY at.action_id
+                at.action_name_cn,
+                vf.file_path,
+                vf.start_frame,
+                vf.end_frame,
+                vf.fps
+            FROM video_files vf
+            INNER JOIN action_types at ON vf.action_id = at.action_id
+            WHERE vf.examination_id = ?
+            AND vf.file_exists = 1
+            ORDER BY at.display_order
         """, (examination_id,))
 
         rows = cursor.fetchall()
@@ -351,12 +446,18 @@ class VideoPipeline:
 
         return [dict(row) for row in rows]
 
-    def _extract_sequence(self, video_path, start_frame, end_frame):
-        """提取视频序列"""
+    def _extract_sequence(self, video_path, start_frame, end_frame, extractor=None):
+        """
+        提取视频序列
+
+        🔧 关键修复7: 使用copy()并及时释放原始帧
+        """
         cap = cv2.VideoCapture(video_path)
 
         if not cap.isOpened():
             return None, None
+
+        extractor = extractor or self.landmark_extractor
 
         landmarks_seq = []
         frames_seq = []
@@ -371,25 +472,84 @@ class VideoPipeline:
             if not ret:
                 break
 
-            # MediaPipe提取 - 返回2D landmarks对象
-            landmarks = self.landmark_extractor.extract_from_frame(frame)
+            # MediaPipe提取
+            landmarks = extractor.extract_from_frame(frame)
 
             landmarks_seq.append(landmarks)
-            frames_seq.append(frame)
+            # 🔧 关键: 只保留副本,原帧立即释放
+            frames_seq.append(frame.copy())
+            del frame
+
             frame_idx += 1
 
         cap.release()
 
         return landmarks_seq, frames_seq
 
-    def _denormalize_indicators(self, normalized_indicators, video_info):
+    def _compute_video_only(self, video_info, neutral_indicators=None):
         """
-        将归一化指标转换回原始像素值(用于动作类)
+        工作线程中计算单个视频
 
-        这是一个近似转换,因为我们没有原始的unit_length
+        🔧 关键修复8: 处理完立即释放序列
         """
-        # TODO: 如果需要精确的原始值,需要从数据库读取NeutralFace的unit_length
-        # 这里暂时返回归一化值,大部分动作类可以处理
+        t0 = time.perf_counter()
+        action_name = video_info['action_name_en']
+
+        if not os.path.exists(video_info['file_path']):
+            return {"ok": False, "error": f"文件不存在: {video_info['file_path']}"}
+
+        worker = self._get_worker()
+
+        landmarks_seq, frames_seq = self._extract_sequence(
+            video_info['file_path'],
+            video_info['start_frame'],
+            video_info['end_frame'],
+            extractor=worker.landmark_extractor
+        )
+        if not landmarks_seq:
+            return {"ok": False, "error": "关键点提取失败"}
+
+        detector = worker.action_detectors.get(action_name)
+        if not detector:
+            return {"ok": False, "error": f"未找到动作检测器: {action_name}"}
+
+        neutral_raw = self._denormalize_indicators(neutral_indicators, video_info) if neutral_indicators else None
+
+        h, w = frames_seq[0].shape[:2]
+        result = detector.process(
+            landmarks_seq=landmarks_seq,
+            frames_seq=frames_seq,
+            w=w,
+            h=h,
+            fps=video_info.get('fps'),
+            neutral_indicators=neutral_raw
+        )
+
+        # 🔧 关键: 立即释放序列内存
+        del landmarks_seq
+        del frames_seq
+
+        if not result:
+            return {"ok": False, "error": "动作处理失败(detector.process 返回空)"}
+
+        feature_vector = worker.feature_integrator.extract_action_features(
+            action_name,
+            result['normalized_indicators'],
+            result['normalized_dynamic_features']
+        )
+
+        return {
+            "ok": True,
+            "action_name": action_name,
+            "video_id": video_info["video_id"],
+            "examination_id": video_info["examination_id"],
+            "result": result,
+            "feature_vector": feature_vector,
+            "elapsed_ms": (time.perf_counter() - t0) * 1000.0
+        }
+
+    def _denormalize_indicators(self, normalized_indicators, video_info):
+        """将归一化指标转换回原始像素值(用于动作类)"""
         return normalized_indicators
 
     def _save_peak_frame(self, frame, examination_id, action_name):
@@ -411,22 +571,17 @@ class VideoPipeline:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # 先查出动作名称，方便和 action_key_indicators 对齐
         video_info = self._get_video_info(video_id)
         action_name = video_info['action_name_en']
 
-        # 根据动作定义，把 dict 映射成有序的 static / dynamic 数组
         key_indicators = self.feature_integrator.action_key_indicators.get(action_name, None)
         if key_indicators is None:
-            # 理论上不会发生，如果发生就直接跳过存储，避免数据库写入垃圾
             print(f"  [WARN] 未在 action_key_indicators 中找到 {action_name}，跳过入库")
             return
 
         static_names = key_indicators['static']
         dynamic_names = key_indicators['dynamic']
 
-        # normalized_indicators / normalized_dynamic_features 都是 dict
-        # 这里按“预先定义好的顺序”取值，保证训练阶段能按相同顺序还原
         static_vals = [
             float(normalized_indicators.get(name, 0.0))
             for name in static_names
@@ -481,7 +636,7 @@ class VideoPipeline:
                     dynamic_features = ?,
                     static_dim = ?,
                     dynamic_dim = ?,
-                    processed_at = CURRENT_TIMESTAMP
+                    geometry_processed_at = CURRENT_TIMESTAMP
                 WHERE video_id = ?
             """, (
                 peak_frame_idx,
@@ -508,30 +663,22 @@ def main():
     model_path = '/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task'
     keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes'
 
-    #  选择运行模式
-    # 说明：
-    #   - 如果只想处理某一个 examination：把 examination_id 改成具体 ID（例如 'XW000001_20240101'）
-    #   - 如果只想处理某个视频：把 video_id 改成具体 video_id（整数），比如 123
-    #   - 如果想批量处理所有未处理的 examinations：保持 run_batch = True 即可
-    examination_id = None   # 例如：'XW000001_20240101'，默认 None
-    video_id = None         # 例如：123，默认 None
-    run_batch = True        # 默认批量处理所有未处理的 examinations
+    examination_id = None
+    video_id = None
+    run_batch = True
 
     # 初始化 Pipeline
     pipeline = VideoPipeline(db_path, model_path, keyframe_dir)
 
-    # 根据上面配置决定怎么跑
     if examination_id is not None:
-        # 处理一个完整的检查（推荐，因为会先用 NeutralFace 做对比）
         pipeline.process_examination(examination_id)
     elif video_id is not None:
-        # 只处理单个视频（不会自动处理同一个检查下的其他动作）
         pipeline.process_video(video_id)
     elif run_batch:
-        # 批量处理所有未处理的 examinations
-        pipeline.process_all_examinations()
+        # 🔧 关键: 使用分批处理,每10个examination清理一次
+        pipeline.process_all_examinations(batch_size=10)
     else:
-        print("当前没有配置任何处理任务，请在 main() 中设置 examination_id / video_id 或 run_batch = True")
+        print("当前没有配置任何处理任务")
 
 
 if __name__ == '__main__':

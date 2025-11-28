@@ -12,9 +12,12 @@ env/
 # Database
 *.db
 
-models/
 
+# data
+models/
 docs/
+checkpoints/
+
 
 # PyCharm
 .idea/
