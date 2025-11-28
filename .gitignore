@@ -17,6 +17,7 @@ env/
 models/
 docs/
 checkpoints/
+*.md
 
 
 # PyCharm
