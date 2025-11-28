@@ -79,7 +79,7 @@ class VideoPipeline:
 
         # 🔧 关键修复1: 降低并行度避免MediaPipe GPU冲突
         # MediaPipe在多线程中会创建多个OpenGL上下文,容易OOM
-        self.num_workers = 5  # 每个线程约500MB模型
+        self.num_workers = 6  # 每个线程约500MB模型
 
         self._tls = threading.local()
 
