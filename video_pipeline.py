@@ -28,19 +28,6 @@ import time
 from facialPalsy.core.landmark_extractor import LandmarkExtractor
 from facialPalsy.action_feature_integrator import ActionFeatureIntegrator
 
-# 导入动作类
-from facialPalsy.actions.neutral_face import NeutralFaceAction
-from facialPalsy.actions.spontaneous_eye_blink import SpontaneousEyeBlinkAction
-from facialPalsy.actions.voluntary_eye_blink import VoluntaryEyeBlinkAction
-from facialPalsy.actions.close_eye_softly import CloseEyeSoftlyAction
-from facialPalsy.actions.close_eye_hardly import CloseEyeHardlyAction
-from facialPalsy.actions.raise_eyebrow import RaiseEyebrowAction
-from facialPalsy.actions.smile import SmileAction
-from facialPalsy.actions.shrug_nose import ShrugNoseAction
-from facialPalsy.actions.show_teeth import ShowTeethAction
-from facialPalsy.actions.blow_cheek import BlowCheekAction
-from facialPalsy.actions.lip_pucker import LipPuckerAction
-
 
 class VideoPipeline:
     """
