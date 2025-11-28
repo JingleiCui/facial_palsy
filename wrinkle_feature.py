@@ -18,9 +18,6 @@
     6: severity_score   - 综合严重程度评分 (0-100)
     7: direction_entropy - 方向熵 (方向多样性)
     8-9: dominant_dirs  - 主要方向 (sin/cos编码)
-
-用法:
-    python wrinkle_feature_extractor.py [db_path]
 """
 
 import os

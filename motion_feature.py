@@ -21,8 +21,6 @@
     10: velocity_mean        - 平均速度
     11: acceleration_std     - 加速度变化
 
-用法:
-    python motion_feature_extractor.py [db_path]
 """
 
 import os

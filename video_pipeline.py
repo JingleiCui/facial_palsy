@@ -648,7 +648,8 @@ def main():
     # 基本路径配置
     db_path = 'facialPalsy.db'
     model_path = '/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task'
-    keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes'
+    keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes'
+    os.makedirs(keyframe_dir, exist_ok=True)
 
     examination_id = None
     video_id = None

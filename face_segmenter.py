@@ -2,7 +2,7 @@
 人脸分割模块 - Face Segmentation Module
 用于从峰值帧图像中分割出人脸区域,去除背景噪声
 """
-
+import os
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -11,6 +11,18 @@ from typing import Optional, Tuple
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import sqlite3
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+def _worker_segment_one(args):
+    img_path, out_path, model_path = args
+    seg = FaceSegmenter(model_path=model_path)  # 每个进程一个实例
+    try:
+        seg.process_peak_frame(Path(img_path), Path(out_path))
+        return (img_path, True, "")
+    except Exception as e:
+        return (img_path, False, str(e))
+    finally:
+        del seg
 
 def to_segmented_path(peak_path: str) -> str:
     """
@@ -18,13 +30,13 @@ def to_segmented_path(peak_path: str) -> str:
 
     规则:
     /.../pipeline/keyframes/ActionName/xxx.jpg
-      → /.../pipeline/keyframes_segmented/ActionName/xxx_segmented.png
+      → /.../pipeline/keyframes_segmented/ActionName/xxx_segmented.jpg
     """
     raw = Path(peak_path)
     # /keyframes/ → /keyframes_segmented/
     seg_dir = str(raw).replace("/keyframes/", "/keyframes_segmented/")
-    # 文件名加 _segmented.png
-    seg = Path(seg_dir).with_name(raw.stem + "_segmented.png")
+    # 文件名加 _segmented.jpg
+    seg = Path(seg_dir).with_name(raw.stem + "_segmented.jpg")
     return str(seg)
 
 def update_segmented_paths(db_path: str):
@@ -196,50 +208,42 @@ class FaceSegmenter:
 
             # 保存mask
             if save_mask:
-                mask_path = output_path.parent / f"{output_path.stem}_mask.png"
+                mask_path = output_path.parent / f"{output_path.stem}_mask.jpg"
                 cv2.imwrite(str(mask_path), face_mask * 255)
 
         return segmented_image, face_mask
 
-    def batch_process_keyframes(
-            self,
-            keyframes_dir: Path,
-            output_dir: Path,
-            pattern: str = "*.jpg"
-    ):
-        """
-        批量处理keyframes目录下的所有峰值帧
-
-        Args:
-            keyframes_dir: keyframes根目录
-            output_dir: 输出目录
-            pattern: 文件匹配模式
-        """
+    def batch_process_keyframes(self, keyframes_dir: Path, output_dir: Path, pattern="*.jpg"):
         keyframes_dir = Path(keyframes_dir)
         output_dir = Path(output_dir)
 
-        total_processed = 0
-
-        # 遍历每个动作目录
+        tasks = []
         for action_dir in keyframes_dir.iterdir():
             if not action_dir.is_dir():
                 continue
-
-            action_name = action_dir.name
-            action_output_dir = output_dir / action_name
+            action_output_dir = output_dir / action_dir.name
             action_output_dir.mkdir(parents=True, exist_ok=True)
 
-            # 处理该动作的所有图像
             for img_path in action_dir.glob(pattern):
-                output_path = action_output_dir / f"{img_path.stem}_segmented.png"
+                out_path = action_output_dir / f"{img_path.stem}_segmented.jpg"
+                tasks.append((str(img_path), str(out_path), self.model_path))
 
-                try:
-                    self.process_peak_frame(img_path, output_path)
-                    total_processed += 1
-                except Exception as e:
-                    print(f"[ERROR] 处理失败 {img_path}: {e}")
+        # 6 个进程
+        max_workers = 6
 
-        print(f"\n[FaceSegmenter] 批量处理完成 - 共处理 {total_processed} 张图像")
+        ok = 0
+        fail = 0
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_worker_segment_one, t) for t in tasks]
+            for fut in as_completed(futures):
+                img_path, success, err = fut.result()
+                if success:
+                    ok += 1
+                else:
+                    fail += 1
+                    print(f"[ERROR] 处理失败 {img_path}: {err}")
+
+        print(f"\n[FaceSegmenter] 批量处理完成 - 成功 {ok} 张 / 失败 {fail} 张 / 总计 {len(tasks)} 张")
 
     def __del__(self):
         """析构函数 - 释放资源"""
@@ -252,10 +256,12 @@ def main():
     测试脚本 - 批量处理keyframes + 更新数据库中的 segmented 路径
     """
     # 配置路径
-    KEYFRAMES_DIR = Path("/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes")
-    OUTPUT_DIR = Path("/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes_segmented")
+    KEYFRAMES_DIR = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes")
+    OUTPUT_DIR = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes_segmented")
     MODEL_PATH = "/Users/cuijinglei/PycharmProjects/medicalProject/models/selfie_multiclass_256x256.tflite"
     DB_PATH = "facialPalsy.db"
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # 创建分割器
     segmenter = FaceSegmenter(model_path=MODEL_PATH)

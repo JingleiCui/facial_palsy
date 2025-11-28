@@ -1,5 +1,5 @@
 """
-视觉特征提取器 V2.0
+视觉特征提取器
 Visual Feature Extractor - Batch Processing
 
 功能:
@@ -86,7 +86,6 @@ class VisualFeatureExtractor:
         ])
 
         print(f"[VisualFeatureExtractor] MobileNetV3-Large 加载成功")
-        print(f"[VisualFeatureExtractor] 输出特征维度: 1280")
 
     def extract_from_image(
         self,
@@ -247,19 +246,19 @@ class VisualFeatureExtractor:
         Args:
             cursor: 数据库游标
             video_id: 视频ID
-            features: 1280维特征
+            features: 视觉特征
         """
-        # 转换为BLOB
-        features_blob = features.astype(np.float32).tobytes()
 
         # 更新数据库
         cursor.execute("""
             UPDATE video_features
             SET visual_features = ?,
-                processed_at = CURRENT_TIMESTAMP
+                visual_dim = ?,
+                visual_processed_at = CURRENT_TIMESTAMP
             WHERE video_id = ?
         """, (
-            features_blob,
+            features.astype(np.float32).tobytes(),
+            len(features),
             video_id
         ))
 
@@ -318,7 +317,7 @@ def main():
     主函数 - 批量提取视觉特征
     """
     db_path = 'facialPalsy.db'
-    segmented_root = Path('/Users/cuijinglei/Documents/facialPalsy/pipeline/keyframes_segmented')
+    segmented_root = Path('/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes_segmented')
 
     # device:
     #   None  → 自动检测（优先 mps, 否则 cpu）
