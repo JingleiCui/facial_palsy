@@ -370,7 +370,7 @@ class Stage1CDCAFRunner:
                     """
                     UPDATE video_features
                     SET geo_refined_features = ?,
-                        processed_at = CURRENT_TIMESTAMP
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE video_id = ?
                     """,
                     (feat.tobytes(), vid),

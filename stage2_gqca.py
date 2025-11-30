@@ -298,7 +298,7 @@ class Stage2GQCARunner:
                 """
                 UPDATE video_features
                 SET visual_guided_features = ?,
-                    processed_at = CURRENT_TIMESTAMP
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE video_id = ?
                 """,
                 (feat.tobytes(), vid),

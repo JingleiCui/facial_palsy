@@ -278,7 +278,7 @@ class Stage3MFARunner:
                 UPDATE video_features
                 SET fused_action_features = ?,
                     visual_global_features = ?,
-                    processed_at = CURRENT_TIMESTAMP
+                    updatd_at = CURRENT_TIMESTAMP
                 WHERE video_id = ?
                 """,
                 (fa.tobytes(), vglo.tobytes(), vid),
