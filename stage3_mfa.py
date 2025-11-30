@@ -9,7 +9,6 @@ Stage 3: MFA (Multi-modal Fusion Attention)
    - visual_features        (B, 1280) 作为视觉全局输入
 2. 通过 Transformer + token gating 得到动作级 512 维特征
 3. 写入:
-   - video_features.visual_global_features    (256维)
    - video_features.fused_action_features     (512维)
 
 使用:
@@ -259,7 +258,6 @@ class Stage3MFARunner:
             )
 
         fused_np = fused_action.detach().cpu().numpy().astype(np.float32)
-        vglob_token_np = details["vglobal_token"].detach().cpu().numpy().astype(np.float32)
         modality_weights_np = details["modality_weights"].detach().cpu().numpy()
 
         # 可选: 打印一次模态权重统计
@@ -271,17 +269,17 @@ class Stage3MFARunner:
             )
             self.print_weight_stats = False
 
-        # 写回 DB
-        for vid, fa, vglo in zip(video_ids, fused_np, vglob_token_np):
+        # 写回 DB (只写入fused_action_features)
+        for vid, fa in zip(video_ids, fused_np):
             cur.execute(
                 """
                 UPDATE video_features
                 SET fused_action_features = ?,
-                    visual_global_features = ?,
-                    updatd_at = CURRENT_TIMESTAMP
+                    fusion_processed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE video_id = ?
                 """,
-                (fa.tobytes(), vglo.tobytes(), vid),
+                (fa.tobytes(), vid),
             )
 
         conn.commit()

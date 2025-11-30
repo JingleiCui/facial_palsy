@@ -512,14 +512,8 @@ def print_dataset_stats(db_path: str):
 
 def main():
     """主函数"""
-    if len(sys.argv) < 2:
-        print("用法:")
-        print("  python data_augmentation.py split [db_path]  # 执行数据划分")
-        print("  python data_augmentation.py stats [db_path]  # 查看统计信息")
-        sys.exit(1)
-
-    command = sys.argv[1]
-    db_path = sys.argv[2] if len(sys.argv) > 2 else 'facialPalsy.db'
+    command = 'split'
+    db_path = 'facialPalsy.db'
 
     if command == 'split':
         splitter = DatasetSplitter(
