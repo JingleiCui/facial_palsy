@@ -225,15 +225,8 @@ def compute_asymmetry(displacement: np.ndarray) -> float:
         left_indices = MOTION_SYMMETRIC_REGIONS.get(left_region, [])
         right_indices = MOTION_SYMMETRIC_REGIONS.get(right_region, [])
 
-        # 过滤有效索引
-        left_valid = [i for i in left_indices if i < len(displacement)]
-        right_valid = [i for i in right_indices if i < len(displacement)]
-
-        if not left_valid or not right_valid:
-            continue
-
-        left_motion = np.mean(displacement[left_valid])
-        right_motion = np.mean(displacement[right_valid])
+        left_motion = np.mean(displacement[left_indices])
+        right_motion = np.mean(displacement[right_indices])
 
         total = left_motion + right_motion
         if total > 1e-6:

@@ -95,7 +95,7 @@ class VideoPipeline:
         self.model_path = model_path
 
         # 降低并行度避免MediaPipe GPU冲突
-        self.num_workers = 6
+        self.num_workers = 4
 
         self._tls = threading.local()
 
@@ -282,6 +282,14 @@ class VideoPipeline:
         h, w = frames_seq[0].shape[:2]
         fps = video_info.get('fps')
 
+        # 确保fps是数值类型
+        if fps is None:
+            fps = 30.0
+        elif isinstance(fps, (list, tuple)):
+            fps = float(fps[0]) if fps else 30.0
+        else:
+            fps = float(fps)
+
         result = detector.process(
             landmarks_seq=landmarks_seq,
             frames_seq=frames_seq,
@@ -292,7 +300,11 @@ class VideoPipeline:
         )
 
         # 6. 计算运动特征 (复用landmarks_seq)
-        motion_features = compute_motion_features(landmarks_seq, w, h, fps)
+        try:
+            motion_features = compute_motion_features(landmarks_seq, w, h, fps)
+        except Exception as e:
+            print(f"[WARN] 运动特征计算异常: {e}")
+            motion_features = None
 
         # 释放序列
         del landmarks_seq
@@ -377,6 +389,14 @@ class VideoPipeline:
         h, w = frames_seq[0].shape[:2]
         fps = video_info.get('fps')
 
+        # 确保fps是数值类型
+        if fps is None:
+            fps = 30.0
+        elif isinstance(fps, (list, tuple)):
+            fps = float(fps[0]) if fps else 30.0
+        else:
+            fps = float(fps)
+
         result = detector.process(
             landmarks_seq=landmarks_seq,
             frames_seq=frames_seq,
@@ -387,7 +407,11 @@ class VideoPipeline:
         )
 
         # 计算运动特征 (复用landmarks_seq)
-        motion_features = compute_motion_features(landmarks_seq, w, h, fps)
+        try:
+            motion_features = compute_motion_features(landmarks_seq, w, h, fps)
+        except Exception as e:
+            print(f"[WARN] 运动特征计算异常: {e}")
+            motion_features = None
 
         # 释放序列内存
         del landmarks_seq
@@ -414,16 +438,18 @@ class VideoPipeline:
         }
 
     def process_all_examinations(self, batch_size=10):
-        """批量处理所有未处理的examinations"""
+        """批量处理所有未处理的examinations（包括motion_features为空的情况）"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
+        # 修改查询：选择未处理的examination 或 已处理但motion_features为空的examination
         cursor.execute("""
             SELECT DISTINCT e.examination_id
             FROM examinations e
             INNER JOIN video_files vf ON e.examination_id = vf.examination_id
             LEFT JOIN video_features feat ON vf.video_id = feat.video_id
-            WHERE vf.file_exists = 1 AND feat.feature_id IS NULL
+            WHERE vf.file_exists = 1 
+              AND (feat.feature_id IS NULL OR feat.motion_features IS NULL)
             ORDER BY e.examination_id
         """)
 
@@ -498,8 +524,6 @@ class VideoPipeline:
                 if not file_path or not os.path.exists(file_path):
                     fail_count += 1
                     continue
-
-                fps = fps
 
                 # 提取landmarks
                 landmarks_seq, frames_seq = self._extract_sequence(
