@@ -279,7 +279,7 @@ class MultiTaskLoss(nn.Module):
 
         # 可学习的log方差参数 (Uncertainty Weighting核心)
         self.log_vars = nn.ParameterDict({
-            name: nn.Parameter(torch.zeros(1))
+            name: nn.Parameter(torch.zeros(1, device=device))
             for name in self.task_configs.keys()
         })
 
@@ -355,7 +355,17 @@ class MultiTaskLoss(nn.Module):
             # loss = loss / (2 * sigma^2) + log(sigma)
             # = loss * exp(-2*log_var) + log_var
             log_var = self.log_vars[name]
+
+            # 🔧 限制 log_var 范围,防止 exp 爆炸
+            log_var = torch.clamp(log_var, min=-10, max=10)
+
+            # 计算加权损失
             weighted_loss = raw_loss * torch.exp(-2 * log_var) + log_var
+
+            # 🔧 检查加权损失是否有效
+            if torch.isnan(weighted_loss) or torch.isinf(weighted_loss):
+                # 如果无效,直接使用原始损失
+                weighted_loss = raw_loss
 
             task_losses[name] = raw_loss.detach()
             weighted_losses.append(weighted_loss)
