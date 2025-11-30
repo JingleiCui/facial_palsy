@@ -1,17 +1,15 @@
 """
-H-GFA Net 训练脚本
-======================
+H-GFA Net 训练脚本 (修复版)
+==============================
 
-完整的训练流程，包括:
-1. 数据加载 (支持所有特征类型)
-2. 数据增强
-3. 多任务学习
-4. 训练/验证循环
-5. 模型保存和日志记录
+修复内容:
+1. 添加特征 NaN/Inf 检查和清理
+2. 修复 classification_report 的 labels 参数
+3. 添加梯度异常检测
+4. 改进损失计算的数值稳定性
 
 用法:
-    python train_model.py [config.yaml]  # 使用配置文件
-    python train_model.py                 # 使用默认配置
+    python train_model.py
 """
 
 import os
@@ -49,40 +47,25 @@ from data_augmentation import (
 @dataclass
 class TrainConfig:
     """训练配置"""
-    # 数据
     db_path: str = 'facialPalsy.db'
-
-    # 训练参数
     batch_size: int = 16
     num_epochs: int = 100
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
-
-    # 学习率调度
-    lr_scheduler: str = 'plateau'  # 'plateau', 'cosine', 'step'
+    lr_scheduler: str = 'plateau'
     lr_patience: int = 10
     lr_factor: float = 0.5
     min_lr: float = 1e-6
-
-    # 早停
     early_stopping_patience: int = 20
-
-    # 任务
     task_names: List[str] = None
-
-    # 数据增强
     augment_prob: float = 0.5
-
-    # 保存
     save_dir: str = 'checkpoints'
     experiment_name: str = None
-
-    # 设备
     device: str = 'auto'
 
     def __post_init__(self):
         if self.task_names is None:
-            self.task_names = ['severity', 'hb_grading']
+            self.task_names = ['severity']
 
         if self.experiment_name is None:
             self.experiment_name = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -97,32 +80,126 @@ class TrainConfig:
 
 
 # =============================================================================
+# 特征清理工具
+# =============================================================================
+
+def clean_features(features: np.ndarray, name: str = "features") -> np.ndarray:
+    """
+    清理特征中的 NaN 和 Inf 值
+
+    Args:
+        features: numpy数组
+        name: 特征名称（用于日志）
+
+    Returns:
+        清理后的特征
+    """
+    if features is None:
+        return None
+
+    # 检查并替换 NaN
+    nan_count = np.isnan(features).sum()
+    if nan_count > 0:
+        print(f"  [WARN] {name} 包含 {nan_count} 个 NaN，替换为0")
+        features = np.nan_to_num(features, nan=0.0)
+
+    # 检查并替换 Inf
+    inf_count = np.isinf(features).sum()
+    if inf_count > 0:
+        print(f"  [WARN] {name} 包含 {inf_count} 个 Inf，替换为0")
+        features = np.nan_to_num(features, posinf=0.0, neginf=0.0)
+
+    return features
+
+
+def validate_sample(sample: Dict[str, Any]) -> bool:
+    """
+    验证样本是否有效
+
+    Returns:
+        True 如果样本有效
+    """
+    # 检查必要字段
+    if sample.get('static_features') is None:
+        return False
+
+    if sample.get('visual_features') is None:
+        return False
+
+    # 检查标签
+    severity = sample.get('severity')
+    if severity is None or severity < 1 or severity > 5:
+        return False
+
+    return True
+
+
+# =============================================================================
 # 数据集
 # =============================================================================
 
 class FacialPalsyDataset(Dataset):
-    """
-    面瘫评估数据集
-
-    支持所有特征类型: 几何、视觉、皱纹、运动
-    """
+    """面瘫评估数据集（带特征清理）"""
 
     def __init__(
         self,
         samples: List[Dict[str, Any]],
         is_training: bool = True
     ):
-        self.samples = samples
-        self.is_training = is_training
+        # 过滤无效样本
+        valid_samples = []
+        invalid_count = 0
 
-        # 按动作分组
+        for sample in samples:
+            if validate_sample(sample):
+                # 清理特征
+                sample['static_features'] = clean_features(
+                    sample.get('static_features'),
+                    f"static_{sample.get('video_id')}"
+                )
+                sample['dynamic_features'] = clean_features(
+                    sample.get('dynamic_features'),
+                    f"dynamic_{sample.get('video_id')}"
+                )
+                sample['visual_features'] = clean_features(
+                    sample.get('visual_features'),
+                    f"visual_{sample.get('video_id')}"
+                )
+                sample['wrinkle_features'] = clean_features(
+                    sample.get('wrinkle_features'),
+                    f"wrinkle_{sample.get('video_id')}"
+                )
+                sample['motion_features'] = clean_features(
+                    sample.get('motion_features'),
+                    f"motion_{sample.get('video_id')}"
+                )
+                valid_samples.append(sample)
+            else:
+                invalid_count += 1
+
+        if invalid_count > 0:
+            print(f"[Dataset] 过滤了 {invalid_count} 个无效样本")
+
+        self.samples = valid_samples
+        self.is_training = is_training
         self.action_groups = self._group_by_action()
 
-        print(f"[Dataset] 样本数: {len(samples)}")
+        print(f"[Dataset] 有效样本数: {len(self.samples)}")
         print(f"[Dataset] 动作分布: {dict(sorted((k, len(v)) for k, v in self.action_groups.items()))}")
 
+        # 打印标签分布
+        self._print_label_distribution()
+
+    def _print_label_distribution(self):
+        """打印标签分布"""
+        severity_counts = defaultdict(int)
+        for sample in self.samples:
+            sev = sample.get('severity', -1)
+            severity_counts[sev] += 1
+
+        print(f"[Dataset] Severity分布: {dict(sorted(severity_counts.items()))}")
+
     def _group_by_action(self) -> Dict[str, List[int]]:
-        """按动作分组"""
         groups = defaultdict(list)
         for idx, sample in enumerate(self.samples):
             action = sample.get('action_name', 'Unknown')
@@ -135,7 +212,6 @@ class FacialPalsyDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.samples[idx].copy()
 
-        # 转换为Tensor
         result = {
             'video_id': sample['video_id'],
             'action_name': sample['action_name'],
@@ -180,10 +256,10 @@ class FacialPalsyDataset(Dataset):
         else:
             result['motion'] = torch.zeros(12)
 
-        # 标签
+        # 标签 (severity 1-5 转为 0-4)
         severity = sample.get('severity')
-        if severity is not None:
-            result['severity_label'] = int(severity) - 1  # 转为0-indexed
+        if severity is not None and 1 <= severity <= 5:
+            result['severity_label'] = int(severity) - 1
         else:
             result['severity_label'] = -1
 
@@ -203,12 +279,7 @@ class FacialPalsyDataset(Dataset):
 
 
 def collate_fn(batch: List[Dict]) -> Dict[str, Dict[str, torch.Tensor]]:
-    """
-    按动作分组的collate函数
-
-    处理可变维度的几何特征
-    """
-    # 按动作分组
+    """按动作分组的collate函数"""
     action_groups = defaultdict(list)
     for item in batch:
         action = item['action_name']
@@ -260,12 +331,10 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Dict[str, torch.Tensor]]:
                     dyn = torch.cat([dyn, pad])
                 padded_dynamic.append(dyn)
 
-            # 其他特征
             visual_list.append(item['visual'])
             wrinkle_list.append(item['wrinkle'])
             motion_list.append(item['motion'])
 
-            # 标签
             severity_labels.append(item['severity_label'])
             hb_labels.append(item['hb_label'])
             sunnybrook_labels.append(item['sunnybrook_label'])
@@ -291,7 +360,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Dict[str, torch.Tensor]]:
 # =============================================================================
 
 class Trainer:
-    """H-GFA Net 训练器"""
+    """H-GFA Net 训练器（修复版）"""
 
     def __init__(
         self,
@@ -358,11 +427,27 @@ class Trainer:
         with open(self.save_dir / 'config.json', 'w') as f:
             json.dump(asdict(config), f, indent=2)
 
+    def _check_tensor(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
+        """检查并清理张量中的 NaN/Inf"""
+        if tensor is None:
+            return None
+
+        if torch.isnan(tensor).any():
+            print(f"  [WARN] {name} 包含 NaN，替换为0")
+            tensor = torch.nan_to_num(tensor, nan=0.0)
+
+        if torch.isinf(tensor).any():
+            print(f"  [WARN] {name} 包含 Inf，替换为0")
+            tensor = torch.nan_to_num(tensor, posinf=0.0, neginf=0.0)
+
+        return tensor
+
     def train_epoch(self, epoch: int) -> float:
         """训练一个epoch"""
         self.model.train()
         total_loss = 0.0
         num_batches = 0
+        nan_batches = 0
 
         for batch_idx, batch in enumerate(self.train_loader):
             self.optimizer.zero_grad()
@@ -375,17 +460,38 @@ class Trainer:
             targets = {}
             valid_masks = {}
 
-            # 严重程度任务
             if 'severity' in self.config.task_names and output.get('action_logits') is not None:
-                predictions['severity'] = output['action_logits']
-                targets['severity'] = output['action_labels']
-                valid_masks['severity'] = targets['severity'] >= 0
+                logits = output['action_logits']
+                labels = output['action_labels']
+
+                # 检查 NaN
+                logits = self._check_tensor(logits, f"logits_batch{batch_idx}")
+
+                predictions['severity'] = logits
+                targets['severity'] = labels
+                valid_masks['severity'] = labels >= 0
 
             # 计算损失
             loss, task_losses = self.loss_fn(predictions, targets, valid_masks)
 
+            # 检查损失是否为 NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_batches += 1
+                print(f"  [WARN] Batch {batch_idx}: Loss is NaN/Inf, skipping")
+                continue
+
             # 反向传播
             loss.backward()
+
+            # 检查梯度
+            total_grad_norm = 0.0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                        print(f"  [WARN] Batch {batch_idx}: Gradient contains NaN/Inf")
+                        p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                    total_grad_norm += p.grad.data.norm(2).item() ** 2
+            total_grad_norm = total_grad_norm ** 0.5
 
             # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -395,10 +501,12 @@ class Trainer:
             total_loss += loss.item()
             num_batches += 1
 
-            # 打印进度
             if (batch_idx + 1) % 10 == 0:
                 print(f"  Batch {batch_idx+1}/{len(self.train_loader)}, "
-                      f"Loss: {loss.item():.4f}")
+                      f"Loss: {loss.item():.4f}, GradNorm: {total_grad_norm:.2f}")
+
+        if nan_batches > 0:
+            print(f"  [WARN] 本Epoch有 {nan_batches} 个batch的loss为NaN")
 
         avg_loss = total_loss / max(num_batches, 1)
         return avg_loss
@@ -416,7 +524,6 @@ class Trainer:
         for batch in self.val_loader:
             output = self.model(batch)
 
-            # 准备预测和目标
             predictions = {}
             targets = {}
             valid_masks = {}
@@ -426,7 +533,6 @@ class Trainer:
                 targets['severity'] = output['action_labels']
                 valid_masks['severity'] = targets['severity'] >= 0
 
-                # 收集预测结果
                 mask = valid_masks['severity']
                 if mask.sum() > 0:
                     preds = output['action_logits'][mask].argmax(dim=1).cpu().numpy()
@@ -435,12 +541,14 @@ class Trainer:
                     all_labels.extend(labels.tolist())
 
             loss, _ = self.loss_fn(predictions, targets, valid_masks)
-            total_loss += loss.item()
-            num_batches += 1
+
+            # 跳过 NaN loss
+            if not torch.isnan(loss) and not torch.isinf(loss):
+                total_loss += loss.item()
+                num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
 
-        # 计算准确率
         if all_preds:
             accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_preds)
         else:
@@ -475,21 +583,34 @@ class Trainer:
         if not self.train_losses:
             return
 
-        epochs = range(1, len(self.train_losses) + 1)
+        # 过滤掉 NaN
+        valid_epochs = []
+        valid_train_losses = []
+        valid_val_losses = []
+        valid_val_accs = []
+
+        for i, (tl, vl, va) in enumerate(zip(self.train_losses, self.val_losses, self.val_accs)):
+            if not (np.isnan(tl) or np.isnan(vl)):
+                valid_epochs.append(i + 1)
+                valid_train_losses.append(tl)
+                valid_val_losses.append(vl)
+                valid_val_accs.append(va)
+
+        if not valid_epochs:
+            print("[Plot] 没有有效数据可绘制")
+            return
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-        # 损失曲线
-        axes[0].plot(epochs, self.train_losses, 'b-', label='Train')
-        axes[0].plot(epochs, self.val_losses, 'r-', label='Val')
+        axes[0].plot(valid_epochs, valid_train_losses, 'b-', label='Train')
+        axes[0].plot(valid_epochs, valid_val_losses, 'r-', label='Val')
         axes[0].set_xlabel('Epoch')
         axes[0].set_ylabel('Loss')
         axes[0].set_title('Loss Curve')
         axes[0].legend()
         axes[0].grid(True)
 
-        # 准确率曲线
-        axes[1].plot(epochs, self.val_accs, 'g-', label='Val Accuracy')
+        axes[1].plot(valid_epochs, valid_val_accs, 'g-', label='Val Accuracy')
         axes[1].set_xlabel('Epoch')
         axes[1].set_ylabel('Accuracy')
         axes[1].set_title('Validation Accuracy')
@@ -524,7 +645,8 @@ class Trainer:
 
             # 学习率调度
             if self.config.lr_scheduler == 'plateau':
-                self.scheduler.step(val_loss)
+                if not np.isnan(val_loss):
+                    self.scheduler.step(val_loss)
             else:
                 self.scheduler.step()
 
@@ -540,17 +662,27 @@ class Trainer:
             if epoch % 5 == 0:
                 print_task_weights(self.loss_fn)
 
-            # 分类报告
+            # 分类报告 - 修复：动态确定类别数
             if epoch % 10 == 0 and labels:
                 print("\n分类报告:")
-                print(classification_report(
-                    labels, preds,
-                    target_names=[f"Grade {i+1}" for i in range(5)],
-                    zero_division=0
-                ))
 
-            # 保存最佳模型
-            if val_loss < self.best_val_loss:
+                # 获取实际出现的类别
+                unique_labels = sorted(set(labels) | set(preds))
+                target_names = [f"Grade {i+1}" for i in unique_labels]
+
+                try:
+                    print(classification_report(
+                        labels, preds,
+                        labels=unique_labels,
+                        target_names=target_names,
+                        zero_division=0
+                    ))
+                except Exception as e:
+                    print(f"  [WARN] 无法生成分类报告: {e}")
+                    print(f"  实际标签: {set(labels)}, 预测标签: {set(preds)}")
+
+            # 保存最佳模型 (跳过 NaN)
+            if not np.isnan(val_loss) and val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.best_val_acc = val_acc
                 self.patience_counter = 0
@@ -571,7 +703,6 @@ class Trainer:
             if self.device.type == 'mps':
                 torch.mps.empty_cache()
 
-        # 训练完成
         print("\n" + "=" * 60)
         print("✓ 训练完成!")
         print(f"最佳验证损失: {self.best_val_loss:.4f}")
@@ -579,11 +710,55 @@ class Trainer:
         print(f"模型保存: {self.save_dir}")
         print("=" * 60)
 
-        # 绘制曲线
         self.plot_curves()
-
-        # 保存最终模型
         self.save_checkpoint(epoch, 'final_model.pth')
+
+
+# =============================================================================
+# 诊断工具
+# =============================================================================
+
+def diagnose_features(db_path: str):
+    """诊断特征数据质量"""
+    print("\n" + "=" * 60)
+    print("特征数据诊断")
+    print("=" * 60)
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # 检查各类特征的统计
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN static_features IS NOT NULL THEN 1 ELSE 0 END) as has_static,
+            SUM(CASE WHEN visual_features IS NOT NULL THEN 1 ELSE 0 END) as has_visual,
+            SUM(CASE WHEN wrinkle_features IS NOT NULL THEN 1 ELSE 0 END) as has_wrinkle,
+            SUM(CASE WHEN motion_features IS NOT NULL THEN 1 ELSE 0 END) as has_motion
+        FROM video_features
+    """)
+
+    row = cursor.fetchone()
+    print(f"\n特征完整性:")
+    print(f"  总记录数: {row[0]}")
+    print(f"  static_features: {row[1]}/{row[0]}")
+    print(f"  visual_features: {row[2]}/{row[0]}")
+    print(f"  wrinkle_features: {row[3]}/{row[0]}")
+    print(f"  motion_features: {row[4]}/{row[0]}")
+
+    # 检查标签分布
+    cursor.execute("""
+        SELECT severity_score, COUNT(*) 
+        FROM action_labels 
+        GROUP BY severity_score 
+        ORDER BY severity_score
+    """)
+
+    print(f"\nSeverity标签分布:")
+    for row in cursor.fetchall():
+        print(f"  Grade {row[0]}: {row[1]} 条")
+
+    conn.close()
 
 
 # =============================================================================
@@ -592,7 +767,6 @@ class Trainer:
 
 def main():
     """主函数"""
-    # 配置
     config = TrainConfig(
         db_path='facialPalsy.db',
         batch_size=16,
@@ -612,6 +786,9 @@ def main():
     print(f"学习率: {config.learning_rate}")
     print(f"任务: {config.task_names}")
     print("=" * 60)
+
+    # 诊断特征
+    diagnose_features(config.db_path)
 
     # 检查数据划分
     print("\n[1/5] 检查数据划分...")
