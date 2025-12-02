@@ -174,7 +174,9 @@ CREATE INDEX IF NOT EXISTS idx_action_labels_severity ON action_labels(severity_
 
 CREATE TABLE IF NOT EXISTS video_features (
     feature_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_id INTEGER NOT NULL UNIQUE,
+    video_id INTEGER NOT NULL,
+    augmentation_type TEXT DEFAULT 'none',      -- 增强类型：none、mirror、rotate_-5等
+    aug_palsy_side INTEGER,                    -- 增强后的患侧标签
     
     -- ========== 基础信息 ==========
     peak_frame_idx INTEGER,                   -- 峰值帧索引
@@ -219,7 +221,8 @@ CREATE TABLE IF NOT EXISTS video_features (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     
-    FOREIGN KEY (video_id) REFERENCES video_files(video_id)
+    FOREIGN KEY (video_id) REFERENCES video_files(video_id),
+    UNIQUE(video_id, augmentation_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_vf_video ON video_features(video_id);
@@ -346,6 +349,7 @@ CREATE TABLE IF NOT EXISTS action_predictions (
 CREATE VIEW IF NOT EXISTS v_training_samples AS
 SELECT 
     vf.video_id,
+    vfeat.augmentation_type, 
     vf.examination_id,
     vf.action_id,
     at.action_name_en,
@@ -374,7 +378,8 @@ SELECT
     
     -- 检查级标签
     el.has_palsy,
-    el.palsy_side,
+    el.palsy_side AS orig_palsy_side,
+    COALESCE(vfeat.aug_palsy_side, el.palsy_side) AS palsy_side,  -- 优先使用增强标签
     el.hb_grade,
     el.sunnybrook_score,
     

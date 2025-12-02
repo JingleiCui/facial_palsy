@@ -12,8 +12,8 @@
 - 默认比例: Train 80%, Val 10%, Test 10%
 
 用法:
-    python data_augmentation.py split [db_path]      # 执行数据划分
-    python data_augmentation.py stats [db_path]      # 查看统计信息
+    python data_split.py split [db_path]      # 执行数据划分
+    python data_split.py stats [db_path]      # 查看统计信息
 """
 
 import os
@@ -465,7 +465,7 @@ def print_dataset_stats(db_path: str):
         for split_type, patients, exams, videos in results:
             print(f"  {split_type:6} - 患者:{patients:4}, 检查:{exams:4}, 视频:{videos:5}")
     else:
-        print("\n[!] 尚未进行数据划分，请先运行: python data_augmentation.py split")
+        print("\n[!] 尚未进行数据划分，请先运行: python data_split.py split")
 
     # 3. 特征完整性
     cursor.execute("""

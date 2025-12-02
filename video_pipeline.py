@@ -37,13 +37,6 @@
 import os
 import sys
 from pathlib import Path
-
-# 添加项目根目录到 Python 路径
-current_dir = Path(__file__).resolve().parent
-parent_dir = current_dir.parent
-if str(parent_dir) not in sys.path:
-    sys.path.insert(0, str(parent_dir))
-
 import cv2
 import numpy as np
 import sqlite3
@@ -56,11 +49,17 @@ import time
 from facialPalsy.core.landmark_extractor import LandmarkExtractor
 from facialPalsy.core.motion_utils import compute_motion_features
 from facialPalsy.action_feature_integrator import ActionFeatureIntegrator
+from facialPalsy.core.augmentation_utils import (
+        flip_palsy_side,
+        horizontal_flip_landmarks_seq,
+        rotate_landmarks_seq,
+        adjust_brightness_contrast,
+    )
 
 
 class VideoPipeline:
     """
-    视频处理Pipeline V4
+    视频处理Pipeline
 
     集成功能:
     1. 几何特征提取 (static + dynamic)
@@ -192,7 +191,7 @@ class VideoPipeline:
                 feature_vector=out["feature_vector"],
                 normalized_indicators=r['normalized_indicators'],
                 normalized_dynamic_features=r['normalized_dynamic_features'],
-                motion_features=out.get("motion_features")
+                motion_features=out.get("motion_features"),
             )
 
             results[action_name] = {
@@ -282,14 +281,6 @@ class VideoPipeline:
         h, w = frames_seq[0].shape[:2]
         fps = video_info.get('fps')
 
-        # 确保fps是数值类型
-        if fps is None:
-            fps = 30.0
-        elif isinstance(fps, (list, tuple)):
-            fps = float(fps[0]) if fps else 30.0
-        else:
-            fps = float(fps)
-
         result = detector.process(
             landmarks_seq=landmarks_seq,
             frames_seq=frames_seq,
@@ -323,11 +314,19 @@ class VideoPipeline:
 
         print(f"  ✓ 几何特征: {feature_vector.shape[0]}维, 运动特征: 12维")
 
+        conn_tmp = sqlite3.connect(self.db_path)
+        cur_tmp = conn_tmp.cursor()
+        cur_tmp.execute("SELECT palsy_side FROM examination_labels WHERE examination_id = ?",
+                        (video_info['examination_id'],))
+        palsy_side = cur_tmp.fetchone()[0] if cur_tmp.fetchone() else None
+        conn_tmp.close()
+
         # 8. 保存峰值帧
         peak_frame_path = self._save_peak_frame(
             result['peak_frame'],
             video_info['examination_id'],
-            action_name
+            action_name,
+            augmentation_type='none'
         )
 
         # 9. 存储到数据库
@@ -339,7 +338,9 @@ class VideoPipeline:
             feature_vector=feature_vector,
             normalized_indicators=result['normalized_indicators'],
             normalized_dynamic_features=result['normalized_dynamic_features'],
-            motion_features=motion_features
+            motion_features=motion_features,
+            augmentation_type='none',
+            aug_palsy_side=palsy_side,
         )
 
         return {
@@ -664,12 +665,12 @@ class VideoPipeline:
         """将归一化指标转换回原始像素值"""
         return normalized_indicators
 
-    def _save_peak_frame(self, frame, examination_id, action_name):
+    def _save_peak_frame(self, frame, examination_id, action_name, augmentation_type: str = 'none'):
         """保存峰值帧"""
         action_dir = self.keyframe_root_dir / action_name
         action_dir.mkdir(parents=True, exist_ok=True)
-
-        filename = f"{examination_id}_{action_name}.jpg"
+        aug = '' if augmentation_type in (None, '', 'none') else f"_{augmentation_type}"
+        filename = f"{examination_id}_{action_name}{aug}.jpg"
         filepath = action_dir / filename
 
         cv2.imwrite(str(filepath), frame)
@@ -678,7 +679,8 @@ class VideoPipeline:
 
     def _save_to_database(self, video_id, peak_frame_idx, peak_frame_path,
                           unit_length, feature_vector, normalized_indicators,
-                          normalized_dynamic_features, motion_features=None):
+                          normalized_dynamic_features, motion_features=None,
+                          augmentation_type='none', aug_palsy_side=None):
         """
         保存到数据库 (包含motion_features)
         """
@@ -726,6 +728,8 @@ class VideoPipeline:
             cursor.execute("""
                 INSERT INTO video_features (
                     video_id,
+                    augmentation_type,
+                    aug_palsy_side,
                     peak_frame_idx,
                     peak_frame_path,
                     unit_length,
@@ -737,9 +741,11 @@ class VideoPipeline:
                     motion_dim,
                     geometry_processed_at,
                     motion_processed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """, (
                 video_id,
+                augmentation_type,
+                aug_palsy_side,
                 peak_frame_idx,
                 peak_frame_path,
                 unit_length,
@@ -757,7 +763,9 @@ class VideoPipeline:
             # 更新
             cursor.execute("""
                 UPDATE video_features
-                SET peak_frame_idx = ?,
+                SET augmentation_type = ?,
+                    aug_palsy_side = ?,
+                    peak_frame_idx = ?,
                     peak_frame_path = ?,
                     unit_length = ?,
                     static_features = ?,
@@ -771,6 +779,8 @@ class VideoPipeline:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE video_id = ?
             """, (
+                augmentation_type,
+                aug_palsy_side,
                 peak_frame_idx,
                 peak_frame_path,
                 unit_length,

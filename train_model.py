@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 # 本地模块
 from hgfa_net import HGFANet, create_hgfa_net
 from multi_task_loss import MultiTaskLoss, print_task_weights
-from data_augmentation import (
+from data_split import (
     DatasetSplitter,
     load_samples_from_db,
     print_dataset_stats
@@ -801,7 +801,7 @@ def main():
 
     if not train_samples:
         print("[!] 训练集为空，请先执行数据划分:")
-        print("    python data_augmentation.py split")
+        print("    python data_split.py split")
         return
 
     print(f"训练样本: {len(train_samples)}")
