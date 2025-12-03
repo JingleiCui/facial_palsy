@@ -56,7 +56,6 @@ from facialPalsy.core.augmentation_utils import (
         adjust_brightness_contrast,
     )
 
-
 class VideoPipeline:
     """
     视频处理Pipeline

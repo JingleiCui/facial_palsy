@@ -1,342 +1,331 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Stage 2: GQCA (Geometry-guided Query Cross-Attention)
-几何引导的查询交叉注意力模块 + SQLite 写入逻辑
+几何引导的查询交叉注意力模块
 
-功能:
-1. 使用 Stage1 输出的 geo_refined 作为 Query
-2. 使用 visual_features (1280维) 生成 7×7=49 个伪空间 token
-3. 通过 FiLM 调制 + Multi-Head Cross-Attention 得到几何引导的视觉特征
-4. 写入 video_features.visual_guided_features 字段
+功能：
+1. 从video_features表读取 geo_refined_features + visual_features + wrinkle_features
+2. 使用 GQCA 模块进行几何引导的视觉特征增强
+3. 融合皱纹特征（10维）到视觉特征中
+4. 输出 visual_guided_features (256维) 并写回数据库
 
-使用:
-    python stage2_gqca.py [facialPalsy.db]
+直接在PyCharm中点击运行即可！可重复运行，已处理的样本会跳过。
 """
 
-import sys
 import sqlite3
-from typing import Optional, List, Tuple
-
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
+import pickle
 
+# ==================== 配置参数 ====================
+DB_PATH = "facialPalsy.db"
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-# =========================
-# 1. GQCA 模块定义
-# =========================
+# 模型参数
+GEO_DIM = 256
+VISUAL_DIM = 1280
+WRINKLE_DIM = 10  # 皱纹特征维度
+HIDDEN_DIM = 256
+NUM_HEADS = 4
+DROPOUT = 0.1
+BATCH_SIZE = 128
 
+# 是否强制重新处理
+FORCE_REPROCESS = True
+
+# ====== 统一的特征编码函数 ======
+def encode_feature(arr: np.ndarray) -> bytes:
+    """
+    将任意 numpy 数组统一编码为 float32 BLOB
+    """
+    arr = np.asarray(arr, dtype=np.float32).ravel()
+    return arr.tobytes()
+
+# ==================== GQCA模块 ====================
 class GQCA(nn.Module):
-    """
-    几何引导的 Cross-Attention 模块 (1D 视觉向量 → 伪 7×7 空间 token)
+    """Geometry-guided Query Cross-Attention Module with Wrinkle Features"""
 
-    输入:
-        geo_refined    : (B, geo_dim)
-        visual_vec     : (B, visual_dim=1280)
-
-    输出:
-        visual_guided  : (B, out_dim=256)
-        (可选)details  : {
-            'attention_map': (B, 7, 7),
-            'q_final': (B, d_model),
-            'x_pooled': (B, d_model),
-        }
-    """
-
-    def __init__(
-        self,
-        geo_dim: int = 256,
-        visual_dim: int = 1280,
-        d_model: int = 256,
-        num_heads: int = 8,
-        num_layers: int = 2,
-        num_tokens: int = 49,  # 7x7
-        out_dim: int = 256,
-        dropout: float = 0.1,
-    ):
+    def __init__(self, geo_dim=256, visual_dim=1280, wrinkle_dim=10,
+                 hidden_dim=256, num_heads=4, dropout=0.1):
         super().__init__()
 
         self.geo_dim = geo_dim
         self.visual_dim = visual_dim
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.num_tokens = num_tokens
-        self.out_dim = out_dim
+        self.wrinkle_dim = wrinkle_dim
+        self.hidden_dim = hidden_dim
 
-        # 几何 → Query token
-        self.geo_proj = nn.Sequential(
-            nn.LayerNorm(geo_dim),
-            nn.Linear(geo_dim, d_model),
+        # 扩展视觉特征维度以包含皱纹特征
+        self.extended_visual_dim = visual_dim + wrinkle_dim  # 1280 + 10 = 1290
+
+        # FiLM modulation: 使用几何特征调制视觉特征
+        self.film_gamma = nn.Linear(geo_dim, self.extended_visual_dim)
+        self.film_beta = nn.Linear(geo_dim, self.extended_visual_dim)
+
+        # Visual feature projection (降维)
+        self.visual_proj = nn.Sequential(
+            nn.Linear(self.extended_visual_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
+            nn.Dropout(dropout)
         )
 
-        # 视觉全局向量 → 基础 token 表示
-        self.visual_base_proj = nn.Sequential(
-            nn.LayerNorm(visual_dim),
-            nn.Linear(visual_dim, d_model),
-            nn.GELU(),
+        # Geometry query projection
+        self.geo_query_proj = nn.Linear(geo_dim, hidden_dim)
+
+        # Multi-head cross-attention
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
         )
 
-        # 位置编码: 49 个伪空间位置
-        self.pos_embed = nn.Parameter(
-            torch.randn(1, num_tokens, d_model) * 0.02
-        )
-
-        # FiLM 调制: 用几何特征生成 γ / β
-        self.film_gamma = nn.Linear(d_model, d_model)
-        self.film_beta = nn.Linear(d_model, d_model)
-
-        # 多层 Cross-Attention
-        self.attn_layers = nn.ModuleList()
-        self.ffn_layers = nn.ModuleList()
-        self.norm_q_layers = nn.ModuleList()
-        self.norm_kv_layers = nn.ModuleList()
-
-        for _ in range(num_layers):
-            self.attn_layers.append(
-                nn.MultiheadAttention(
-                    embed_dim=d_model,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                    batch_first=True,
-                )
-            )
-            self.ffn_layers.append(
-                nn.Sequential(
-                    nn.Linear(d_model, d_model * 4),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(d_model * 4, d_model),
-                    nn.Dropout(dropout),
-                )
-            )
-            self.norm_q_layers.append(nn.LayerNorm(d_model))
-            self.norm_kv_layers.append(nn.LayerNorm(d_model))
-
-        # 输出聚合: [q_final, x_pooled] → out_dim
-        self.out_proj = nn.Sequential(
-            nn.LayerNorm(d_model * 2),
-            nn.Linear(d_model * 2, d_model * 2),
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model * 2, out_dim),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout)
         )
 
-    def forward(
-        self,
-        geo_refined: torch.Tensor,
-        visual_vec: torch.Tensor,
-        return_details: bool = False,
-    ):
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, geo_features, visual_features, wrinkle_features):
         """
-        geo_refined : (B, geo_dim)
-        visual_vec  : (B, visual_dim)
+        Args:
+            geo_features: (batch, geo_dim=256)
+            visual_features: (batch, visual_dim=1280)
+            wrinkle_features: (batch, wrinkle_dim=10)
+        Returns:
+            visual_guided_features: (batch, hidden_dim=256)
         """
-        B = geo_refined.size(0)
+        batch_size = geo_features.size(0)
 
-        # 1) 编码几何 query
-        q = self.geo_proj(geo_refined)           # (B, D)
-        q = q.unsqueeze(1)                       # (B, 1, D)
+        # 1. 融合视觉特征和皱纹特征
+        extended_visual = torch.cat([visual_features, wrinkle_features], dim=-1)  # (batch, 1290)
 
-        # 2) 视觉向量 → 基础 token
-        base = self.visual_base_proj(visual_vec) # (B, D)
-        x = base.unsqueeze(1).expand(-1, self.num_tokens, -1)  # (B, L, D)
-        x = x + self.pos_embed                   # 加上伪空间的位置编码
+        # 2. FiLM modulation
+        gamma = self.film_gamma(geo_features)  # (batch, 1290)
+        beta = self.film_beta(geo_features)  # (batch, 1290)
 
-        # 3) FiLM 调制
-        geo_for_film = q.squeeze(1)              # (B, D)
-        gamma = self.film_gamma(geo_for_film).unsqueeze(1)  # (B, 1, D)
-        beta = self.film_beta(geo_for_film).unsqueeze(1)    # (B, 1, D)
-        x = (1.0 + gamma) * x + beta
+        modulated_visual = extended_visual * (1 + gamma) + beta  # (batch, 1290)
 
-        attn_map = None
+        # 3. Project visual features
+        visual_proj = self.visual_proj(modulated_visual)  # (batch, hidden_dim)
 
-        # 4) 多层 Cross-Attention: Q=几何, K/V=视觉 token
-        for layer_idx in range(self.num_layers):
-            attn = self.attn_layers[layer_idx]
-            ffn = self.ffn_layers[layer_idx]
-            norm_q = self.norm_q_layers[layer_idx]
-            norm_kv = self.norm_kv_layers[layer_idx]
+        # 4. 创建伪空间tokens (7x7 = 49 tokens)
+        visual_tokens = visual_proj.unsqueeze(1).repeat(1, 49, 1)  # (batch, 49, hidden_dim)
 
-            q_norm = norm_q(q)
-            x_norm = norm_kv(x)
+        # 5. Geometry as query
+        geo_query = self.geo_query_proj(geo_features)  # (batch, hidden_dim)
+        geo_query = geo_query.unsqueeze(1)  # (batch, 1, hidden_dim)
 
-            attn_out, attn_weights = attn(
-                q_norm,  # (B, 1, D)
-                x_norm,  # (B, L, D)
-                x_norm,
-                need_weights=True,
-                average_attn_weights=True,
-            )
-            # attn_out: (B, 1, D), attn_weights: (B, 1, L)
+        # 6. Cross-attention
+        attn_output, _ = self.cross_attention(
+            query=geo_query,
+            key=visual_tokens,
+            value=visual_tokens
+        )  # (batch, 1, hidden_dim)
 
-            q = q + attn_out
-            q = q + ffn(q)
+        # 7. Residual connection
+        attn_output = attn_output.squeeze(1)  # (batch, hidden_dim)
+        x = self.norm1(geo_query.squeeze(1) + attn_output)
 
-            attn_map = attn_weights  # 只保留最后一层
+        # 8. Feed-forward network
+        ffn_output = self.ffn(x)
+        output = self.norm2(x + ffn_output)
 
-        q_final = q.squeeze(1)           # (B, D)
-        x_pooled = x.mean(dim=1)         # (B, D)
-
-        out_concat = torch.cat([q_final, x_pooled], dim=-1)
-        visual_guided = self.out_proj(out_concat)   # (B, out_dim)
-
-        if not return_details:
-            return visual_guided
-
-        if attn_map is not None:
-            attn_flat = attn_map.squeeze(1)         # (B, L)
-            if self.num_tokens == 49:
-                attn_2d = attn_flat.view(B, 7, 7)
-            else:
-                attn_2d = attn_flat
-        else:
-            attn_2d = None
-
-        details = {
-            "attention_map": attn_2d,
-            "q_final": q_final,
-            "x_pooled": x_pooled,
-        }
-        return visual_guided, details
+        return output
 
 
-# =========================
-# 2. SQLite 批处理 Runner
-# =========================
+def load_features_from_db(db_path, force_reprocess=False):
+    """从数据库加载特征"""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-class Stage2GQCARunner:
-    def __init__(
-        self,
-        db_path: str,
-        batch_size: int = 128,
-        device: Optional[str] = None,
-    ):
-        self.db_path = db_path
-        self.batch_size = batch_size
-
-        if device is not None:
-            self.device = device
-        else:
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            elif torch.backends.mps.is_available():
-                self.device = "mps"
-            else:
-                self.device = "cpu"
-
-        print(f"[Stage2] 使用设备: {self.device}")
-
-        self.model = GQCA(
-            geo_dim=256,
-            visual_dim=1280,
-            d_model=256,
-            num_heads=8,
-            num_layers=2,
-            num_tokens=49,
-            out_dim=256,
-        ).to(self.device)
-        self.model.eval()
-
-    def _fetch_pending_rows(self, conn: sqlite3.Connection):
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT video_id,
-                   geo_refined_features,
-                   visual_features
+    if force_reprocess:
+        query = """
+            SELECT feature_id, geo_refined_features, visual_features, wrinkle_features
+            FROM video_features
+            WHERE geo_refined_features IS NOT NULL
+              AND visual_features IS NOT NULL
+            ORDER BY feature_id
+        """
+    else:
+        query = """
+            SELECT feature_id, geo_refined_features, visual_features, wrinkle_features
             FROM video_features
             WHERE geo_refined_features IS NOT NULL
               AND visual_features IS NOT NULL
               AND visual_guided_features IS NULL
-            """
-        )
-        return cur.fetchall()
+            ORDER BY feature_id
+        """
 
-    def _run_batch(
-        self,
-        conn: sqlite3.Connection,
-        batch: List[Tuple[int, bytes, bytes]],
-    ):
-        cur = conn.cursor()
+    cursor.execute(query)
 
-        video_ids = []
-        geo_list = []
-        vis_list = []
+    data = []
+    for row in cursor.fetchall():
+        feature_id, geo_blob, visual_blob, wrinkle_blob = row
 
-        for vid, g_blob, v_blob in batch:
-            video_ids.append(vid)
+        # geo_refined / visual 必须存在
+        if geo_blob is None or visual_blob is None:
+            continue
 
-            g = np.frombuffer(g_blob or b"", dtype=np.float32)
-            v = np.frombuffer(v_blob or b"", dtype=np.float32)
+        # 按固定维度解码 float32 BLOB
+        geo_features = np.frombuffer(geo_blob, dtype=np.float32, count=GEO_DIM)
+        visual_features = np.frombuffer(visual_blob, dtype=np.float32, count=VISUAL_DIM)
 
-            # 维度容错: 目标 geo=256, visual=1280
-            geo_dim = 256
-            vis_dim = 1280
+        # 皱纹特征可能为 NULL，用 0 向量替代
+        if wrinkle_blob is not None:
+            wrinkle_features = np.frombuffer(wrinkle_blob, dtype=np.float32, count=WRINKLE_DIM)
+        else:
+            wrinkle_features = np.zeros(WRINKLE_DIM, dtype=np.float32)
 
-            g_fixed = np.zeros(geo_dim, dtype=np.float32)
-            if g.size > 0:
-                g_fixed[: min(geo_dim, g.size)] = g[:geo_dim]
+        data.append({
+            'feature_id': feature_id,
+            'geo_refined_features': geo_features,
+            'visual_features': visual_features,
+            'wrinkle_features': wrinkle_features
+        })
 
-            v_fixed = np.zeros(vis_dim, dtype=np.float32)
-            if v.size > 0:
-                v_fixed[: min(vis_dim, v.size)] = v[:vis_dim]
-
-            geo_list.append(g_fixed)
-            vis_list.append(v_fixed)
-
-        geo_batch = torch.from_numpy(np.stack(geo_list, axis=0)).to(self.device)
-        vis_batch = torch.from_numpy(np.stack(vis_list, axis=0)).to(self.device)
-
-        with torch.no_grad():
-            visual_guided = self.model(geo_batch, vis_batch, return_details=False)
-
-        vg_np = visual_guided.detach().cpu().numpy().astype(np.float32)
-
-        for vid, feat in zip(video_ids, vg_np):
-            cur.execute(
-                """
-                UPDATE video_features
-                SET visual_guided_features = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE video_id = ?
-                """,
-                (feat.tobytes(), vid),
-            )
-
-        conn.commit()
-
-    def run(self):
-        conn = sqlite3.connect(self.db_path)
-        rows = self._fetch_pending_rows(conn)
-
-        if not rows:
-            print("[Stage2] 没有需要处理的记录 (visual_guided_features 已全部存在)")
-            conn.close()
-            return
-
-        print(f"[Stage2] 共有 {len(rows)} 条记录待处理")
-
-        for start in range(0, len(rows), self.batch_size):
-            batch = rows[start : start + self.batch_size]
-            self._run_batch(conn, batch)
-            print(
-                f"[Stage2] 已处理 {min(start + self.batch_size, len(rows))}/{len(rows)} 条"
-            )
-
-        conn.close()
-        print("[Stage2] 全部完成 ✅")
+    conn.close()
+    return data
 
 
-# =========================
-# 3. main
-# =========================
+def save_visual_guided_features(db_path, feature_id, features):
+    """保存visual_guided_features到数据库"""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-def main():
-    db_path = "facialPalsy.db"
-    runner = Stage2GQCARunner(db_path=db_path, batch_size=128, device=None)
-    runner.run()
+    features_blob = encode_feature(features)
+
+    cursor.execute("""
+        UPDATE video_features
+        SET visual_guided_features = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE feature_id = ?
+    """, (features_blob, feature_id))
+
+    conn.commit()
+    conn.close()
+
+
+def process_stage2():
+    """执行Stage 2特征融合"""
+    print("=" * 60)
+    print("Stage 2: GQCA特征融合（包含皱纹特征）")
+    print("=" * 60)
+    print(f"数据库路径: {DB_PATH}")
+    print(f"设备: {DEVICE}")
+    print(f"强制重新处理: {FORCE_REPROCESS}")
+    print()
+
+    # 1. 加载数据
+    print("正在加载特征数据...")
+    data = load_features_from_db(DB_PATH, FORCE_REPROCESS)
+
+    if len(data) == 0:
+        if FORCE_REPROCESS:
+            print("❌ 错误: 数据库中没有找到必要的特征！")
+            print("请确保已运行:")
+            print("  1. stage1_cdcaf.py (生成geo_refined_features)")
+            print("  2. visual_feature_extractor.py (生成visual_features)")
+            print("  3. wrinkle_feature.py (生成wrinkle_features，可选)")
+        else:
+            print("✓ 所有样本已经处理过了！")
+            print("如需重新处理，请设置 FORCE_REPROCESS = True")
+        return
+
+    print(f"✓ 需要处理 {len(data)} 个样本")
+    print()
+
+    # 2. 验证特征维度
+    sample = data[0]
+    geo_dim = len(sample['geo_refined_features'])
+    visual_dim = len(sample['visual_features'])
+    wrinkle_dim = len(sample['wrinkle_features'])
+
+    print(f"特征维度验证:")
+    print(f"  geo_refined_features: {geo_dim} (期望: 256)")
+    print(f"  visual_features: {visual_dim} (期望: 1280)")
+    print(f"  wrinkle_features: {wrinkle_dim} (期望: 10)")
+
+    if geo_dim != 256:
+        print(f"⚠ 警告: geo_refined_features维度不是256！")
+    if visual_dim != 1280:
+        print(f"⚠ 警告: visual_features维度不是1280！")
+    if wrinkle_dim != 10:
+        print(f"⚠ 提示: wrinkle_features维度不是10，可能未提取皱纹特征")
+    print()
+
+    # 3. 创建GQCA模型
+    print("创建GQCA模型...")
+    model = GQCA(
+        geo_dim=geo_dim,
+        visual_dim=visual_dim,
+        wrinkle_dim=wrinkle_dim,
+        hidden_dim=HIDDEN_DIM,
+        num_heads=NUM_HEADS,
+        dropout=DROPOUT
+    ).to(DEVICE)
+
+    model.eval()
+    print(f"✓ 模型已创建并移至 {DEVICE}")
+    print()
+
+    # 4. 批量处理
+    num_batches = (len(data) + BATCH_SIZE - 1) // BATCH_SIZE
+    total_processed = 0
+
+    print(f"开始处理 {len(data)} 个样本 (batch_size={BATCH_SIZE})...")
+
+    with torch.no_grad():
+        for i in tqdm(range(num_batches), desc="GQCA融合"):
+            batch_items = data[i * BATCH_SIZE:(i + 1) * BATCH_SIZE]
+
+            # 准备批量数据
+            geo_batch = []
+            visual_batch = []
+            wrinkle_batch = []
+
+            for item in batch_items:
+                geo_batch.append(item['geo_refined_features'])
+                visual_batch.append(item['visual_features'])
+                wrinkle_batch.append(item['wrinkle_features'])
+
+            # 转换为tensor
+            geo_tensor = torch.FloatTensor(np.array(geo_batch)).to(DEVICE)
+            visual_tensor = torch.FloatTensor(np.array(visual_batch)).to(DEVICE)
+            wrinkle_tensor = torch.FloatTensor(np.array(wrinkle_batch)).to(DEVICE)
+
+            # 前向传播
+            visual_guided = model(geo_tensor, visual_tensor, wrinkle_tensor)
+
+            # 保存结果
+            visual_guided_np = visual_guided.cpu().numpy()
+            for j, item in enumerate(batch_items):
+                save_visual_guided_features(
+                    DB_PATH,
+                    item['feature_id'],
+                    visual_guided_np[j]
+                )
+                total_processed += 1
+
+    print()
+    print("=" * 60)
+    print(f"✓ Stage 2完成！共处理 {total_processed} 个样本")
+    print(f"✓ visual_guided_features (256维) 已保存到数据库")
+    print(f"✓ 已融合皱纹特征 ({wrinkle_dim}维)")
+    print("=" * 60)
+    print()
+    print("下一步: 运行 stage3_mfa.py")
 
 
 if __name__ == "__main__":
-    main()
+    process_stage2()
