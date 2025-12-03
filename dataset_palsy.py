@@ -1,14 +1,25 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-支持层级多任务学习的数据集
-按检查(examination)组织，每个样本包含11个动作
+层级面瘫数据集 (V2.0)
+
+按检查(examination)组织数据，每个样本包含一次检查的所有动作
+支持:
+- 动作级任务 (severity分类)
+- 检查级任务 (has_palsy, palsy_side, hb_grade, sunnybrook)
+- 缺失动作处理 (通过action_mask)
+
+关键设计:
+- 每个样本是一个examination (不是单个视频)
+- action_indices记录每个动作对应batch中的哪些examination
+- 支持数据增强开关
 """
+
 import sqlite3
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional
-import io
-from PIL import Image
 
 
 class HierarchicalPalsyDataset(Dataset):
@@ -16,7 +27,7 @@ class HierarchicalPalsyDataset(Dataset):
     层级面瘫数据集
 
     每个样本是一次检查(examination)，包含:
-    - 11个动作的多模态特征
+    - 最多11个动作的多模态特征
     - 动作级标签 (severity)
     - 检查级标签 (has_palsy, palsy_side, hb_grade, sunnybrook)
     """
@@ -27,21 +38,6 @@ class HierarchicalPalsyDataset(Dataset):
         'ShrugNose', 'SpontaneousEyeBlink', 'VoluntaryEyeBlink'
     ]
 
-    # 每个动作的特征维度
-    ACTION_DIMS = {
-        'NeutralFace': {'static': 7, 'dynamic': 0},
-        'Smile': {'static': 9, 'dynamic': 6},
-        'RaiseEyebrow': {'static': 7, 'dynamic': 4},
-        'CloseEyeHardly': {'static': 5, 'dynamic': 8},
-        'CloseEyeSoftly': {'static': 5, 'dynamic': 8},
-        'BlowCheek': {'static': 7, 'dynamic': 4},
-        'LipPucker': {'static': 7, 'dynamic': 4},
-        'ShowTeeth': {'static': 11, 'dynamic': 4},
-        'ShrugNose': {'static': 9, 'dynamic': 4},
-        'SpontaneousEyeBlink': {'static': 5, 'dynamic': 7},
-        'VoluntaryEyeBlink': {'static': 5, 'dynamic': 4},
-    }
-
     MAX_STATIC_DIM = 11
     MAX_DYNAMIC_DIM = 8
     VISUAL_DIM = 1280
@@ -49,22 +45,20 @@ class HierarchicalPalsyDataset(Dataset):
     MOTION_DIM = 12
 
     def __init__(self, db_path: str, fold: int, split_type: str = 'train',
-                 split_version: str = 'v1.0', use_augmentation: bool = True,
-                 use_wrinkle_heatmap: bool = True):
+                 split_version: str = 'v1.0', use_augmentation: bool = True):
         """
         Args:
             db_path: 数据库路径
             fold: 交叉验证折数 (0, 1, 2)
             split_type: 'train' 或 'val'
-            use_augmentation: 是否使用增强数据
-            use_wrinkle_heatmap: 是否加载皱纹热力图
+            split_version: 划分版本
+            use_augmentation: 是否使用增强数据 (训练时True, 验证时False)
         """
         self.db_path = db_path
         self.fold = fold
         self.split_type = split_type
         self.split_version = split_version
         self.use_augmentation = use_augmentation
-        self.use_wrinkle_heatmap = use_wrinkle_heatmap
 
         self.examinations = self._load_examinations()
 
@@ -98,7 +92,7 @@ class HierarchicalPalsyDataset(Dataset):
                 el.hb_grade,
                 el.sunnybrook_score
             FROM examinations e
-            JOIN examination_labels el ON e.examination_id = el.examination_id
+            LEFT JOIN examination_labels el ON e.examination_id = el.examination_id
             WHERE e.patient_id IN ({placeholders})
         """, patient_ids)
 
@@ -113,19 +107,23 @@ class HierarchicalPalsyDataset(Dataset):
                 examinations.append({
                     'examination_id': exam_id,
                     'patient_id': patient_id,
-                    'has_palsy': has_palsy,
+                    'has_palsy': has_palsy if has_palsy is not None else 0,
                     'palsy_side': self._encode_palsy_side(palsy_side),
-                    'hb_grade': hb_grade - 1,  # 转为0-5索引
-                    'sunnybrook': sunnybrook or 0,
+                    'hb_grade': (hb_grade - 1) if hb_grade is not None else 0,  # 转为0-5索引
+                    'sunnybrook': float(sunnybrook) if sunnybrook is not None else 0.0,
                     'actions': actions
                 })
 
         conn.close()
         return examinations
 
-    def _load_examination_actions(self, cursor, exam_id: int) -> Dict:
+    def _load_examination_actions(self, cursor, exam_id: str) -> Dict:
         """加载一次检查的所有动作特征"""
-        aug_condition = "" if self.use_augmentation else "AND vf.augmentation_type = 'original'"
+        # 根据是否使用增强数据选择条件
+        if self.use_augmentation:
+            aug_condition = ""
+        else:
+            aug_condition = "AND (vf.augmentation_type = 'original' OR vf.augmentation_type = 'none' OR vf.augmentation_type IS NULL)"
 
         cursor.execute(f"""
             SELECT 
@@ -135,9 +133,11 @@ class HierarchicalPalsyDataset(Dataset):
                 vf.dynamic_features,
                 vf.dynamic_dim,
                 vf.visual_features,
+                vf.visual_dim,
                 vf.wrinkle_features,
-                vf.wrinkle_heatmap,
+                vf.wrinkle_dim,
                 vf.motion_features,
+                vf.motion_dim,
                 al.severity_score
             FROM video_features vf
             JOIN video_files v ON vf.video_id = v.video_id
@@ -147,34 +147,35 @@ class HierarchicalPalsyDataset(Dataset):
             WHERE v.examination_id = ?
               AND vf.static_features IS NOT NULL
               {aug_condition}
+            ORDER BY at.display_order
         """, (exam_id,))
 
         actions = {}
         for row in cursor.fetchall():
             (action_name, static_blob, static_dim, dynamic_blob, dynamic_dim,
-             visual_blob, wrinkle_blob, wrinkle_hm_blob, motion_blob, severity) = row
+             visual_blob, visual_dim, wrinkle_blob, wrinkle_dim,
+             motion_blob, motion_dim, severity) = row
 
             # 解码特征
-            static = self._decode_feature(static_blob, static_dim)
-            dynamic = self._decode_feature(dynamic_blob, dynamic_dim) if dynamic_dim > 0 else np.zeros(0)
-            visual = self._decode_feature(visual_blob, self.VISUAL_DIM)
-            wrinkle = self._decode_feature(wrinkle_blob, self.WRINKLE_DIM) if wrinkle_blob else np.zeros(
-                self.WRINKLE_DIM)
-            motion = self._decode_feature(motion_blob, self.MOTION_DIM) if motion_blob else np.zeros(self.MOTION_DIM)
+            static_dim = static_dim or self.MAX_STATIC_DIM
+            dynamic_dim = dynamic_dim or 0
+            visual_dim = visual_dim or self.VISUAL_DIM
+            wrinkle_dim = wrinkle_dim or self.WRINKLE_DIM
+            motion_dim = motion_dim or self.MOTION_DIM
 
-            # 皱纹热力图
-            wrinkle_hm = None
-            if self.use_wrinkle_heatmap and wrinkle_hm_blob:
-                wrinkle_hm = self._decode_heatmap(wrinkle_hm_blob)
+            static = self._decode_feature(static_blob, static_dim)
+            dynamic = self._decode_feature(dynamic_blob, dynamic_dim) if dynamic_dim > 0 else np.zeros(self.MAX_DYNAMIC_DIM, dtype=np.float32)
+            visual = self._decode_feature(visual_blob, visual_dim) if visual_blob else np.zeros(self.VISUAL_DIM, dtype=np.float32)
+            wrinkle = self._decode_feature(wrinkle_blob, wrinkle_dim) if wrinkle_blob else np.zeros(self.WRINKLE_DIM, dtype=np.float32)
+            motion = self._decode_feature(motion_blob, motion_dim) if motion_blob else np.zeros(self.MOTION_DIM, dtype=np.float32)
 
             actions[action_name] = {
-                'static': static,
-                'dynamic': dynamic,
+                'static': self._pad_feature(static, self.MAX_STATIC_DIM),
+                'dynamic': self._pad_feature(dynamic, self.MAX_DYNAMIC_DIM),
                 'visual': visual,
                 'wrinkle_scalar': wrinkle,
-                'wrinkle_heatmap': wrinkle_hm,
                 'motion': motion,
-                'severity': severity - 1 if severity else 0  # 转为0-4索引
+                'severity': (severity - 1) if severity is not None else 0  # 转为0-4索引
             }
 
         return actions
@@ -183,26 +184,22 @@ class HierarchicalPalsyDataset(Dataset):
         """解码float32 BLOB"""
         if blob is None:
             return np.zeros(dim, dtype=np.float32)
-        return np.frombuffer(blob, dtype=np.float32, count=dim)
+        arr = np.frombuffer(blob, dtype=np.float32, count=dim)
+        return arr.copy()  # 返回可写的副本
 
-    def _decode_heatmap(self, blob: bytes) -> np.ndarray:
-        """解码皱纹热力图"""
-        try:
-            img = Image.open(io.BytesIO(blob))
-            arr = np.array(img.convert('L'), dtype=np.float32) / 255.0
-            return arr
-        except:
-            return np.zeros((64, 64), dtype=np.float32)
-
-    def _encode_palsy_side(self, side: str) -> int:
+    def _encode_palsy_side(self, side) -> int:
         """编码面瘫侧别"""
-        mapping = {'none': 0, 'left': 1, 'right': 2, None: 0}
-        return mapping.get(side, 0)
+        if side is None:
+            return 0
+        if isinstance(side, int):
+            return side
+        mapping = {'none': 0, 'left': 1, 'right': 2, 'None': 0, '0': 0, '1': 1, '2': 2}
+        return mapping.get(str(side), 0)
 
     def _pad_feature(self, feature: np.ndarray, max_dim: int) -> np.ndarray:
         """零填充到最大维度"""
         if len(feature) >= max_dim:
-            return feature[:max_dim]
+            return feature[:max_dim].copy()
         padded = np.zeros(max_dim, dtype=np.float32)
         padded[:len(feature)] = feature
         return padded
@@ -213,7 +210,7 @@ class HierarchicalPalsyDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         exam = self.examinations[idx]
 
-        # 构建动作特征字典
+        # 构建动作特征字典和mask
         actions_tensor = {}
         action_severities = {}
         action_mask = []
@@ -223,26 +220,17 @@ class HierarchicalPalsyDataset(Dataset):
                 action = exam['actions'][action_name]
 
                 actions_tensor[action_name] = {
-                    'static': torch.FloatTensor(
-                        self._pad_feature(action['static'], self.MAX_STATIC_DIM)
-                    ),
-                    'dynamic': torch.FloatTensor(
-                        self._pad_feature(action['dynamic'], self.MAX_DYNAMIC_DIM)
-                    ),
+                    'static': torch.FloatTensor(action['static']),
+                    'dynamic': torch.FloatTensor(action['dynamic']),
                     'visual': torch.FloatTensor(action['visual']),
                     'wrinkle_scalar': torch.FloatTensor(action['wrinkle_scalar']),
                     'motion': torch.FloatTensor(action['motion']),
                 }
 
-                if action['wrinkle_heatmap'] is not None:
-                    actions_tensor[action_name]['wrinkle_heatmap'] = torch.FloatTensor(
-                        action['wrinkle_heatmap']
-                    ).unsqueeze(0)  # (1, H, W)
-
                 action_severities[action_name] = action['severity']
-                action_mask.append(1)
+                action_mask.append(1.0)
             else:
-                action_mask.append(0)
+                action_mask.append(0.0)
 
         return {
             'examination_id': exam['examination_id'],
@@ -259,11 +247,17 @@ class HierarchicalPalsyDataset(Dataset):
 
 
 def collate_hierarchical(batch: List[Dict]) -> Dict:
-    """自定义collate函数，处理变长动作"""
+    """
+    自定义collate函数
+
+    关键：记录每个动作对应batch中的哪些examination (action_indices)
+    """
     batch_size = len(batch)
 
-    # 收集所有动作
+    # 收集所有动作，并记录每个动作属于batch中的哪个examination
     all_actions = {}
+    action_indices = {}
+
     for action_name in HierarchicalPalsyDataset.ACTION_NAMES:
         action_batch = {
             'static': [],
@@ -271,16 +265,15 @@ def collate_hierarchical(batch: List[Dict]) -> Dict:
             'visual': [],
             'wrinkle_scalar': [],
             'motion': [],
-            'wrinkle_heatmap': []
         }
+        indices = []  # 这个动作对应的examination索引
 
-        for sample in batch:
+        for exam_idx, sample in enumerate(batch):
             if action_name in sample['actions']:
                 action = sample['actions'][action_name]
-                for key in ['static', 'dynamic', 'visual', 'wrinkle_scalar', 'motion']:
+                for key in action_batch.keys():
                     action_batch[key].append(action[key])
-                if 'wrinkle_heatmap' in action:
-                    action_batch['wrinkle_heatmap'].append(action['wrinkle_heatmap'])
+                indices.append(exam_idx)
 
         if action_batch['static']:
             all_actions[action_name] = {
@@ -290,12 +283,9 @@ def collate_hierarchical(batch: List[Dict]) -> Dict:
                 'wrinkle_scalar': torch.stack(action_batch['wrinkle_scalar']),
                 'motion': torch.stack(action_batch['motion']),
             }
-            if action_batch['wrinkle_heatmap']:
-                all_actions[action_name]['wrinkle_heatmap'] = torch.stack(
-                    action_batch['wrinkle_heatmap']
-                )
+            action_indices[action_name] = indices
 
-    # 收集标签
+    # 收集动作级标签
     action_severities = {}
     for action_name in HierarchicalPalsyDataset.ACTION_NAMES:
         severities = []
@@ -307,6 +297,7 @@ def collate_hierarchical(batch: List[Dict]) -> Dict:
 
     return {
         'actions': all_actions,
+        'action_indices': action_indices,
         'action_mask': torch.stack([s['action_mask'] for s in batch]),
         'targets': {
             'action_severity': action_severities,

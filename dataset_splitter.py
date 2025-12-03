@@ -1,278 +1,379 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-数据集划分脚本
-Patient-level Stratified 3-Fold Cross-Validation
+数据集划分脚本 (V2.0 - 支持检查级层级多任务学习)
 
 功能：
-1. 读取数据库中的所有样本
-2. 按患者级别进行分层3折交叉验证
-3. 确保同一患者的所有样本都在同一fold中（防止数据泄漏）
-4. 按严重程度等级(severity_score)进行分层
-5. 将划分结果保存到 dataset_splits 和 dataset_members 表
+1. 按患者级别进行分层3折交叉验证 (防止数据泄漏)
+2. 按HB分级进行分层采样 (确保各fold分布均衡)
+3. 支持检查级(examination)任务的数据划分
+4. 将划分结果保存到 dataset_splits 和 dataset_members 表
 
-直接在PyCharm中点击运行即可！可重复运行。
+设计原则:
+- 同一患者的所有检查都在同一fold (患者级分离)
+- 按HB分级分层 (确保各等级在train/val中分布均衡)
+- 支持层级多任务学习 (动作级 + 检查级)
+
 """
 
 import sqlite3
 from collections import defaultdict
+import numpy as np
 from sklearn.model_selection import StratifiedKFold
 
 # ==================== 配置参数 ====================
 DB_PATH = "facialPalsy.db"
+
+# 交叉验证折数
 N_FOLDS = 3
+
+# 随机种子
 RANDOM_SEED = 42
+
+# 划分版本 (用于区分不同的划分方案)
 SPLIT_VERSION = "v1.0"
 
-# 是否强制重新划分（会删除旧的划分）
+# 是否强制重新划分
 FORCE_RESPLIT = True
 
 
-def load_dataset_info(db_path):
-    """从数据库加载数据集信息"""
+def load_patient_info(db_path):
+    """
+    加载患者信息
+
+    Returns:
+        patient_info: {
+            patient_id: {
+                'examinations': [exam_id1, exam_id2, ...],
+                'hb_grades': [grade1, grade2, ...],
+                'dominant_hb': 主要HB分级,
+                'video_count': 视频数量
+            }
+        }
+    """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # 查询所有样本及其标签
+    # 查询所有有标签的患者及其检查信息
     cursor.execute("""
         SELECT 
-            vf.feature_id,
-            v.video_id,
             e.patient_id,
             e.examination_id,
-            al.severity_score,
-            at.action_name_en
-        FROM video_features vf
-        JOIN video_files v ON vf.video_id = v.video_id
-        JOIN examinations e ON v.examination_id = e.examination_id
-        JOIN action_labels al ON e.examination_id = al.examination_id 
-                              AND v.action_id = al.action_id
-        JOIN action_types at ON v.action_id = at.action_id
-        WHERE vf.fused_action_features IS NOT NULL
-          AND al.severity_score IS NOT NULL
-        ORDER BY e.patient_id, v.video_id
+            el.hb_grade,
+            COUNT(DISTINCT v.video_id) as video_count
+        FROM examinations e
+        JOIN examination_labels el ON e.examination_id = el.examination_id
+        JOIN video_files v ON e.examination_id = v.examination_id
+        JOIN video_features vf ON v.video_id = vf.video_id
+        WHERE el.hb_grade IS NOT NULL
+          AND vf.static_features IS NOT NULL
+        GROUP BY e.patient_id, e.examination_id
+        ORDER BY e.patient_id
     """)
 
-    samples = []
     patient_info = defaultdict(lambda: {
-        'samples': [],
-        'severity_counts': defaultdict(int),
-        'dominant_severity': None
+        'examinations': [],
+        'hb_grades': [],
+        'dominant_hb': None,
+        'video_count': 0
     })
 
     for row in cursor.fetchall():
-        feature_id, video_id, patient_id, exam_id, severity, action_name = row
+        patient_id, exam_id, hb_grade, video_count = row
 
-        sample = {
-            'feature_id': feature_id,
-            'video_id': video_id,
-            'patient_id': patient_id,
-            'examination_id': exam_id,
-            'severity_score': severity,
-            'action_name': action_name
-        }
-
-        samples.append(sample)
-        patient_info[patient_id]['samples'].append(sample)
-        patient_info[patient_id]['severity_counts'][severity] += 1
-
-    # 确定每个患者的主导严重程度
-    for patient_id, info in patient_info.items():
-        severity_counts = info['severity_counts']
-        dominant_severity = max(severity_counts.items(), key=lambda x: x[1])[0]
-        info['dominant_severity'] = dominant_severity
+        patient_info[patient_id]['examinations'].append(exam_id)
+        patient_info[patient_id]['hb_grades'].append(hb_grade)
+        patient_info[patient_id]['video_count'] += video_count
 
     conn.close()
-    return samples, dict(patient_info)
+
+    # 确定每个患者的主导HB分级 (用于分层)
+    for patient_id, info in patient_info.items():
+        if info['hb_grades']:
+            # 使用最严重的等级作为主导等级
+            info['dominant_hb'] = max(info['hb_grades'])
+
+    return dict(patient_info)
 
 
-def create_fold_splits(patient_info, n_folds=3, random_seed=42):
-    """创建患者级别的分层交叉验证划分"""
+def create_stratified_folds(patient_info, n_folds=3, random_seed=42):
+    """
+    创建患者级分层K折划分
+
+    Args:
+        patient_info: 患者信息字典
+        n_folds: 折数
+        random_seed: 随机种子
+
+    Returns:
+        fold_assignments: {patient_id: fold_number}
+    """
     patient_ids = list(patient_info.keys())
-    patient_labels = [info['dominant_severity'] for info in patient_info.values()]
+    patient_labels = [info['dominant_hb'] for info in patient_info.values()]
 
-    print(f"\n患者数量: {len(patient_ids)}")
-    print(f"严重程度分布:")
-    severity_dist = defaultdict(int)
+    print(f"\n{'='*60}")
+    print(f"数据集统计")
+    print(f"{'='*60}")
+    print(f"患者总数: {len(patient_ids)}")
+
+    # 统计HB分级分布
+    hb_dist = defaultdict(int)
     for label in patient_labels:
-        severity_dist[label] += 1
-    for severity in sorted(severity_dist.keys()):
-        print(f"  Grade {severity}: {severity_dist[severity]} 患者")
+        hb_dist[label] += 1
 
-    # 分层K折交叉验证
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_seed)
+    print(f"\nHB分级分布 (患者数):")
+    for grade in sorted(hb_dist.keys()):
+        print(f"  Grade {grade}: {hb_dist[grade]} 患者")
 
-    fold_splits = []
-    for fold_idx, (train_indices, val_indices) in enumerate(skf.split(patient_ids, patient_labels)):
-        train_patient_ids = [patient_ids[i] for i in train_indices]
-        val_patient_ids = [patient_ids[i] for i in val_indices]
+    # 检查是否有足够的样本进行分层
+    min_samples = min(hb_dist.values())
+    if min_samples < n_folds:
+        print(f"\n⚠️ 警告: 某些类别样本数({min_samples})少于折数({n_folds})")
+        print("   将使用非分层划分...")
+        use_stratified = False
+    else:
+        use_stratified = True
 
-        fold_splits.append({
-            'fold': fold_idx,
-            'train_patients': train_patient_ids,
-            'val_patients': val_patient_ids
-        })
+    # 执行划分
+    fold_assignments = {}
 
-        print(f"\nFold {fold_idx}:")
-        print(f"  训练患者: {len(train_patient_ids)}")
-        print(f"  验证患者: {len(val_patient_ids)}")
+    if use_stratified:
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_seed)
+        patient_array = np.array(patient_ids)
+        label_array = np.array(patient_labels)
 
-        # 统计严重程度分布
-        train_severity_dist = defaultdict(int)
-        val_severity_dist = defaultdict(int)
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(patient_array, label_array)):
+            # val_idx中的患者属于这个fold的验证集
+            for idx in val_idx:
+                fold_assignments[patient_ids[idx]] = fold_idx
+    else:
+        # 简单随机划分
+        np.random.seed(random_seed)
+        indices = np.random.permutation(len(patient_ids))
+        fold_size = len(patient_ids) // n_folds
 
-        for pid in train_patient_ids:
-            train_severity_dist[patient_info[pid]['dominant_severity']] += 1
-        for pid in val_patient_ids:
-            val_severity_dist[patient_info[pid]['dominant_severity']] += 1
+        for fold_idx in range(n_folds):
+            start_idx = fold_idx * fold_size
+            if fold_idx == n_folds - 1:
+                end_idx = len(patient_ids)
+            else:
+                end_idx = start_idx + fold_size
 
-        print(f"  训练集严重程度分布:")
-        for severity in sorted(train_severity_dist.keys()):
-            print(f"    Grade {severity}: {train_severity_dist[severity]} 患者")
+            for idx in range(start_idx, end_idx):
+                fold_assignments[patient_ids[indices[idx]]] = fold_idx
 
-        print(f"  验证集严重程度分布:")
-        for severity in sorted(val_severity_dist.keys()):
-            print(f"    Grade {severity}: {val_severity_dist[severity]} 患者")
-
-    return fold_splits
+    return fold_assignments
 
 
-def save_splits_to_db(db_path, samples, patient_info, fold_splits, split_version, force_resplit=False):
-    """将划分结果保存到数据库"""
+def print_fold_statistics(patient_info, fold_assignments, n_folds):
+    """打印各fold的统计信息"""
+
+    for fold_idx in range(n_folds):
+        print(f"\n{'='*60}")
+        print(f"Fold {fold_idx} 统计")
+        print(f"{'='*60}")
+
+        # 获取该fold的验证患者和训练患者
+        val_patients = [p for p, f in fold_assignments.items() if f == fold_idx]
+        train_patients = [p for p, f in fold_assignments.items() if f != fold_idx]
+
+        # 统计
+        train_hb = defaultdict(int)
+        val_hb = defaultdict(int)
+        train_videos = 0
+        val_videos = 0
+        train_exams = 0
+        val_exams = 0
+
+        for p in train_patients:
+            info = patient_info[p]
+            for hb in info['hb_grades']:
+                train_hb[hb] += 1
+            train_videos += info['video_count']
+            train_exams += len(info['examinations'])
+
+        for p in val_patients:
+            info = patient_info[p]
+            for hb in info['hb_grades']:
+                val_hb[hb] += 1
+            val_videos += info['video_count']
+            val_exams += len(info['examinations'])
+
+        print(f"\n训练集:")
+        print(f"  患者数: {len(train_patients)}")
+        print(f"  检查数: {train_exams}")
+        print(f"  视频数: {train_videos}")
+        print(f"  HB分布: ", end="")
+        for grade in sorted(train_hb.keys()):
+            print(f"G{grade}:{train_hb[grade]} ", end="")
+        print()
+
+        print(f"\n验证集:")
+        print(f"  患者数: {len(val_patients)}")
+        print(f"  检查数: {val_exams}")
+        print(f"  视频数: {val_videos}")
+        print(f"  HB分布: ", end="")
+        for grade in sorted(val_hb.keys()):
+            print(f"G{grade}:{val_hb[grade]} ", end="")
+        print()
+
+
+def save_to_database(db_path, fold_assignments, patient_info, n_folds, split_version, force_resplit=False):
+    """
+    保存划分结果到数据库
+
+    表结构:
+    - dataset_splits: 划分配置 (train_fold_0, val_fold_0, ...)
+    - dataset_members: 患者归属 (patient_id -> split_id, fold_number)
+    """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # 检查是否已存在划分
-    cursor.execute("SELECT COUNT(*) FROM dataset_splits WHERE split_version = ?", (split_version,))
-    existing_count = cursor.fetchone()[0]
+    # 检查是否已存在该版本的划分
+    cursor.execute("""
+        SELECT COUNT(*) FROM dataset_splits WHERE split_version = ?
+    """, (split_version,))
+    existing = cursor.fetchone()[0]
 
-    if existing_count > 0:
+    if existing > 0:
         if force_resplit:
-            print(f"\n正在删除已有的 {split_version} 划分...")
-            # 删除旧的划分
+            print(f"\n⚠️ 删除旧的划分 (version={split_version})...")
+            # 先删除成员，再删除划分
             cursor.execute("""
-                DELETE FROM dataset_members 
-                WHERE split_id IN (
+                DELETE FROM dataset_members WHERE split_id IN (
                     SELECT split_id FROM dataset_splits WHERE split_version = ?
                 )
             """, (split_version,))
-            cursor.execute("DELETE FROM dataset_splits WHERE split_version = ?", (split_version,))
+            cursor.execute("""
+                DELETE FROM dataset_splits WHERE split_version = ?
+            """, (split_version,))
             conn.commit()
-            print("✓ 已删除旧划分")
         else:
-            print(f"\n✓ 数据集划分 {split_version} 已存在！")
-            print("如需重新划分，请设置 FORCE_RESPLIT = True")
+            print(f"\n✓ 划分已存在 (version={split_version})，跳过...")
             conn.close()
             return
 
-    # 创建新的划分记录
-    for fold_split in fold_splits:
-        fold = fold_split['fold']
+    # 创建划分记录
+    print(f"\n保存划分到数据库...")
 
-        # 创建 train split
-        train_split_name = f"train_fold{fold}_{split_version}"
+    for fold_idx in range(n_folds):
+        # 创建train split
         cursor.execute("""
-            INSERT INTO dataset_splits 
-            (split_name, split_type, split_version, split_method, random_seed, description)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (train_split_name, 'train', split_version, 'patient_stratified',
-              RANDOM_SEED, f'Training set for fold {fold}'))
+            INSERT INTO dataset_splits (split_name, split_type, split_version, split_method, random_seed)
+            VALUES (?, 'train', ?, 'patient_stratified', ?)
+        """, (f'train_fold_{fold_idx}', split_version, RANDOM_SEED))
         train_split_id = cursor.lastrowid
 
-        # 创建 val split
-        val_split_name = f"val_fold{fold}_{split_version}"
+        # 创建val split
         cursor.execute("""
-            INSERT INTO dataset_splits 
-            (split_name, split_type, split_version, split_method, random_seed, description)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (val_split_name, 'val', split_version, 'patient_stratified',
-              RANDOM_SEED, f'Validation set for fold {fold}'))
+            INSERT INTO dataset_splits (split_name, split_type, split_version, split_method, random_seed)
+            VALUES (?, 'val', ?, 'patient_stratified', ?)
+        """, (f'val_fold_{fold_idx}', split_version, RANDOM_SEED))
         val_split_id = cursor.lastrowid
 
-        # 添加患者到 dataset_members
-        for patient_id in fold_split['train_patients']:
-            cursor.execute("""
-                INSERT INTO dataset_members (split_id, patient_id, fold_number)
-                VALUES (?, ?, ?)
-            """, (train_split_id, patient_id, fold))
-
-        for patient_id in fold_split['val_patients']:
-            cursor.execute("""
-                INSERT INTO dataset_members (split_id, patient_id, fold_number)
-                VALUES (?, ?, ?)
-            """, (val_split_id, patient_id, fold))
+        # 添加成员
+        for patient_id, patient_fold in fold_assignments.items():
+            if patient_fold == fold_idx:
+                # 该患者属于这个fold的验证集
+                cursor.execute("""
+                    INSERT INTO dataset_members (split_id, patient_id, fold_number)
+                    VALUES (?, ?, ?)
+                """, (val_split_id, patient_id, fold_idx))
+            else:
+                # 该患者属于这个fold的训练集
+                cursor.execute("""
+                    INSERT INTO dataset_members (split_id, patient_id, fold_number)
+                    VALUES (?, ?, ?)
+                """, (train_split_id, patient_id, fold_idx))
 
     conn.commit()
+    conn.close()
+    print(f"✓ 划分保存完成！")
 
-    # 统计每个fold的样本数量
-    print("\n" + "=" * 60)
-    print("数据集划分统计:")
-    print("=" * 60)
 
-    for fold_split in fold_splits:
-        fold = fold_split['fold']
+def verify_no_data_leakage(db_path, split_version):
+    """验证没有数据泄漏"""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
 
-        # 统计训练集样本
-        train_patients = fold_split['train_patients']
-        train_count = sum(len(patient_info[pid]['samples']) for pid in train_patients)
+    print(f"\n{'='*60}")
+    print("数据泄漏检查")
+    print(f"{'='*60}")
 
-        # 统计验证集样本
-        val_patients = fold_split['val_patients']
-        val_count = sum(len(patient_info[pid]['samples']) for pid in val_patients)
+    for fold_idx in range(N_FOLDS):
+        # 获取训练集患者
+        cursor.execute("""
+            SELECT DISTINCT dm.patient_id
+            FROM dataset_members dm
+            JOIN dataset_splits ds ON dm.split_id = ds.split_id
+            WHERE ds.split_type = 'train' AND dm.fold_number = ? AND ds.split_version = ?
+        """, (fold_idx, split_version))
+        train_patients = set(row[0] for row in cursor.fetchall())
 
-        print(f"\nFold {fold}:")
-        print(f"  训练集: {len(train_patients)} 患者, {train_count} 样本")
-        print(f"  验证集: {len(val_patients)} 患者, {val_count} 样本")
-        print(f"  总计: {len(train_patients) + len(val_patients)} 患者, {train_count + val_count} 样本")
+        # 获取验证集患者
+        cursor.execute("""
+            SELECT DISTINCT dm.patient_id
+            FROM dataset_members dm
+            JOIN dataset_splits ds ON dm.split_id = ds.split_id
+            WHERE ds.split_type = 'val' AND dm.fold_number = ? AND ds.split_version = ?
+        """, (fold_idx, split_version))
+        val_patients = set(row[0] for row in cursor.fetchall())
+
+        # 检查交集
+        overlap = train_patients & val_patients
+        if overlap:
+            print(f"⚠️ Fold {fold_idx}: 发现数据泄漏！重叠患者: {overlap}")
+        else:
+            print(f"✓ Fold {fold_idx}: 无数据泄漏 (训练:{len(train_patients)}患者, 验证:{len(val_patients)}患者)")
 
     conn.close()
 
 
-def process_dataset_split():
-    """执行数据集划分"""
+def main():
+    """主函数"""
     print("=" * 60)
-    print("数据集划分 - Patient-level Stratified 3-Fold CV")
+    print("数据集划分器 V2.0 (患者级分层)")
     print("=" * 60)
-    print(f"数据库路径: {DB_PATH}")
-    print(f"交叉验证折数: {N_FOLDS}")
-    print(f"随机种子: {RANDOM_SEED}")
-    print(f"版本: {SPLIT_VERSION}")
-    print(f"强制重新划分: {FORCE_RESPLIT}")
 
-    # 1. 加载数据
-    print("\n正在加载数据...")
-    samples, patient_info = load_dataset_info(DB_PATH)
+    # 加载患者信息
+    print("\n加载患者信息...")
+    patient_info = load_patient_info(DB_PATH)
 
-    if len(samples) == 0:
-        print("❌ 错误: 数据库中没有找到带有fused_action_features的样本！")
-        print("请先运行 stage3_mfa.py")
+    if not patient_info:
+        print("错误: 未找到有效的患者数据！")
+        print("请确保:")
+        print("  1. examination_labels表有HB分级数据")
+        print("  2. video_features表有几何特征数据")
         return
 
-    print(f"✓ 加载了 {len(samples)} 个样本，来自 {len(patient_info)} 个患者")
-
-    # 2. 创建患者级别的分层划分
-    print("\n创建患者级别的分层交叉验证划分...")
-    fold_splits = create_fold_splits(
-        patient_info=patient_info,
+    # 创建分层划分
+    print("\n创建分层K折划分...")
+    fold_assignments = create_stratified_folds(
+        patient_info,
         n_folds=N_FOLDS,
         random_seed=RANDOM_SEED
     )
-    print(f"✓ 创建了 {N_FOLDS} 折交叉验证划分")
 
-    # 3. 保存到数据库
-    print("\n正在保存划分结果到数据库...")
-    save_splits_to_db(DB_PATH, samples, patient_info, fold_splits, SPLIT_VERSION, FORCE_RESPLIT)
-    print("✓ 划分结果已保存到 dataset_splits 和 dataset_members 表")
+    # 打印统计
+    print_fold_statistics(patient_info, fold_assignments, N_FOLDS)
 
-    print("\n" + "=" * 60)
-    print("✓ 数据集划分完成！")
-    print("=" * 60)
-    print("\n下一步: 运行 train_hgfa_net.py 开始训练")
-    print("\n提示:")
-    print("  - 同一患者的所有样本都在同一fold中")
-    print("  - 训练集和验证集的严重程度分布已平衡")
-    print("  - 可以开始训练Fold 0, Fold 1, Fold 2")
+    # 保存到数据库
+    save_to_database(
+        DB_PATH,
+        fold_assignments,
+        patient_info,
+        N_FOLDS,
+        SPLIT_VERSION,
+        force_resplit=FORCE_RESPLIT
+    )
+
+    # 验证无数据泄漏
+    verify_no_data_leakage(DB_PATH, SPLIT_VERSION)
+
+    print(f"\n{'='*60}")
+    print("划分完成！")
+    print(f"{'='*60}")
 
 
-if __name__ == "__main__":
-    process_dataset_split()
+if __name__ == '__main__':
+    main()
