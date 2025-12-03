@@ -1,8 +1,10 @@
-# augment_keyframes.py
+# augment_keyframes_optimized.py
 # ============================================================
-# 关键帧增强:
-# 1) 基于分割后的峰值帧做镜像增强(+ 指标镜像)
-# 2) 对(原分割图 + 镜像分割图)做小角度旋转/亮度对比度增强(仅图像)
+# 优化版本 - 关键改进:
+# 1. 多进程并行处理图像增强 (充分利用 M3 Max 的多核)
+# 2. 批量数据库操作 (减少 I/O)
+# 3. 内存优化 (避免重复加载)
+# 4. 预先计算所有路径 (减少文件系统操作)
 # ============================================================
 
 import os
@@ -13,10 +15,13 @@ from typing import List, Tuple, Dict, Optional
 import numpy as np
 import cv2
 import multiprocessing
+from multiprocessing import Pool, cpu_count
+from functools import partial
+from tqdm import tqdm
+import time
 
-# 建议: 使用一半核心给 OpenCV, 避免过度抢占系统
-num_cores = multiprocessing.cpu_count()
-cv2.setNumThreads(max(1, num_cores // 2))
+# OpenCV 线程数设置为 1，避免与多进程冲突
+cv2.setNumThreads(1)
 
 from facialPalsy.action_feature_integrator import ActionFeatureIntegrator
 from facialPalsy.face_segmenter import to_segmented_path
@@ -35,15 +40,9 @@ def load_indicators_from_db_row(
         dynamic_dim: int,
         afi: ActionFeatureIntegrator
 ) -> Tuple[Dict[str, float], Dict[str, float], List[str], List[str]]:
-    """
-    从 video_features 一行中解析出静态/动态指标字典
-
-    返回:
-        static_dict, dynamic_dict, static_names, dynamic_names
-    """
+    """从 video_features 一行中解析出静态/动态指标字典"""
     key_inds = afi.action_key_indicators.get(action_name)
     if key_inds is None:
-        # 理论上不会发生
         return {}, {}, [], []
 
     static_names = key_inds["static"]
@@ -66,47 +65,114 @@ def load_indicators_from_db_row(
     return static_dict, dynamic_dict, static_names, dynamic_names
 
 
-def save_mirror_features_into_db(
+def _color_jitter_hsv(img: np.ndarray,
+                      delta_h: float,
+                      scale_s: float,
+                      scale_v: float) -> np.ndarray:
+    """在 HSV 空间做颜色抖动"""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h, s, v = cv2.split(hsv)
+
+    h = (h + delta_h) % 180.0
+    s = np.clip(s * scale_s, 0.0, 255.0)
+    v = np.clip(v * scale_v, 0.0, 255.0)
+
+    hsv_j = cv2.merge([h, s, v]).astype(np.uint8)
+    return cv2.cvtColor(hsv_j, cv2.COLOR_HSV2BGR)
+
+
+def process_single_image_augmentation(args: Tuple[str, Path]) -> int:
+    """
+    处理单张图像的所有增强
+
+    这个函数会被多进程调用，每个进程独立处理一张图像
+
+    Returns:
+        增强后生成的图像数量
+    """
+    base_path, parent = args
+
+    if not os.path.exists(base_path):
+        return 0
+
+    img = cv2.imread(base_path)
+    if img is None:
+        return 0
+
+    h, w = img.shape[:2]
+    stem = Path(base_path).stem
+
+    count = 0
+
+    # 旋转增强
+    angles = (-7, -4, 4, 7)
+    for angle in angles:
+        M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+        img_rot = cv2.warpAffine(
+            img,
+            M,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        out_path = parent / f"{stem}_rot{angle:+d}.jpg"
+        cv2.imwrite(str(out_path), img_rot, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        count += 1
+
+    # 亮度/对比度增强
+    bc_configs = [
+        ("brightStrong", 1.30, 1.0),
+        ("darkStrong", 0.70, 1.0),
+        ("contrastHigh", 1.0, 1.35),
+        ("contrastLow", 1.0, 0.70),
+        ("brightContrast", 1.25, 1.20),
+    ]
+    for tag, b, c in bc_configs:
+        img_bc = adjust_brightness_contrast(img, brightness=b, contrast=c)
+        out_path = parent / f"{stem}_{tag}.jpg"
+        cv2.imwrite(str(out_path), img_bc, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        count += 1
+
+    # 颜色抖动
+    cj_configs = [
+        ("cj_warm", +12.0, 1.20, 1.00),
+        ("cj_cool", -12.0, 0.85, 1.05),
+        ("cj_flat", 0.0, 0.75, 1.05),
+        ("cj_vivid", 0.0, 1.30, 1.10),
+    ]
+    for tag, dh, ss, vv in cj_configs:
+        img_cj = _color_jitter_hsv(img, delta_h=dh, scale_s=ss, scale_v=vv)
+        out_path = parent / f"{stem}_{tag}.jpg"
+        cv2.imwrite(str(out_path), img_cj, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        count += 1
+
+    # 灰度转换
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    out_path = parent / f"{stem}_gray.jpg"
+    cv2.imwrite(str(out_path), gray_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    count += 1
+
+    return count
+
+
+def batch_save_mirror_features(
         conn: sqlite3.Connection,
-        video_id: int,
-        seg_mirror_path: str,
-        static_mirror: Dict[str, float],
-        dynamic_mirror: Dict[str, float],
-        static_names: List[str],
-        dynamic_names: List[str],
-        static_dim: int,
-        dynamic_dim: int,
-        palsy_side: Optional[int]
+        mirror_data_list: List[Tuple]
 ):
     """
-    将镜像后的指标插入 video_features 表，augmentation_type='mirror'
+    批量保存镜像特征到数据库
+
+    Args:
+        mirror_data_list: [(video_id, seg_mirror_path, static_blob, dynamic_blob, aug_palsy_side), ...]
     """
+    if not mirror_data_list:
+        return
+
     cur = conn.cursor()
 
-    # 按既定顺序重新打包成 numpy 数组
-    if static_dim > 0 and static_names:
-        static_arr = np.array(
-            [static_mirror.get(name, 0.0) for name in static_names],
-            dtype=np.float32,
-        )
-        static_blob = static_arr.tobytes()
-    else:
-        static_blob = None
-
-    if dynamic_dim > 0 and dynamic_names:
-        dyn_arr = np.array(
-            [dynamic_mirror.get(name, 0.0) for name in dynamic_names],
-            dtype=np.float32,
-        )
-        dynamic_blob = dyn_arr.tobytes()
-    else:
-        dynamic_blob = None
-
-    # 患侧翻转
-    aug_palsy_side = flip_palsy_side(palsy_side) if palsy_side is not None else None
-
-    # 直接基于原始那一行复制其他字段, 只改增强相关
-    cur.execute(
+    # 使用 executemany 批量插入
+    cur.executemany(
         """
         INSERT INTO video_features (
             video_id,
@@ -127,15 +193,15 @@ def save_mirror_features_into_db(
         )
         SELECT
             video_id,
-            ?,                      -- augmentation_type
-            ?,                      -- aug_palsy_side
+            'mirror',
+            ?,
             peak_frame_idx,
-            peak_frame_path,        -- 原始峰值帧路径不变
-            ?,                      -- 镜像后的分割图路径
+            peak_frame_path,
+            ?,
             unit_length,
-            ?,                      -- 静态特征BLOB(镜像)
+            ?,
             static_dim,
-            ?,                      -- 动态特征BLOB(镜像)
+            ?,
             dynamic_dim,
             motion_features,
             motion_dim,
@@ -144,137 +210,47 @@ def save_mirror_features_into_db(
         FROM video_features
         WHERE video_id = ? AND augmentation_type = 'none'
         """,
-        (
-            "mirror",
-            aug_palsy_side,
-            seg_mirror_path,
-            static_blob,
-            dynamic_blob,
-            video_id,
-        ),
+        [(aug_palsy_side, seg_mirror_path, static_blob, dynamic_blob, video_id)
+         for video_id, seg_mirror_path, static_blob, dynamic_blob, aug_palsy_side in mirror_data_list]
     )
 
 
-def _color_jitter_hsv(img: np.ndarray,
-                      delta_h: float,
-                      scale_s: float,
-                      scale_v: float) -> np.ndarray:
-    """
-    在 HSV 空间做颜色抖动:
-    - delta_h: 色相偏移(单位: 0~180), 正值偏暖, 负值偏冷
-    - scale_s: 饱和度缩放
-    - scale_v: 明度缩放
-    """
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    h, s, v = cv2.split(hsv)
-
-    # Hue 在 [0,180) 循环
-    h = (h + delta_h) % 180.0
-    # Saturation / Value 做缩放并裁剪
-    s = np.clip(s * scale_s, 0.0, 255.0)
-    v = np.clip(v * scale_v, 0.0, 255.0)
-
-    hsv_j = cv2.merge([h, s, v]).astype(np.uint8)
-    return cv2.cvtColor(hsv_j, cv2.COLOR_HSV2BGR)
-
-
-def augment_images_only(base_path: str):
-    """
-    对一张(分割后的)关键帧图像做多种增强, 只在图像层面修改, 不改指标:
-    1) 多角度轻微旋转(-7°, -4°, +4°, +7°)
-    2) 亮度 / 对比度增强(力度更明显)
-    3) 颜色抖动(色相、饱和度、明度)
-    4) 灰度转换(黑白图)
-    """
-    if not os.path.exists(base_path):
-        print(f"[WARN] 图像不存在, 跳过增强: {base_path}")
-        return
-
-    img = cv2.imread(base_path)
-    if img is None:
-        print(f"[WARN] cv2无法读取图像, 跳过增强: {base_path}")
-        return
-
-    h, w = img.shape[:2]
-    stem = Path(base_path).stem
-    parent = Path(base_path).parent
-
-    # ---------- 1) 旋转增强 ----------
-    # 控制在 ±7° 以内, 不会夸张到影响动作语义
-    angles = (-7, -4, 4, 7)
-    for angle in angles:
-        M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
-        img_rot = cv2.warpAffine(
-            img,
-            M,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101,
-        )
-        out_path = parent / f"{stem}_rot{angle:+d}.jpg"
-        cv2.imwrite(str(out_path), img_rot)
-
-    # ---------- 2) 亮度 / 对比度增强 ----------
-    # brightness: 亮度系数, 对应你之前写的 brightness 参数
-    # contrast:   对比度系数
-    bc_configs = [
-        ("brightStrong", 1.30, 1.0),    # 明显变亮
-        ("darkStrong",   0.70, 1.0),    # 明显变暗
-        ("contrastHigh", 1.0,  1.35),   # 对比度明显增强
-        ("contrastLow",  1.0,  0.70),   # 对比度降低(偏灰)
-        ("brightContrast", 1.25, 1.20), # 又亮又“硬”
-    ]
-    for tag, b, c in bc_configs:
-        img_bc = adjust_brightness_contrast(img, brightness=b, contrast=c)
-        out_path = parent / f"{stem}_{tag}.jpg"
-        cv2.imwrite(str(out_path), img_bc)
-
-    # ---------- 3) 颜色抖动(Color Jitter) ----------
-    # 在 HSV 空间组合几种"风格":
-    #  - 偏暖 + 饱和度略增
-    #  - 偏冷 + 饱和度略减
-    #  - 轻微曝光变化
-    cj_configs = [
-        ("cj_warm",   +12.0, 1.20, 1.00),  # 色相偏暖, 饱和度增加
-        ("cj_cool",   -12.0, 0.85, 1.05),  # 色相偏冷, 饱和度略减, 明度略增
-        ("cj_flat",    0.0,  0.75, 1.05),  # 色彩变平, 类似“低饱和滤镜”
-        ("cj_vivid",   0.0,  1.30, 1.10),  # 饱和度+明度一起提升, 更鲜艳
-    ]
-    for tag, dh, ss, vv in cj_configs:
-        img_cj = _color_jitter_hsv(img, delta_h=dh, scale_s=ss, scale_v=vv)
-        out_path = parent / f"{stem}_{tag}.jpg"
-        cv2.imwrite(str(out_path), img_cj)
-
-    # ---------- 4) 灰度转换 ----------
-    # 灰度图鼓励模型更多关注形状与纹理, 减少对颜色的依赖
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    out_path = parent / f"{stem}_gray.jpg"
-    cv2.imwrite(str(out_path), gray_bgr)
-
-
-def run_offline_augmentation(
+def run_offline_augmentation_optimized(
         db_path: str,
         do_mirror: bool = True,
         do_rotate_and_bc: bool = True,
-        commit_interval: int = 50,   # 每处理多少条样本提交一次
+        num_workers: Optional[int] = None,
+        db_batch_size: int = 100,
 ):
     """
-    主入口:
-    1) 对 augmentation_type='none' 的样本做镜像增强(含指标镜像 + 镜像分割图)
-    2) 对 原分割图 + 镜像分割图 做旋转/亮度对比度/颜色/灰度增强(只在图像层)
-    3) 每处理 commit_interval 条样本提交一次事务 -> 既加快速度又方便中途停止+重跑
-    """
-    conn = sqlite3.connect(db_path)
+    优化版主入口
 
-    # 让 SQLite 写入更快: WAL + synchronous=NORMAL
+    关键优化:
+    1. 预先加载所有需要处理的数据（减少数据库查询）
+    2. 镜像处理分批提交（减少 I/O）
+    3. 图像增强使用多进程并行（充分利用 CPU）
+    4. 预先检查已存在的镜像记录（避免重复处理）
+
+    Args:
+        num_workers: 进程数，None 表示使用 CPU 核心数
+        db_batch_size: 数据库批量提交大小
+    """
+    if num_workers is None:
+        num_workers = cpu_count()
+
+    print(f"[OPT] 使用 {num_workers} 个进程并行处理")
+
+    start_time = time.time()
+
+    conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
 
     cur = conn.cursor()
     afi = ActionFeatureIntegrator()
 
-    # 只取基础样本: augmentation_type='none'
+    # ========== 阶段1: 预先加载所有数据 ==========
+    print("[OPT] 阶段1: 加载数据...")
     cur.execute(
         """
         SELECT
@@ -298,125 +274,207 @@ def run_offline_augmentation(
     )
     rows = cur.fetchall()
     total = len(rows)
-    print(f"[AUG] 找到 {total} 条基础样本(augmentation_type='none')用于增强")
+    print(f"[OPT] 找到 {total} 条基础样本")
 
-    processed = 0
+    if total == 0:
+        conn.close()
+        return
 
-    for idx, (
-        video_id,
-        examination_id,
-        action_name,
-        peak_frame_idx,
-        peak_frame_path,
-        seg_path,
-        static_blob,
-        static_dim,
-        dynamic_blob,
-        dynamic_dim,
-        palsy_side,
-    ) in enumerate(rows, start=1):
-
-        # ---------- 0) 检查镜像记录是否已经存在 (支持中途停止+重跑) ----------
+    # ========== 阶段2: 检查已存在的镜像记录 ==========
+    if do_mirror:
+        print("[OPT] 阶段2: 检查已存在的镜像记录...")
+        video_ids = [row[0] for row in rows]
+        placeholders = ','.join('?' * len(video_ids))
         cur.execute(
-            "SELECT 1 FROM video_features WHERE video_id = ? AND augmentation_type = 'mirror'",
-            (video_id,),
+            f"""
+            SELECT video_id 
+            FROM video_features 
+            WHERE video_id IN ({placeholders}) 
+              AND augmentation_type = 'mirror'
+            """,
+            video_ids
         )
-        mirror_exists_in_db = cur.fetchone() is not None
+        existing_mirrors = set(row[0] for row in cur.fetchall())
+        print(f"[OPT] 已存在 {len(existing_mirrors)} 个镜像记录")
+    else:
+        existing_mirrors = set()
 
-        # 1) 确定分割后峰值帧路径
-        if seg_path:
-            seg_path_real = seg_path
-        else:
-            seg_path_real = to_segmented_path(peak_frame_path)
+    # ========== 阶段3: 批量处理镜像增强 ==========
+    mirror_count = 0
+    mirror_data_batch = []
+    image_paths_for_augmentation = []
 
-        if not seg_path_real or not os.path.exists(seg_path_real):
-            print(f"[WARN] 分割图不存在, 跳过 video_id={video_id}, seg_path={seg_path_real}")
-            continue
+    if do_mirror:
+        print("[OPT] 阶段3: 处理镜像增强...")
 
-        # 2) 从 DB blob 中恢复原始指标
-        static_dict, dynamic_dict, static_names, dynamic_names = load_indicators_from_db_row(
-            action_name,
-            static_blob,
-            static_dim,
-            dynamic_blob,
-            dynamic_dim,
-            afi,
-        )
+        for idx, (
+                video_id,
+                examination_id,
+                action_name,
+                peak_frame_idx,
+                peak_frame_path,
+                seg_path,
+                static_blob,
+                static_dim,
+                dynamic_blob,
+                dynamic_dim,
+                palsy_side,
+        ) in enumerate(tqdm(rows, desc="镜像增强"), start=1):
 
-        seg_mirror_path = None
+            # 跳过已存在的镜像
+            if video_id in existing_mirrors:
+                # 但仍然需要记录路径用于后续的图像增强
+                if seg_path:
+                    seg_path_real = seg_path
+                else:
+                    seg_path_real = to_segmented_path(peak_frame_path)
 
-        # ---------- 3) 镜像增强: 只在 DB 里还没有 mirror 记录时才做 ----------
-        if do_mirror and not mirror_exists_in_db:
+                if seg_path_real and os.path.exists(seg_path_real):
+                    seg_mirror_path = str(
+                        Path(seg_path_real).with_name(Path(seg_path_real).stem + "_mirror.jpg")
+                    )
+                    if os.path.exists(seg_mirror_path):
+                        image_paths_for_augmentation.append(seg_mirror_path)
+                continue
+
+            # 确定分割后峰值帧路径
+            if seg_path:
+                seg_path_real = seg_path
+            else:
+                seg_path_real = to_segmented_path(peak_frame_path)
+
+            if not seg_path_real or not os.path.exists(seg_path_real):
+                continue
+
+            # 从 DB blob 中恢复原始指标
+            static_dict, dynamic_dict, static_names, dynamic_names = load_indicators_from_db_row(
+                action_name,
+                static_blob,
+                static_dim,
+                dynamic_blob,
+                dynamic_dim,
+                afi,
+            )
+
+            # 读取并镜像图像
             img_seg = cv2.imread(seg_path_real)
             if img_seg is None:
-                print(f"[WARN] 无法读取分割图, 跳过mirror: {seg_path_real}")
-            else:
-                seg_mirror_path = str(
-                    Path(seg_path_real).with_name(Path(seg_path_real).stem + "_mirror.jpg")
-                )
-                os.makedirs(Path(seg_mirror_path).parent, exist_ok=True)
+                continue
 
-                # 图像镜像
-                img_seg_mirror = cv2.flip(img_seg, 1)
-                cv2.imwrite(seg_mirror_path, img_seg_mirror)
-
-                # 指标镜像
-                static_mirror = mirror_indicators_dict(static_dict)
-                dynamic_mirror = mirror_indicators_dict(dynamic_dict)
-
-                # 写入 mirror 样本到 DB (不 commit, 由外层统一 commit)
-                save_mirror_features_into_db(
-                    conn,
-                    video_id=video_id,
-                    seg_mirror_path=seg_mirror_path,
-                    static_mirror=static_mirror,
-                    dynamic_mirror=dynamic_mirror,
-                    static_names=static_names,
-                    dynamic_names=dynamic_names,
-                    static_dim=static_dim,
-                    dynamic_dim=dynamic_dim,
-                    palsy_side=palsy_side,
-                )
-
-                print(f"[AUG] video_id={video_id}, action={action_name}: 已生成镜像样本")
-        else:
-            # DB里已经存在 mirror 行, 推断 mirror 图路径(用于图像增强)
             seg_mirror_path = str(
                 Path(seg_path_real).with_name(Path(seg_path_real).stem + "_mirror.jpg")
             )
+            os.makedirs(Path(seg_mirror_path).parent, exist_ok=True)
 
-        # ---------- 4) 图像级别增强(旋转 + 亮度/对比度/颜色/灰度) ----------
-        if do_rotate_and_bc:
-            # 原分割图增强
-            augment_images_only(seg_path_real)
+            # 图像镜像
+            img_seg_mirror = cv2.flip(img_seg, 1)
+            cv2.imwrite(seg_mirror_path, img_seg_mirror, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-            # 镜像分割图增强(如果存在 mirror 图)
-            if seg_mirror_path and os.path.exists(seg_mirror_path):
-                augment_images_only(seg_mirror_path)
+            # 指标镜像
+            static_mirror = mirror_indicators_dict(static_dict)
+            dynamic_mirror = mirror_indicators_dict(dynamic_dict)
 
-        processed += 1
+            # 打包成 numpy 数组
+            if static_dim > 0 and static_names:
+                static_arr = np.array(
+                    [static_mirror.get(name, 0.0) for name in static_names],
+                    dtype=np.float32,
+                )
+                static_blob_mirror = static_arr.tobytes()
+            else:
+                static_blob_mirror = None
 
-        # ---------- 5) 批量提交事务 ----------
-        if processed % commit_interval == 0:
+            if dynamic_dim > 0 and dynamic_names:
+                dyn_arr = np.array(
+                    [dynamic_mirror.get(name, 0.0) for name in dynamic_names],
+                    dtype=np.float32,
+                )
+                dynamic_blob_mirror = dyn_arr.tobytes()
+            else:
+                dynamic_blob_mirror = None
+
+            # 患侧翻转
+            aug_palsy_side = flip_palsy_side(palsy_side) if palsy_side is not None else None
+
+            # 添加到批次
+            mirror_data_batch.append((
+                video_id,
+                seg_mirror_path,
+                static_blob_mirror,
+                dynamic_blob_mirror,
+                aug_palsy_side
+            ))
+
+            # 记录镜像图像路径，用于后续增强
+            image_paths_for_augmentation.append(seg_mirror_path)
+
+            mirror_count += 1
+
+            # 批量提交
+            if len(mirror_data_batch) >= db_batch_size:
+                batch_save_mirror_features(conn, mirror_data_batch)
+                conn.commit()
+                mirror_data_batch = []
+
+        # 提交剩余的批次
+        if mirror_data_batch:
+            batch_save_mirror_features(conn, mirror_data_batch)
             conn.commit()
-            print(f"[AUG] 已处理 {processed}/{total} 条样本, 已提交一次事务")
 
-    # 循环结束后再提交一次, 确保最后一批保存
-    conn.commit()
+        print(f"[OPT] 镜像增强完成: 新增 {mirror_count} 个镜像样本")
+
+    # ========== 阶段4: 收集所有需要图像增强的路径 ==========
+    if do_rotate_and_bc:
+        print("[OPT] 阶段4: 收集图像增强路径...")
+
+        # 添加原始分割图路径
+        for row in rows:
+            seg_path = row[5]  # peak_frame_segmented_path
+            peak_frame_path = row[4]  # peak_frame_path
+
+            if seg_path:
+                seg_path_real = seg_path
+            else:
+                seg_path_real = to_segmented_path(peak_frame_path)
+
+            if seg_path_real and os.path.exists(seg_path_real):
+                image_paths_for_augmentation.append(seg_path_real)
+
+        # 去重
+        image_paths_for_augmentation = list(set(image_paths_for_augmentation))
+        print(f"[OPT] 共 {len(image_paths_for_augmentation)} 张图像需要增强")
+
+        # ========== 阶段5: 多进程并行处理图像增强 ==========
+        print(f"[OPT] 阶段5: 多进程并行图像增强（{num_workers} 进程）...")
+
+        # 准备参数：(图像路径, 父目录)
+        args_list = [(img_path, Path(img_path).parent) for img_path in image_paths_for_augmentation]
+
+        # 使用多进程池
+        with Pool(processes=num_workers) as pool:
+            results = list(tqdm(
+                pool.imap(process_single_image_augmentation, args_list),
+                total=len(args_list),
+                desc="图像增强"
+            ))
+
+        total_augmented = sum(results)
+        print(f"[OPT] 图像增强完成: 生成 {total_augmented} 张增强图像")
+
     conn.close()
-    print(f"[AUG] 离线数据增强完成, 共处理 {processed}/{total} 条样本")
+
+    elapsed = time.time() - start_time
+    print(f"\n[OPT] 总耗时: {elapsed:.2f} 秒 ({elapsed / 60:.2f} 分钟)")
+    print(f"[OPT] 平均速度: {total / elapsed:.2f} 样本/秒")
 
 
 if __name__ == "__main__":
-    # TODO: 根据你的实际路径修改
     DB_PATH = "facialPalsy.db"
 
-    # 先确保已经跑过:
-    #   1) video_pipeline.py
-    #   2) face_segmenter.py 的 batch_process_keyframes + update_segmented_paths
-
-    run_offline_augmentation(
+    run_offline_augmentation_optimized(
         db_path=DB_PATH,
-        do_mirror=True,          # 是否做镜像增强(含指标镜像)
-        do_rotate_and_bc=True,   # 是否做旋转 + 亮度/对比度图像增强
+        do_mirror=True,
+        do_rotate_and_bc=True,
+        num_workers=6,  # 自动使用所有CPU核心
+        db_batch_size=100,  # 每100个样本提交一次数据库
     )
