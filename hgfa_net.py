@@ -1,486 +1,669 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-H-GFA Net: Hierarchical Geometric-Feature Attention Network
-端到端层级多任务学习模型
+H-GFA Net: 改进版层级多任务网络
+=============================================
 
-架构:
-1. ActionEncoder: 对每个动作编码 (CDCAF -> GQCA -> MFA)
-2. SessionAggregator: 聚合11个动作到检查级表示
-3. 多任务输出头:
-   - 动作级: 严重程度分类 (5类)
-   - 检查级: 是否面瘫(2类), 面瘫侧别(3类), HB分级(6类), Sunnybrook(回归)
+核心改进 (基于MLST-Net思想):
+1. **Proxy Task Fusion**: 动作级任务作为辅助任务
+2. **Task Cascade**: 先预测severity,再用它辅助检查级诊断
+3. **Wrinkle特征独立编码**: 不直接concat,而是通过乘法融合
+4. **任务层级建模**: 显式利用任务间的依赖关系
 
-关键设计:
-- 所有特征融合模块都是可训练的 (端到端)
-- 支持缺失动作 (通过action_mask处理)
-- 不确定性加权的多任务损失
+架构流程:
+Stage 1: Feature Extraction
+  ├─ CDCAF: static + dynamic → geo_feat (128)
+  ├─ Visual: MobileNetV3 → visual_feat (1280)
+  ├─ Wrinkle: wrinkle_scalar (10) → wrinkle_feat (128)
+  └─ Motion: motion_feat (12) → motion_feat (128)
 
-版本: V3.0 (修复batch维度不一致问题)
+Stage 2: Proxy Task (Action-Level Severity)
+  ├─ Multi-modal Fusion → action_embed (256)
+  └─ Severity Head → severity_logits (5类)
+       [这个任务帮助网络学习面部特征的判别性表示]
+
+Stage 3: Main Task (Session-Level Diagnosis)
+  ├─ Input: action_embed + severity_prob
+  ├─ Aggregator: 聚合11个动作
+  └─ 4 Heads: has_palsy, palsy_side, hb_grade, sunnybrook
+       [利用severity信息辅助更复杂的诊断]
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional
+from typing import Dict, Tuple
+from dataset_palsy import HierarchicalPalsyDataset
 
+# ============================================================================
+# Stage 1: Feature Encoders
+# ============================================================================
 
 class CDCAF(nn.Module):
-    """
-    Clinical-Driven Cross-Attention Fusion
-    几何特征融合: 静态特征 + 动态特征 -> 融合几何特征
-    """
+    """几何特征融合 (保持不变)"""
 
     def __init__(self, max_static_dim=11, max_dynamic_dim=8, hidden_dim=128, dropout=0.3):
         super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # 静态特征编码器
         self.static_encoder = nn.Sequential(
             nn.Linear(max_static_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
-
-        # 动态特征编码器
         self.dynamic_encoder = nn.Sequential(
             nn.Linear(max_dynamic_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
-
-        # 门控融合机制
         self.gate = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.Sigmoid()
         )
-
-        # 输出投影
         self.output_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim)
         )
 
     def forward(self, static_feat, dynamic_feat):
-        """
-        Args:
-            static_feat: (batch, max_static_dim)
-            dynamic_feat: (batch, max_dynamic_dim)
-        Returns:
-            geo_feat: (batch, hidden_dim)
-        """
         static_enc = self.static_encoder(static_feat)
         dynamic_enc = self.dynamic_encoder(dynamic_feat)
-
-        # 门控融合
         concat = torch.cat([static_enc, dynamic_enc], dim=-1)
         gate_weight = self.gate(concat)
         fused = gate_weight * static_enc + (1 - gate_weight) * dynamic_enc
-
         return self.output_proj(fused)
 
 
-class GQCA(nn.Module):
+class WrinkleEncoder(nn.Module):
     """
-    Geometry-guided Query Cross-Attention
-    几何引导的视觉特征增强: 几何特征 + 视觉特征 + 皱纹特征 -> 增强视觉特征
+    皱纹特征独立编码器
+    将10维标量编码到128维,与其他模态维度对齐
     """
 
-    def __init__(self, geo_dim=128, visual_dim=1280, wrinkle_dim=10,
-                 hidden_dim=256, dropout=0.3):
+    def __init__(self, wrinkle_dim=10, hidden_dim=128, dropout=0.3):
         super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # 扩展视觉维度 = visual + wrinkle
-        extended_visual_dim = visual_dim + wrinkle_dim
-
-        # FiLM调制: 用几何特征调制视觉特征
-        self.film_gamma = nn.Linear(geo_dim, extended_visual_dim)
-        self.film_beta = nn.Linear(geo_dim, extended_visual_dim)
-
-        # 视觉特征降维
-        self.visual_proj = nn.Sequential(
-            nn.Linear(extended_visual_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        self.encoder = nn.Sequential(
+            nn.Linear(wrinkle_dim, 64),
+            nn.LayerNorm(64),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
+            nn.Linear(64, hidden_dim),
+            nn.LayerNorm(hidden_dim)
         )
 
-        # 几何查询投影
-        self.geo_query_proj = nn.Linear(geo_dim, hidden_dim)
+    def forward(self, wrinkle_feat):
+        """
+        Args:
+            wrinkle_feat: (batch, 10)
+        Returns:
+            encoded: (batch, 128)
+        """
+        return self.encoder(wrinkle_feat)
 
-        # 交叉注意力
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
+
+class MotionEncoder(nn.Module):
+    """运动特征编码器"""
+
+    def __init__(self, motion_dim=12, hidden_dim=128, dropout=0.3):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(motion_dim, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+
+    def forward(self, motion_feat):
+        return self.encoder(motion_feat)
+
+
+class VisualEncoder(nn.Module):
+    """视觉特征编码器"""
+
+    def __init__(self, visual_dim=1280, hidden_dim=128, dropout=0.3):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(visual_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+
+    def forward(self, visual_feat):
+        return self.encoder(visual_feat)
+
+
+# ============================================================================
+# Stage 2: Multi-Modal Fusion (改进版)
+# ============================================================================
+
+class ComplementaryFusion(nn.Module):
+    """
+    互补特征融合 (参考MLST-Net)
+
+    核心思想: 不同模态通过乘法融合,保留各自的判别性信息
+    visual ⊗ wrinkle → 视觉-纹理互补
+    (visual ⊗ wrinkle) + geo + motion → 多模态融合
+    """
+
+    def __init__(self, feature_dim=128, output_dim=256, dropout=0.3):
+        super().__init__()
+
+        # 互补融合权重
+        self.visual_wrinkle_gate = nn.Parameter(torch.ones(1, feature_dim))
+
+        # 多模态注意力融合
+        self.attention = nn.MultiheadAttention(
+            embed_dim=feature_dim,
             num_heads=4,
             dropout=dropout,
             batch_first=True
         )
 
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
+        # 输出投影
+        self.output_proj = nn.Sequential(
+            nn.Linear(feature_dim, output_dim),
+            nn.LayerNorm(output_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim)
+            nn.Dropout(dropout)
         )
 
-    def forward(self, geo_feat, visual_feat, wrinkle_scalar):
+    def forward(self, visual_feat, wrinkle_feat, geo_feat, motion_feat):
         """
         Args:
-            geo_feat: (batch, geo_dim) - 来自CDCAF
-            visual_feat: (batch, 1280) - MobileNetV3特征
-            wrinkle_scalar: (batch, 10) - 皱纹标量特征
+            visual_feat: (batch, 128)
+            wrinkle_feat: (batch, 128)
+            geo_feat: (batch, 128)
+            motion_feat: (batch, 128)
         Returns:
-            visual_guided: (batch, hidden_dim)
+            fused: (batch, 256)
         """
-        # 拼接视觉特征和皱纹特征
-        extended_visual = torch.cat([visual_feat, wrinkle_scalar], dim=-1)
+        # 1. Visual-Wrinkle互补融合 (element-wise multiply)
+        visual_wrinkle = visual_feat * (1 + self.visual_wrinkle_gate * wrinkle_feat)
 
-        # FiLM调制
-        gamma = self.film_gamma(geo_feat)
-        beta = self.film_beta(geo_feat)
-        modulated = extended_visual * (1 + gamma) + beta
+        # 2. 堆叠所有模态
+        modalities = torch.stack([visual_wrinkle, geo_feat, motion_feat], dim=1)  # (B, 3, 128)
 
-        # 投影
-        visual_proj = self.visual_proj(modulated)  # (batch, hidden_dim)
-        geo_query = self.geo_query_proj(geo_feat).unsqueeze(1)  # (batch, 1, hidden_dim)
-        visual_kv = visual_proj.unsqueeze(1)  # (batch, 1, hidden_dim)
+        # 3. 自注意力融合
+        fused, _ = self.attention(modalities, modalities, modalities)
+        fused = fused.mean(dim=1)  # (B, 128)
 
-        # 交叉注意力
-        attn_out, _ = self.cross_attention(geo_query, visual_kv, visual_kv)
-
-        # FFN + 残差
-        out = self.norm(geo_query.squeeze(1) + attn_out.squeeze(1))
-        out = out + self.ffn(out)
-
-        return out
+        # 4. 输出投影
+        return self.output_proj(fused)
 
 
-class MFA(nn.Module):
-    """
-    Multi-modal Fusion Attention
-    最终多模态融合: 几何特征 + 视觉引导特征 + 运动特征 -> 动作嵌入
-    """
-
-    def __init__(self, geo_dim=128, visual_guided_dim=256, motion_dim=12,
-                 output_dim=256, dropout=0.3):
-        super().__init__()
-
-        # 各模态投影
-        self.geo_proj = nn.Linear(geo_dim, output_dim)
-        self.visual_proj = nn.Linear(visual_guided_dim, output_dim)
-        self.motion_proj = nn.Linear(motion_dim, output_dim)
-
-        # 动态权重门
-        self.modal_gate = nn.Sequential(
-            nn.Linear(output_dim * 3, 3),
-            nn.Softmax(dim=-1)
-        )
-
-        # Transformer融合
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=output_dim,
-                nhead=4,
-                dim_feedforward=output_dim * 2,
-                dropout=dropout,
-                batch_first=True
-            ),
-            num_layers=1
-        )
-
-        self.output_norm = nn.LayerNorm(output_dim)
-
-    def forward(self, geo_feat, visual_guided_feat, motion_feat):
-        """
-        Args:
-            geo_feat: (batch, geo_dim)
-            visual_guided_feat: (batch, visual_guided_dim)
-            motion_feat: (batch, motion_dim)
-        Returns:
-            action_embed: (batch, output_dim)
-        """
-        geo = self.geo_proj(geo_feat)
-        visual = self.visual_proj(visual_guided_feat)
-        motion = self.motion_proj(motion_feat)
-
-        # 计算动态权重
-        concat = torch.cat([geo, visual, motion], dim=-1)
-        weights = self.modal_gate(concat)  # (batch, 3)
-
-        # 加权融合
-        weighted = (weights[:, 0:1] * geo +
-                    weights[:, 1:2] * visual +
-                    weights[:, 2:3] * motion)
-
-        # Transformer refinement
-        x = weighted.unsqueeze(1)  # (batch, 1, dim)
-        x = self.transformer(x)
-
-        return self.output_norm(x.squeeze(1))
-
+# ============================================================================
+# Stage 3: Action Encoder with Proxy Task
+# ============================================================================
 
 class ActionEncoder(nn.Module):
     """
-    单个动作的完整编码器
-    原始特征 -> CDCAF -> GQCA -> MFA -> 动作嵌入 + 严重程度分类
+    动作编码器 + 辅助任务
+
+    包含两个输出:
+    1. action_embed: 用于检查级聚合
+    2. severity_logits: 辅助任务,帮助学习判别性特征
     """
 
     def __init__(self, config):
         super().__init__()
 
+        # Feature encoders
         self.cdcaf = CDCAF(
             max_static_dim=config['max_static_dim'],
             max_dynamic_dim=config['max_dynamic_dim'],
-            hidden_dim=config['geo_hidden_dim'],
+            hidden_dim=128,
             dropout=config['dropout']
         )
 
-        self.gqca = GQCA(
-            geo_dim=config['geo_hidden_dim'],
+        self.visual_encoder = VisualEncoder(
             visual_dim=config['visual_dim'],
-            wrinkle_dim=config['wrinkle_dim'],
-            hidden_dim=config['gqca_hidden_dim'],
+            hidden_dim=128,
             dropout=config['dropout']
         )
 
-        self.mfa = MFA(
-            geo_dim=config['geo_hidden_dim'],
-            visual_guided_dim=config['gqca_hidden_dim'],
+        self.wrinkle_encoder = WrinkleEncoder(
+            wrinkle_dim=config['wrinkle_dim'],
+            hidden_dim=128,
+            dropout=config['dropout']
+        )
+
+        self.motion_encoder = MotionEncoder(
             motion_dim=config['motion_dim'],
+            hidden_dim=128,
+            dropout=config['dropout']
+        )
+
+        # Complementary fusion
+        self.fusion = ComplementaryFusion(
+            feature_dim=128,
             output_dim=config['action_embed_dim'],
             dropout=config['dropout']
         )
 
-        # 动作级严重程度分类头
+        # Proxy task: Action-level severity classification
         self.severity_head = nn.Sequential(
-            nn.Linear(config['action_embed_dim'], 64),
+            nn.Linear(config['action_embed_dim'], 128),
             nn.GELU(),
             nn.Dropout(config['dropout']),
-            nn.Linear(64, config['num_severity_classes'])
+            nn.Linear(128, config['num_severity_classes'])
         )
 
-    def forward(self, static, dynamic, visual, wrinkle_scalar, motion):
+    def forward(self, static, dynamic, visual, wrinkle, motion):
         """
         Returns:
-            action_embed: (batch, action_embed_dim)
-            severity_logits: (batch, num_severity_classes)
+            action_embed: (batch, 256) - 用于session聚合
+            severity_logits: (batch, 5) - 辅助任务输出
         """
-        geo = self.cdcaf(static, dynamic)
-        visual_guided = self.gqca(geo, visual, wrinkle_scalar)
-        action_embed = self.mfa(geo, visual_guided, motion)
+        # 1. Encode each modality
+        geo_feat = self.cdcaf(static, dynamic)
+        visual_feat = self.visual_encoder(visual)
+        wrinkle_feat = self.wrinkle_encoder(wrinkle)
+        motion_feat = self.motion_encoder(motion)
+
+        # 2. Multi-modal fusion
+        action_embed = self.fusion(visual_feat, wrinkle_feat, geo_feat, motion_feat)
+
+        # 3. Proxy task: severity classification
         severity_logits = self.severity_head(action_embed)
 
         return action_embed, severity_logits
 
 
+# ============================================================================
+# Stage 4: Session Aggregator with Task Cascade
+# ============================================================================
+
 class SessionAggregator(nn.Module):
     """
-    检查级聚合器
-    聚合11个动作的嵌入 -> 检查级表示 -> 多任务输出
+    检查级聚合器 (改进版)
+
+    核心改进: 利用动作级severity概率辅助检查级诊断
     """
 
-    def __init__(self, action_embed_dim=256, num_actions=11, dropout=0.3):
+    def __init__(self, action_embed_dim=256, num_actions=11,
+                 num_severity_classes=5, dropout=0.3):
         super().__init__()
         self.num_actions = num_actions
 
-        # 动作位置编码
+        # 1. 拼接action_embed + severity_prob
+        aggregator_input_dim = action_embed_dim + num_severity_classes
+
+        # 2. 动作位置编码
         self.action_pos_embed = nn.Parameter(
-            torch.randn(1, num_actions, action_embed_dim) * 0.02
+            torch.randn(1, num_actions, aggregator_input_dim) * 0.02
         )
 
-        # 注意力聚合
-        self.attention_aggregator = nn.MultiheadAttention(
-            embed_dim=action_embed_dim,
-            num_heads=4,
-            dropout=dropout,
-            batch_first=True
+        # 3. Transformer聚合
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=aggregator_input_dim,
+                nhead=3,
+                dim_feedforward=aggregator_input_dim * 2,
+                dropout=dropout,
+                batch_first=True
+            ),
+            num_layers=2
         )
 
-        # 可学习的查询token
-        self.session_query = nn.Parameter(torch.randn(1, 1, action_embed_dim) * 0.02)
-
-        # 最终投影
-        self.output_proj = nn.Sequential(
-            nn.Linear(action_embed_dim, action_embed_dim),
-            nn.LayerNorm(action_embed_dim),
+        # 4. 检查级表示
+        session_dim = 512
+        self.session_proj = nn.Sequential(
+            nn.Linear(aggregator_input_dim * num_actions, session_dim),
+            nn.LayerNorm(session_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
 
-        # 检查级任务头
-        self.has_palsy_head = nn.Linear(action_embed_dim, 2)       # 是否面瘫
-        self.palsy_side_head = nn.Linear(action_embed_dim, 3)      # 无/左/右
-        self.hb_grade_head = nn.Linear(action_embed_dim, 6)        # HB 1-6级
-        self.sunnybrook_head = nn.Linear(action_embed_dim, 1)      # 回归分数
+        # 5. 多任务输出头
+        self.has_palsy_head = self._make_head(session_dim, 2)
+        self.palsy_side_head = self._make_head(session_dim, 3)
+        self.hb_grade_head = self._make_head(session_dim, 6)
+        self.sunnybrook_head = nn.Sequential(
+            nn.Linear(session_dim, 128),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 1)
+        )
 
-    def forward(self, action_embeddings: torch.Tensor, action_mask: torch.Tensor = None):
+    def _make_head(self, in_dim, out_dim):
+        return nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, out_dim)
+        )
+
+    def forward(self, action_embeds, severity_logits, action_mask):
         """
         Args:
-            action_embeddings: (batch, num_actions, action_embed_dim)
-            action_mask: (batch, num_actions) - 1=有效, 0=缺失
+            action_embeds: (batch, num_actions, action_embed_dim)
+            severity_logits: (batch, num_actions, 5)
+            action_mask: (batch, num_actions) - 1表示有效动作, 0表示该动作缺失
         Returns:
-            session_outputs: dict of task outputs
+            session_outputs: dict with 4 tasks
         """
-        batch_size = action_embeddings.size(0)
+        # 1. severity logits → 概率
+        severity_probs = torch.softmax(severity_logits, dim=-1)
 
-        # 添加位置编码
-        x = action_embeddings + self.action_pos_embed
+        # 2. 拼接 action_embed 和 severity_prob
+        augmented_embeds = torch.cat([action_embeds, severity_probs], dim=-1)  # (B, A, 261)
 
-        # 扩展session query
-        query = self.session_query.expand(batch_size, -1, -1)
+        # 3. 添加位置编码
+        augmented_embeds = augmented_embeds + self.action_pos_embed  # broadcast 到 (B, A, 261)
 
-        # 创建key_padding_mask (True表示忽略)
-        key_padding_mask = None
+        # 4. 构造 padding mask: True 表示要忽略
         if action_mask is not None:
-            key_padding_mask = (action_mask == 0)
+            # action_mask: 1=有效 → padding_mask False; 0=无效 → padding_mask True
+            padding_mask = ~action_mask.bool()  # (B, A)
+        else:
+            padding_mask = None
 
-        # 注意力聚合
-        session_embed, attn_weights = self.attention_aggregator(
-            query, x, x,
-            key_padding_mask=key_padding_mask
-        )
-        session_embed = session_embed.squeeze(1)
+        # 5. Transformer 聚合
+        aggregated = self.transformer(
+            augmented_embeds,
+            src_key_padding_mask=padding_mask
+        )  # (B, A, 261)
 
-        # 投影
-        session_embed = self.output_proj(session_embed)
+        # 6. Flatten 并映射到 session 表示
+        session_repr = self.session_proj(aggregated.flatten(1))  # (B, session_dim)
 
-        # 任务输出
-        outputs = {
-            'has_palsy': self.has_palsy_head(session_embed),
-            'palsy_side': self.palsy_side_head(session_embed),
-            'hb_grade': self.hb_grade_head(session_embed),
-            'sunnybrook': self.sunnybrook_head(session_embed).squeeze(-1),
-            'attention_weights': attn_weights,
-            'session_embed': session_embed
+        # 7. 多任务输出
+        return {
+            'has_palsy': self.has_palsy_head(session_repr),
+            'palsy_side': self.palsy_side_head(session_repr),
+            'hb_grade': self.hb_grade_head(session_repr),
+            'sunnybrook': self.sunnybrook_head(session_repr).squeeze(-1)
         }
 
-        return outputs
-
+# ============================================================================
+# Complete H-GFA Net
+# ============================================================================
 
 class HGFANet(nn.Module):
     """
-    H-GFA Net: 完整的层级多任务学习网络
+    H-GFA Net: 层级多任务网络
 
-    层级结构:
-    1. 动作级 (Action-Level): 对每个动作预测严重程度
-    2. 检查级 (Session-Level): 聚合所有动作，预测整体诊断
+    关键点:
+    1. 每个样本是一次检查(examination)
+    2. 先对每个动作做多模态编码 + severity proxy task
+    3. 再把 11 个动作的 embedding 聚合成检查级表征
+    4. 用检查级表征做 has_palsy / palsy_side / HB / Sunnybrook 多任务预测
     """
-
-    ACTION_NAMES = [
-        'NeutralFace', 'Smile', 'RaiseEyebrow', 'CloseEyeHardly',
-        'CloseEyeSoftly', 'BlowCheek', 'LipPucker', 'ShowTeeth',
-        'ShrugNose', 'SpontaneousEyeBlink', 'VoluntaryEyeBlink'
-    ]
 
     def __init__(self, config=None):
         super().__init__()
 
         if config is None:
-            config = self.default_config()
-
+            config = self.get_default_config()
         self.config = config
-        self.num_actions = config['num_actions']
 
-        # 共享的动作编码器 (所有动作共用一个编码器)
+        # 与数据集保持同一套动作顺序
+        self.ACTION_NAMES = HierarchicalPalsyDataset.ACTION_NAMES
+        self.num_actions = config['num_actions']
+        assert self.num_actions == len(self.ACTION_NAMES), \
+            f"num_actions({self.num_actions}) 与 ACTION_NAMES({len(self.ACTION_NAMES)}) 不一致"
+
+        # 动作级编码器（11 个动作共享参数）
         self.action_encoder = ActionEncoder(config)
 
         # 检查级聚合器
         self.session_aggregator = SessionAggregator(
             action_embed_dim=config['action_embed_dim'],
             num_actions=config['num_actions'],
+            num_severity_classes=config['num_severity_classes'],
             dropout=config['dropout']
         )
 
     @staticmethod
-    def default_config():
+    def get_default_config():
         return {
-            'num_actions': 11,
+            # Feature dimensions
             'max_static_dim': 11,
             'max_dynamic_dim': 8,
             'visual_dim': 1280,
             'wrinkle_dim': 10,
             'motion_dim': 12,
-            'geo_hidden_dim': 128,
-            'gqca_hidden_dim': 256,
+
+            # Model dimensions
             'action_embed_dim': 256,
+            'num_actions': 11,
+
+            # Tasks
             'num_severity_classes': 5,
-            'dropout': 0.3,
+            'num_has_palsy_classes': 2,
+            'num_palsy_side_classes': 3,
+            'num_hb_grade_classes': 6,
+
+            # Training
+            'dropout': 0.3
         }
 
-    def forward(self, batch: Dict) -> Dict:
+    def forward(self, batch):
         """
         Args:
-            batch: {
-                'actions': {action_name: {static, dynamic, visual, wrinkle_scalar, motion}},
-                'action_indices': {action_name: [exam_indices]},
-                'action_mask': (batch, 11),
-            }
+            batch: collate_hierarchical 输出的字典, 包含:
+                - actions: {action_name: {static, dynamic, visual, wrinkle, motion}}
+                  每个动作的 batch 大小不一定等于全局 batch_size
+                - action_indices: {action_name: [exam_idx0, exam_idx1, ...]}
+                  记录该动作对应的是哪些检查
+                - action_mask: (B, 11)  1=该检查有这个动作, 0=缺失
+                - targets: {action_severity, has_palsy, ...}
         Returns:
-            {
-                'action_severity': {action_name: (N, 5)},
-                'action_severity_masks': {action_name: [indices]},
-                'action_embeddings': (batch, 11, embed_dim),
-                'session_outputs': {...}
-            }
+            outputs: dict
+                - action_severity: (B, 11, 5)
+                - session_outputs: {has_palsy, palsy_side, hb_grade, sunnybrook}
         """
-        device = batch['action_mask'].device
-        batch_size = batch['action_mask'].size(0)
+        # 全局 batch_size = 检查数
+        action_mask = batch['action_mask']  # (B, 11)
+        device = action_mask.device
+        batch_size = action_mask.size(0)
+        num_actions = self.num_actions
 
-        # 初始化全零的动作嵌入矩阵
+        # 1. 预先分配全量的动作 embedding & severity logits
+        action_embed_dim = self.config['action_embed_dim']
+        num_severity_classes = self.config['num_severity_classes']
+
+        # (B, 11, 256)
         all_action_embeddings = torch.zeros(
-            batch_size, self.num_actions, self.config['action_embed_dim'],
-            device=device
+            batch_size, num_actions, action_embed_dim, device=device
+        )
+        # (B, 11, 5)
+        all_severity_logits = torch.zeros(
+            batch_size, num_actions, num_severity_classes, device=device
         )
 
-        action_severities = {}
-        action_severity_masks = {}
-
-        # 对每个动作进行编码
+        # 2. 按固定顺序遍历 11 个动作, 用 action_indices 把结果写回全局矩阵
         for action_idx, action_name in enumerate(self.ACTION_NAMES):
             if action_name not in batch['actions']:
+                # 这个 batch 里所有检查都缺这个动作 → 保持全 0, 由 action_mask 控制
                 continue
 
             action_data = batch['actions'][action_name]
-            exam_indices = batch['action_indices'][action_name]
-
+            exam_indices = batch['action_indices'].get(action_name, [])
             if len(exam_indices) == 0:
                 continue
 
-            # 编码动作
-            embed, severity = self.action_encoder(
-                static=action_data['static'],
-                dynamic=action_data['dynamic'],
-                visual=action_data['visual'],
-                wrinkle_scalar=action_data['wrinkle_scalar'],
-                motion=action_data['motion']
-            )
+            # 该动作在当前 batch 中的有效样本数 = len(exam_indices)
+            # 形状: (n_i, feat_dim)
+            static = action_data['static'].to(device)
+            dynamic = action_data['dynamic'].to(device)
+            visual = action_data['visual'].to(device)
+            wrinkle = action_data['wrinkle'].to(device)
+            motion = action_data['motion'].to(device)
 
-            # 将embedding放到正确的位置
-            for i, exam_idx in enumerate(exam_indices):
-                all_action_embeddings[exam_idx, action_idx] = embed[i]
+            # 编码该动作
+            action_embed, severity_logits = self.action_encoder(
+                static=static,
+                dynamic=dynamic,
+                visual=visual,
+                wrinkle=wrinkle,
+                motion=motion
+            )  # (n_i, 256), (n_i, 5)
 
-            # 记录severity预测
-            action_severities[action_name] = severity
-            action_severity_masks[action_name] = exam_indices
+            # 将局部 n_i 样本写回到全局 B 样本的对应检查位置
+            exam_indices_tensor = torch.tensor(exam_indices, dtype=torch.long, device=device)
+            all_action_embeddings[exam_indices_tensor, action_idx, :] = action_embed
+            all_severity_logits[exam_indices_tensor, action_idx, :] = severity_logits
 
-        # 检查级聚合
+        # 3. 检查级聚合 (使用 action_mask 屏蔽缺失动作)
         session_outputs = self.session_aggregator(
-            all_action_embeddings,
-            batch['action_mask']
+            action_embeds=all_action_embeddings,      # (B, 11, 256)
+            severity_logits=all_severity_logits,      # (B, 11, 5)
+            action_mask=action_mask                   # (B, 11)
         )
 
         return {
-            'action_severity': action_severities,
-            'action_severity_masks': action_severity_masks,
-            'action_embeddings': all_action_embeddings,
+            'action_severity': all_severity_logits,   # (B, 11, 5)
             'session_outputs': session_outputs
         }
 
-    def count_parameters(self):
-        """统计模型参数"""
-        total = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return {'total': total, 'trainable': trainable}
+# ============================================================================
+# Multi-Task Loss with Task Weighting
+# ============================================================================
+
+class HierarchicalMultiTaskLoss(nn.Module):
+    """
+    层级多任务损失 (改进版)
+
+    关键改进:
+    1. 增加action-level severity loss (proxy task)
+    2. 使用固定权重或可学习权重平衡任务
+    3. 支持任务层级: action级 → session级
+    """
+
+    def __init__(self, use_uncertainty_weighting=True):
+        super().__init__()
+
+        self.use_uncertainty_weighting = use_uncertainty_weighting
+
+        # Loss functions
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
+        self.mse_loss = nn.MSELoss()
+
+        if use_uncertainty_weighting:
+            # 可学习的任务权重 (log(σ²))
+            self.log_vars = nn.Parameter(torch.zeros(5))  # 5个任务
+        else:
+            # 固定权重
+            self.register_buffer('weights', torch.tensor([
+                1.0,  # action_severity
+                1.0,  # has_palsy
+                1.0,  # palsy_side
+                1.5,  # hb_grade (更重要)
+                0.5  # sunnybrook (回归任务,降低权重)
+            ]))
+
+    def forward(self, outputs, targets):
+        """
+        Args:
+            outputs: model outputs dict
+            targets: ground truth dict
+
+        Returns:
+            total_loss, loss_dict
+        """
+        losses = {}
+
+        # 1. Action-level severity loss (proxy task)
+        if 'action_severity' in outputs and 'action_severity' in targets:
+            severity_logits = outputs['action_severity']  # (B, 11, 5)
+            severity_targets = targets['action_severity']  # (B, 11)
+
+            # Flatten for CE loss
+            severity_logits_flat = severity_logits.view(-1, 5)
+            severity_targets_flat = severity_targets.view(-1)
+
+            losses['action_severity'] = self.ce_loss(severity_logits_flat, severity_targets_flat)
+
+        # 2. Session-level tasks
+        session_outputs = outputs['session_outputs']
+
+        losses['has_palsy'] = self.ce_loss(
+            session_outputs['has_palsy'],
+            targets['has_palsy']
+        )
+
+        losses['palsy_side'] = self.ce_loss(
+            session_outputs['palsy_side'],
+            targets['palsy_side']
+        )
+
+        losses['hb_grade'] = self.ce_loss(
+            session_outputs['hb_grade'],
+            targets['hb_grade']
+        )
+
+        losses['sunnybrook'] = self.mse_loss(
+            session_outputs['sunnybrook'],
+            targets['sunnybrook']
+        )
+
+        # 3. 计算总损失
+        if self.use_uncertainty_weighting:
+            # Uncertainty weighting: L = Σ (1/2σ²) * L_i + log(σ)
+            total_loss = 0
+            task_names = ['action_severity', 'has_palsy', 'palsy_side', 'hb_grade', 'sunnybrook']
+
+            for i, task_name in enumerate(task_names):
+                if task_name in losses:
+                    precision = torch.exp(-self.log_vars[i])
+                    total_loss += precision * losses[task_name] + self.log_vars[i]
+        else:
+            # Fixed weighting
+            total_loss = 0
+            task_names = ['action_severity', 'has_palsy', 'palsy_side', 'hb_grade', 'sunnybrook']
+
+            for i, task_name in enumerate(task_names):
+                if task_name in losses:
+                    total_loss += self.weights[i] * losses[task_name]
+
+        # Add individual losses to dict for monitoring
+        loss_dict = {k: v.item() for k, v in losses.items()}
+        loss_dict['total'] = total_loss.item()
+
+        return total_loss, loss_dict
+
+
+# ============================================================================
+# Example Usage
+# ============================================================================
+
+if __name__ == "__main__":
+    # 创建模型
+    model = HGFANet()
+
+    # 模拟输入
+    batch_size = 4
+    batch = {
+        'actions': {},
+        'action_mask': torch.ones(batch_size, 11)
+    }
+
+    action_names = ['NeutralFace', 'Smile', 'RaiseEyebrow', 'CloseEyeHardly',
+                    'CloseEyeSoftly', 'BlowCheek', 'LipPucker', 'ShowTeeth',
+                    'ShrugNose', 'SpontaneousEyeBlink', 'VoluntaryEyeBlink']
+
+    for action_name in action_names:
+        batch['actions'][action_name] = {
+            'static': torch.randn(batch_size, 11),
+            'dynamic': torch.randn(batch_size, 8),
+            'visual': torch.randn(batch_size, 1280),
+            'wrinkle': torch.randn(batch_size, 10),
+            'motion': torch.randn(batch_size, 12)
+        }
+
+    # 前向传播
+    outputs = model(batch)
+
+    print("✓ 模型创建成功!")
+    print(f"Action severity shape: {outputs['action_severity'].shape}")
+    print(f"Has palsy shape: {outputs['session_outputs']['has_palsy'].shape}")
+    print(f"HB grade shape: {outputs['session_outputs']['hb_grade'].shape}")
+
+    # 统计参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"\n总参数量: {total_params:,}")

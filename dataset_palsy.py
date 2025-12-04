@@ -164,16 +164,20 @@ class HierarchicalPalsyDataset(Dataset):
             motion_dim = motion_dim or self.MOTION_DIM
 
             static = self._decode_feature(static_blob, static_dim)
-            dynamic = self._decode_feature(dynamic_blob, dynamic_dim) if dynamic_dim > 0 else np.zeros(self.MAX_DYNAMIC_DIM, dtype=np.float32)
-            visual = self._decode_feature(visual_blob, visual_dim) if visual_blob else np.zeros(self.VISUAL_DIM, dtype=np.float32)
-            wrinkle = self._decode_feature(wrinkle_blob, wrinkle_dim) if wrinkle_blob else np.zeros(self.WRINKLE_DIM, dtype=np.float32)
-            motion = self._decode_feature(motion_blob, motion_dim) if motion_blob else np.zeros(self.MOTION_DIM, dtype=np.float32)
+            dynamic = self._decode_feature(dynamic_blob, dynamic_dim) if dynamic_dim > 0 else np.zeros(
+                self.MAX_DYNAMIC_DIM, dtype=np.float32)
+            visual = self._decode_feature(visual_blob, visual_dim) if visual_blob else np.zeros(self.VISUAL_DIM,
+                                                                                                dtype=np.float32)
+            wrinkle = self._decode_feature(wrinkle_blob, wrinkle_dim) if wrinkle_blob else np.zeros(self.WRINKLE_DIM,
+                                                                                                    dtype=np.float32)
+            motion = self._decode_feature(motion_blob, motion_dim) if motion_blob else np.zeros(self.MOTION_DIM,
+                                                                                                dtype=np.float32)
 
             actions[action_name] = {
                 'static': self._pad_feature(static, self.MAX_STATIC_DIM),
                 'dynamic': self._pad_feature(dynamic, self.MAX_DYNAMIC_DIM),
                 'visual': visual,
-                'wrinkle_scalar': wrinkle,
+                'wrinkle': wrinkle,
                 'motion': motion,
                 'severity': (severity - 1) if severity is not None else 0  # 转为0-4索引
             }
@@ -223,7 +227,7 @@ class HierarchicalPalsyDataset(Dataset):
                     'static': torch.FloatTensor(action['static']),
                     'dynamic': torch.FloatTensor(action['dynamic']),
                     'visual': torch.FloatTensor(action['visual']),
-                    'wrinkle_scalar': torch.FloatTensor(action['wrinkle_scalar']),
+                    'wrinkle': torch.FloatTensor(action['wrinkle']),  # 改为wrinkle匹配模型
                     'motion': torch.FloatTensor(action['motion']),
                 }
 
@@ -263,7 +267,7 @@ def collate_hierarchical(batch: List[Dict]) -> Dict:
             'static': [],
             'dynamic': [],
             'visual': [],
-            'wrinkle_scalar': [],
+            'wrinkle': [],  # 改为wrinkle匹配模型
             'motion': [],
         }
         indices = []  # 这个动作对应的examination索引
@@ -280,27 +284,27 @@ def collate_hierarchical(batch: List[Dict]) -> Dict:
                 'static': torch.stack(action_batch['static']),
                 'dynamic': torch.stack(action_batch['dynamic']),
                 'visual': torch.stack(action_batch['visual']),
-                'wrinkle_scalar': torch.stack(action_batch['wrinkle_scalar']),
+                'wrinkle': torch.stack(action_batch['wrinkle']),  # 改为wrinkle匹配模型
                 'motion': torch.stack(action_batch['motion']),
             }
             action_indices[action_name] = indices
 
-    # 收集动作级标签
-    action_severities = {}
-    for action_name in HierarchicalPalsyDataset.ACTION_NAMES:
-        severities = []
-        for sample in batch:
+    # 收集动作级标签 - 转换为固定shape的tensor (B, 11)
+    # 初始化为-1 (表示缺失的动作,CE loss会ignore)
+    severity_matrix = torch.full((batch_size, 11), -1, dtype=torch.long)
+
+    for action_idx, action_name in enumerate(HierarchicalPalsyDataset.ACTION_NAMES):
+        for sample_idx, sample in enumerate(batch):
             if action_name in sample['targets']['action_severity']:
-                severities.append(sample['targets']['action_severity'][action_name])
-        if severities:
-            action_severities[action_name] = torch.LongTensor(severities)
+                severity = sample['targets']['action_severity'][action_name]
+                severity_matrix[sample_idx, action_idx] = severity
 
     return {
         'actions': all_actions,
         'action_indices': action_indices,
         'action_mask': torch.stack([s['action_mask'] for s in batch]),
         'targets': {
-            'action_severity': action_severities,
+            'action_severity': severity_matrix,  # (B, 11) tensor
             'has_palsy': torch.LongTensor([s['targets']['has_palsy'] for s in batch]),
             'palsy_side': torch.LongTensor([s['targets']['palsy_side'] for s in batch]),
             'hb_grade': torch.LongTensor([s['targets']['hb_grade'] for s in batch]),
