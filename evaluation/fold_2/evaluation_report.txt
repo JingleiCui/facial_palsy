@@ -7,107 +7,63 @@ H-GFA Net 层级多任务评估报告
 ============================================================
 
 --- 是否面瘫 (Has Palsy) ---
-Accuracy: 0.8750
-Precision: 0.9125
-Recall: 0.8750
-F1-Score: 0.8800
+Accuracy: 0.7083
+Precision: 0.5017
+Recall: 0.7083
+F1-Score: 0.5874
 
               precision    recall  f1-score   support
 
-    No Palsy       0.70      1.00      0.82         7
-       Palsy       1.00      0.82      0.90        17
+    No Palsy       0.00      0.00      0.00         7
+       Palsy       0.71      1.00      0.83        17
 
-    accuracy                           0.88        24
-   macro avg       0.85      0.91      0.86        24
-weighted avg       0.91      0.88      0.88        24
+    accuracy                           0.71        24
+   macro avg       0.35      0.50      0.41        24
+weighted avg       0.50      0.71      0.59        24
 
 
 --- 面瘫侧别 (Palsy Side) ---
-Accuracy: 0.5417
-Precision: 0.5208
-Recall: 0.5417
-F1-Score: 0.5092
+Accuracy: 0.2917
+Precision: 0.0851
+Recall: 0.2917
+F1-Score: 0.1317
 
               precision    recall  f1-score   support
 
-        None       0.70      1.00      0.82         7
-        Left       0.50      0.25      0.33         8
-       Right       0.40      0.44      0.42         9
+        None       0.29      1.00      0.45         7
+        Left       0.00      0.00      0.00         8
+       Right       0.00      0.00      0.00         9
 
-    accuracy                           0.54        24
-   macro avg       0.53      0.56      0.53        24
-weighted avg       0.52      0.54      0.51        24
+    accuracy                           0.29        24
+   macro avg       0.10      0.33      0.15        24
+weighted avg       0.09      0.29      0.13        24
 
 
 --- HB分级 (HB Grade) ---
-Accuracy: 0.5000
-Precision: 0.4583
-Recall: 0.5000
-F1-Score: 0.4643
+Accuracy: 0.3750
+Precision: 0.1406
+Recall: 0.3750
+F1-Score: 0.2045
 
               precision    recall  f1-score   support
 
-     Grade 1       0.70      1.00      0.82         7
+     Grade 1       0.00      0.00      0.00         7
      Grade 2       0.00      0.00      0.00         0
-     Grade 3       0.40      0.50      0.44         4
+     Grade 3       0.00      0.00      0.00         4
      Grade 4       0.00      0.00      0.00         4
-     Grade 5       0.50      0.33      0.40         9
+     Grade 5       0.38      1.00      0.55         9
      Grade 6       0.00      0.00      0.00         0
 
-    accuracy                           0.50        24
-   macro avg       0.27      0.31      0.28        24
-weighted avg       0.46      0.50      0.46        24
+    accuracy                           0.38        24
+   macro avg       0.06      0.17      0.09        24
+weighted avg       0.14      0.38      0.20        24
 
 
 --- Sunnybrook分数 (回归) ---
-MAE: 17.47
-RMSE: 21.21
-R²: 0.5359
+MAE: 417.13
+RMSE: 418.29
+R²: -179.5472
 
 ============================================================
 动作级任务 (Action-Level)
 ============================================================
-
---- NeutralFace ---
-Accuracy: 0.4167
-Samples: 24
-
---- Smile ---
-Accuracy: 0.2500
-Samples: 24
-
---- RaiseEyebrow ---
-Accuracy: 0.5000
-Samples: 24
-
---- CloseEyeHardly ---
-Accuracy: 0.5417
-Samples: 24
-
---- CloseEyeSoftly ---
-Accuracy: 0.4583
-Samples: 24
-
---- BlowCheek ---
-Accuracy: 0.2083
-Samples: 24
-
---- LipPucker ---
-Accuracy: 0.3043
-Samples: 23
-
---- ShowTeeth ---
-Accuracy: 0.4167
-Samples: 24
-
---- ShrugNose ---
-Accuracy: 0.3750
-Samples: 24
-
---- SpontaneousEyeBlink ---
-Accuracy: 0.4583
-Samples: 24
-
---- VoluntaryEyeBlink ---
-Accuracy: 0.5000
-Samples: 24

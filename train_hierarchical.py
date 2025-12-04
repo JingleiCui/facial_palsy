@@ -36,8 +36,11 @@ from hgfa_net import HGFANet, HierarchicalMultiTaskLoss
 from dataset_palsy import HierarchicalPalsyDataset, collate_hierarchical
 
 # ==================== 配置参数 ====================
-# 训练哪一个fold (0, 1, 或 2)
-FOLD = 2  # <--- 修改这里来训练不同的fold
+# 训练哪一个fold:
+#   >=0 : 只训练对应的 fold
+#   <0  : 自动循环训练所有 fold (0,1,2)
+FOLD = -1
+N_FOLDS = 3
 
 # 数据库路径
 DB_PATH = "facialPalsy.db"
@@ -367,22 +370,8 @@ def plot_training_curves(history, output_dir):
     print(f"✓ 训练曲线已保存: {output_dir / 'training_curves.png'}")
 
 
-def main(args=None):
-    """主函数"""
-    # 解析参数
-    if args is None:
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--db_path', type=str, default=DB_PATH)
-        parser.add_argument('--fold', type=int, default=FOLD)
-        parser.add_argument('--split_version', type=str, default=SPLIT_VERSION)
-        parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
-        parser.add_argument('--lr', type=float, default=LEARNING_RATE)
-        parser.add_argument('--weight_decay', type=float, default=WEIGHT_DECAY)
-        parser.add_argument('--epochs', type=int, default=NUM_EPOCHS)
-        parser.add_argument('--checkpoint_dir', type=str, default=str(CHECKPOINT_DIR))
-        args = parser.parse_args()
-
-    # 设备
+def run_single_fold(args):
+    """真正执行一个 fold 的训练逻辑"""
     device = get_device()
     print(f"{'=' * 60}")
     print(f"H-GFA Net 层级多任务训练")
@@ -474,7 +463,7 @@ def main(args=None):
     patience = 0
     max_patience = EARLY_STOPPING_PATIENCE
 
-    print(f"\n开始训练...")
+    print(f"\n开始训练 Fold {args.fold} ...")
     print(f"{'=' * 60}")
 
     for epoch in range(args.epochs):
@@ -522,7 +511,7 @@ def main(args=None):
 
             print(f"Val Loss: {val_metrics['loss']:.4f}")
             print(
-                f"  action_severity: acc={val_metrics['action_severity_acc']:.4f}, F1={val_metrics['action_severity_f1']:.4f}")  # 新增
+                f"  action_severity: acc={val_metrics['action_severity_acc']:.4f}, F1={val_metrics['action_severity_f1']:.4f}")
             print(f"  has_palsy:       acc={val_metrics['has_palsy_acc']:.4f}, F1={val_metrics['has_palsy_f1']:.4f}")
             print(f"  palsy_side:      acc={val_metrics['palsy_side_acc']:.4f}, F1={val_metrics['palsy_side_f1']:.4f}")
             print(f"  hb_grade:        acc={val_metrics['hb_grade_acc']:.4f}, F1={val_metrics['hb_grade_f1']:.4f}")
@@ -553,7 +542,7 @@ def main(args=None):
             else:
                 patience += 1
                 if patience >= max_patience:
-                    print(f"\nEarly stopping at epoch {epoch + 1}")
+                    print(f"\nEarly stopping at epoch {epoch + 1} (fold {args.fold})")
                     break
         else:
             # 没有验证集，每10个epoch保存一次
@@ -603,11 +592,37 @@ def main(args=None):
         json.dump(config, f, indent=2, ensure_ascii=False)
 
     print(f"\n{'=' * 60}")
-    print(f"训练完成!")
+    print(f"Fold {args.fold} 训练完成!")
     if val_loader is not None:
         print(f"Best Combined Metric: {best_metric:.4f}")
     print(f"模型保存到: {checkpoint_dir}")
     print(f"{'=' * 60}")
+
+
+def main():
+    """支持单 fold / 多 fold 训练的入口"""
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--db_path', type=str, default=DB_PATH)
+    parser.add_argument('--fold', type=int, default=FOLD)
+    parser.add_argument('--split_version', type=str, default=SPLIT_VERSION)
+    parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
+    parser.add_argument('--lr', type=float, default=LEARNING_RATE)
+    parser.add_argument('--weight_decay', type=float, default=WEIGHT_DECAY)
+    parser.add_argument('--epochs', type=int, default=NUM_EPOCHS)
+    parser.add_argument('--checkpoint_dir', type=str, default=str(CHECKPOINT_DIR))
+    args = parser.parse_args()
+
+    if args.fold < 0:
+        # 自动跑完所有 fold
+        for fold in range(N_FOLDS):
+            print(f"\n================== 开始训练 Fold {fold} ==================\n")
+            args_single = argparse.Namespace(**vars(args))
+            args_single.fold = fold
+            run_single_fold(args_single)
+    else:
+        # 只训练指定 fold
+        run_single_fold(args)
 
 
 if __name__ == '__main__':

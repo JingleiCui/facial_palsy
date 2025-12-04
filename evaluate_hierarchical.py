@@ -40,10 +40,13 @@ import json
 # 导入自定义模块
 from hgfa_net import HGFANet
 from dataset_palsy import HierarchicalPalsyDataset, collate_hierarchical
-from multi_task_loss import HierarchicalMultiTaskLoss
 
 # ==================== 配置参数 ====================
-FOLD = 0  # <--- 修改这里来评估不同的fold
+#   >=0 : 只评估对应 fold
+#   <0  : 自动评估所有 fold (0,1,2)
+FOLD = -1
+N_FOLDS = 3
+
 CHECKPOINT_TYPE = "best"  # "best" 或 "final"
 
 DB_PATH = "facialPalsy.db"
@@ -110,13 +113,31 @@ def evaluate_model(model, dataloader, device):
                 all_preds['sunnybrook_pred'].extend(session['sunnybrook'].cpu().numpy() * 100)
                 all_preds['sunnybrook_true'].extend(batch['targets']['sunnybrook'].cpu().numpy())
 
-                # 动作级预测
-                for action_name, severity_logits in outputs['action_severity'].items():
-                    if action_name in batch['targets']['action_severity']:
-                        preds = severity_logits.argmax(dim=1).cpu().numpy()
-                        labels = batch['targets']['action_severity'][action_name].cpu().numpy()
-                        action_preds[action_name].extend(preds)
-                        action_labels[action_name].extend(labels)
+                # 动作级预测 (适配新的输出格式: action_severity 为 (B, num_actions, num_classes) 张量)
+                action_severity_logits = outputs['action_severity']  # (B, 11, 5)
+
+                for action_idx, action_name in enumerate(HierarchicalPalsyDataset.ACTION_NAMES):
+                    # 只有当该动作在本 batch 存在标签时才评估
+                    if action_name not in batch['targets']['action_severity']:
+                        continue
+
+                    exam_indices = batch['action_indices'].get(action_name, [])
+                    if not exam_indices:
+                        continue
+
+                    # 这些 exam_indices 对应的是 batch 内的检查下标
+                    exam_indices_tensor = torch.tensor(
+                        exam_indices, dtype=torch.long, device=device
+                    )
+
+                    # 取出对应检查、对应动作的 logits: 形状 (n_i, 5)
+                    logits = action_severity_logits[exam_indices_tensor, action_idx, :]
+
+                    preds = logits.argmax(dim=1).cpu().numpy()
+                    labels = batch['targets']['action_severity'][action_name].cpu().numpy()
+
+                    action_preds[action_name].extend(preds)
+                    action_labels[action_name].extend(labels)
 
                 # 注意力权重
                 if 'attention_weights' in session:
@@ -280,19 +301,8 @@ def generate_report(all_preds, all_labels, action_preds, action_labels, output_d
         'sunnybrook_r2': float(r2),
     }
 
-def main(args=None):
-    """主函数"""
-    if args is None:
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--db_path', type=str, default=DB_PATH)
-        parser.add_argument('--fold', type=int, default=FOLD)
-        parser.add_argument('--checkpoint_type', type=str, default=CHECKPOINT_TYPE)
-        parser.add_argument('--checkpoint_dir', type=str, default=str(CHECKPOINT_DIR))
-        parser.add_argument('--output_dir', type=str, default=str(OUTPUT_DIR))
-        parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
-        parser.add_argument('--split_version', type=str, default=SPLIT_VERSION)
-        args = parser.parse_args()
-
+def run_single_fold(args):
+    """评估单个 fold 的主流程"""
     device = get_device()
 
     print("=" * 60)
@@ -342,7 +352,7 @@ def main(args=None):
     )
 
     # 评估
-    print(f"\n开始评估...")
+    print(f"\n开始评估 Fold {args.fold} ...")
     all_preds, all_labels, action_preds, action_labels, attn_weights = evaluate_model(
         model, val_loader, device
     )
@@ -392,9 +402,34 @@ def main(args=None):
         json.dump(metrics, f, indent=2)
 
     print(f"\n{'='*60}")
-    print(f"评估完成！")
+    print(f"Fold {args.fold} 评估完成！")
     print(f"结果保存到: {output_dir}")
     print(f"{'='*60}")
+
+
+def main(args=None):
+    """支持单 fold / 多 fold 评估的入口"""
+    if args is None:
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--db_path', type=str, default=DB_PATH)
+        parser.add_argument('--fold', type=int, default=FOLD)
+        parser.add_argument('--checkpoint_type', type=str, default=CHECKPOINT_TYPE)
+        parser.add_argument('--checkpoint_dir', type=str, default=str(CHECKPOINT_DIR))
+        parser.add_argument('--output_dir', type=str, default=str(OUTPUT_DIR))
+        parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
+        parser.add_argument('--split_version', type=str, default=SPLIT_VERSION)
+        args = parser.parse_args()
+
+    if args.fold < 0:
+        # 自动评估所有 fold
+        for fold in range(N_FOLDS):
+            print(f"\n================== 开始评估 Fold {fold} ==================\n")
+            args_single = argparse.Namespace(**vars(args))
+            args_single.fold = fold
+            run_single_fold(args_single)
+    else:
+        # 只评估指定 fold
+        run_single_fold(args)
 
 
 if __name__ == '__main__':

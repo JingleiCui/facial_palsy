@@ -23,91 +23,47 @@ weighted avg       0.54      0.74      0.63        19
 
 
 --- 面瘫侧别 (Palsy Side) ---
-Accuracy: 0.5789
-Precision: 0.5556
-Recall: 0.5789
-F1-Score: 0.4637
+Accuracy: 0.5263
+Precision: 0.2770
+Recall: 0.5263
+F1-Score: 0.3630
 
               precision    recall  f1-score   support
 
-        None       1.00      0.20      0.33         5
+        None       0.00      0.00      0.00         5
         Left       0.00      0.00      0.00         4
-       Right       0.56      1.00      0.71        10
+       Right       0.53      1.00      0.69        10
 
-    accuracy                           0.58        19
-   macro avg       0.52      0.40      0.35        19
-weighted avg       0.56      0.58      0.46        19
+    accuracy                           0.53        19
+   macro avg       0.18      0.33      0.23        19
+weighted avg       0.28      0.53      0.36        19
 
 
 --- HB分级 (HB Grade) ---
-Accuracy: 0.3684
-Precision: 0.2577
-Recall: 0.3684
-F1-Score: 0.2569
+Accuracy: 0.2632
+Precision: 0.0693
+Recall: 0.2632
+F1-Score: 0.1096
 
               precision    recall  f1-score   support
 
-     Grade 1       0.67      0.40      0.50         5
+     Grade 1       0.00      0.00      0.00         5
      Grade 2       0.00      0.00      0.00         2
      Grade 3       0.00      0.00      0.00         5
      Grade 4       0.00      0.00      0.00         2
-     Grade 5       0.31      1.00      0.48         5
+     Grade 5       0.26      1.00      0.42         5
      Grade 6       0.00      0.00      0.00         0
 
-    accuracy                           0.37        19
-   macro avg       0.16      0.23      0.16        19
-weighted avg       0.26      0.37      0.26        19
+    accuracy                           0.26        19
+   macro avg       0.04      0.17      0.07        19
+weighted avg       0.07      0.26      0.11        19
 
 
 --- Sunnybrook分数 (回归) ---
-MAE: 20.65
-RMSE: 24.31
-R²: 0.1594
+MAE: 1373.73
+RMSE: 1373.99
+R²: -2683.4644
 
 ============================================================
 动作级任务 (Action-Level)
 ============================================================
-
---- NeutralFace ---
-Accuracy: 0.3158
-Samples: 19
-
---- Smile ---
-Accuracy: 0.3158
-Samples: 19
-
---- RaiseEyebrow ---
-Accuracy: 0.4211
-Samples: 19
-
---- CloseEyeHardly ---
-Accuracy: 0.5263
-Samples: 19
-
---- CloseEyeSoftly ---
-Accuracy: 0.4737
-Samples: 19
-
---- BlowCheek ---
-Accuracy: 0.2632
-Samples: 19
-
---- LipPucker ---
-Accuracy: 0.3158
-Samples: 19
-
---- ShowTeeth ---
-Accuracy: 0.2632
-Samples: 19
-
---- ShrugNose ---
-Accuracy: 0.2632
-Samples: 19
-
---- SpontaneousEyeBlink ---
-Accuracy: 0.3684
-Samples: 19
-
---- VoluntaryEyeBlink ---
-Accuracy: 0.5263
-Samples: 19

@@ -393,6 +393,9 @@ class HGFANet(nn.Module):
     3. 再把 11 个动作的 embedding 聚合成检查级表征
     4. 用检查级表征做 has_palsy / palsy_side / HB / Sunnybrook 多任务预测
     """
+    ACTION_NAMES = ['NeutralFace', 'Smile', 'RaiseEyebrow', 'CloseEyeHardly',
+                    'CloseEyeSoftly', 'BlowCheek', 'LipPucker', 'ShowTeeth',
+                    'ShrugNose', 'SpontaneousEyeBlink', 'VoluntaryEyeBlink']
 
     def __init__(self, config=None):
         super().__init__()
@@ -631,6 +634,9 @@ class HierarchicalMultiTaskLoss(nn.Module):
 # ============================================================================
 # Example Usage
 # ============================================================================
+ACTION_NAMES = ['NeutralFace', 'Smile', 'RaiseEyebrow', 'CloseEyeHardly',
+                    'CloseEyeSoftly', 'BlowCheek', 'LipPucker', 'ShowTeeth',
+                    'ShrugNose', 'SpontaneousEyeBlink', 'VoluntaryEyeBlink']
 
 if __name__ == "__main__":
     # 创建模型
@@ -643,11 +649,7 @@ if __name__ == "__main__":
         'action_mask': torch.ones(batch_size, 11)
     }
 
-    action_names = ['NeutralFace', 'Smile', 'RaiseEyebrow', 'CloseEyeHardly',
-                    'CloseEyeSoftly', 'BlowCheek', 'LipPucker', 'ShowTeeth',
-                    'ShrugNose', 'SpontaneousEyeBlink', 'VoluntaryEyeBlink']
-
-    for action_name in action_names:
+    for action_name in ACTION_NAMES:
         batch['actions'][action_name] = {
             'static': torch.randn(batch_size, 11),
             'dynamic': torch.randn(batch_size, 8),
