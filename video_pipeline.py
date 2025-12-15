@@ -93,7 +93,7 @@ class VideoPipeline:
         self.model_path = model_path
 
         # 降低并行度避免MediaPipe GPU冲突
-        self.num_workers = 4
+        self.num_workers = 8
 
         self._tls = threading.local()
 
