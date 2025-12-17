@@ -701,12 +701,17 @@ class VideoPipeline:
             "elapsed_ms": (time.perf_counter() - t0) * 1000.0
         }
 
-    def process_all_examinations(self, batch_size: int = 10) -> List[Dict]:
+    def process_all_examinations(self, batch_size: int = 10, force_recompute: bool = False) -> List[Dict]:
         """
-        批量处理所有未处理的 examinations
+        批量处理 examinations
+
+        模式说明:
+        - force_recompute=False: 仅处理“未处理”或 motion_features 为空的检查（默认）
+        - force_recompute=True : 强制重算所有检查（忽略 video_features 是否已有数据）
 
         Args:
             batch_size: 每批处理数量
+            force_recompute: 是否强制重算全部
 
         Returns:
             处理结果列表
@@ -714,21 +719,32 @@ class VideoPipeline:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # 查找未处理或 motion_features 为空的 examination
-        cursor.execute("""
-            SELECT DISTINCT e.examination_id
-            FROM examinations e
-            INNER JOIN video_files vf ON e.examination_id = vf.examination_id
-            LEFT JOIN video_features feat ON vf.video_id = feat.video_id
-            WHERE vf.file_exists = 1 
-              AND (feat.feature_id IS NULL OR feat.motion_features IS NULL)
-            ORDER BY e.examination_id
-        """)
+        if force_recompute:
+            # 强制重算：只要 video_files 中标记 file_exists=1，就纳入处理
+            cursor.execute("""
+                SELECT DISTINCT e.examination_id
+                FROM examinations e
+                INNER JOIN video_files vf ON e.examination_id = vf.examination_id
+                WHERE vf.file_exists = 1
+                ORDER BY e.examination_id
+            """)
+        else:
+            # 默认：仅处理“未处理”或 motion_features 为空的检查
+            cursor.execute("""
+                SELECT DISTINCT e.examination_id
+                FROM examinations e
+                INNER JOIN video_files vf ON e.examination_id = vf.examination_id
+                LEFT JOIN video_features feat ON vf.video_id = feat.video_id
+                WHERE vf.file_exists = 1 
+                  AND (feat.feature_id IS NULL OR feat.motion_features IS NULL)
+                ORDER BY e.examination_id
+            """)
 
         examination_ids = [row[0] for row in cursor.fetchall()]
         conn.close()
 
-        print(f"\n找到 {len(examination_ids)} 个需要处理的检查")
+        mode = "强制重算全部" if force_recompute else "仅处理缺失/未处理"
+        print(f"\n[{mode}] 找到 {len(examination_ids)} 个需要处理的检查")
         print(f"将分 {(len(examination_ids) + batch_size - 1) // batch_size} 批处理")
 
         results = []
@@ -1122,14 +1138,15 @@ def main():
 
     # 基本路径配置 - 根据实际环境修改
     db_path = 'facialPalsy.db'
-    model_path = '/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task'  # 修改为实际路径
-    keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes_new'           # 修改为实际路径
+    model_path = '/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task'
+    keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes_new'
     os.makedirs(keyframe_dir, exist_ok=True)
 
     # 运行模式
     examination_id = None       # 指定单个检查ID
     video_id = None             # 指定单个视频ID
-    run_batch = True            # 批量处理所有
+    run_batch = True            # 批量处理
+    force_recompute = True     # True=重算全部(算法更新后用)，False=只补缺失/续跑
     update_motion_only = False  # 仅更新运动特征
 
     # 初始化 Pipeline
@@ -1143,7 +1160,7 @@ def main():
     elif video_id is not None:
         pipeline.process_video(video_id)
     elif run_batch:
-        pipeline.process_all_examinations(batch_size=10)
+        pipeline.process_all_examinations(batch_size=10, force_recompute=force_recompute)
     else:
         print("当前没有配置任何处理任务")
 

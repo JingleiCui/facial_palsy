@@ -1,6 +1,7 @@
 """
 动作模块 - 自动注册所有动作类
 """
+from .base_action import NeutralBaseline
 from .neutral_face import NeutralFaceAction
 from .spontaneous_eye_blink import SpontaneousEyeBlinkAction
 from .voluntary_eye_blink import VoluntaryEyeBlinkAction
@@ -14,7 +15,7 @@ from .blow_cheek import BlowCheekAction
 from .lip_pucker import LipPuckerAction
 
 # 动作注册表：动作名 -> 动作类
-ACTION_REGISTRY = {
+ACTION_CLASSES = {
     'NeutralFace': NeutralFaceAction,
     'SpontaneousEyeBlink': SpontaneousEyeBlinkAction,
     'VoluntaryEyeBlink': VoluntaryEyeBlinkAction,
@@ -39,12 +40,13 @@ def get_action_class(action_name):
     Returns:
         动作类
     """
-    return ACTION_REGISTRY.get(action_name)
+    return ACTION_CLASSES.get(action_name)
 
 
 __all__ = [
-    'ACTION_REGISTRY',
+    'ACTION_CLASSES',
     'get_action_class',
+    'NeutralBaseline',
     'NeutralFaceAction',
     'SpontaneousEyeBlinkAction',
     'VoluntaryEyeBlinkAction',
