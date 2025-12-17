@@ -1,102 +1,243 @@
 """
-轻闭眼动作 (CloseEyeSoftly)
-与静息帧对比，计算部分闭合程度
+CloseEyeSoftly - 轻轻闭眼 (Sunnybrook随意运动)
+
+关键帧: 最小EAR帧 (眼睛闭得最紧的帧)
+
+核心指标:
+- 睁眼度 (openness): 相对静息帧的眼睛开合程度
+- 闭拢度 (closure): 1 - 睁眼度
+- 完全闭眼 (complete_closure): 睁眼度 <= 6.25%
 """
+
 import numpy as np
-from .base_action import BaseAction
-from ..core.geometry_utils import *
+from typing import Dict, List, Optional, Any
+import cv2
+
+from .base_action import BaseAction, ActionResult, NeutralBaseline
+from ..core.geometry_utils import (
+    LM, compute_icd, compute_ear,
+    measure_eyes, find_min_ear_frame, compute_openness_curve,
+    pts2d, pt2d
+)
 
 
 class CloseEyeSoftlyAction(BaseAction):
-    """轻闭眼动作"""
+    """轻轻闭眼动作 (Sunnybrook随意运动B2)"""
 
-    def detect_peak_frame(self, landmarks_seq, w, h):
-        """
-        检测峰值帧: 前30%最小值的中位数帧
-        """
-        valid_indices = [i for i, lm in enumerate(landmarks_seq) if lm is not None]
-        if not valid_indices:
-            return 0
+    ACTION_NAME = "CloseEyeSoftly"
+    ACTION_NAME_CN = "轻闭眼"
 
-        eye_openings = []
-        for idx in valid_indices:
-            lm = landmarks_seq[idx]
-            unit_length = get_unit_length(lm, w, h)
-            left_eye = get_eye_opening(lm, w, h, left=True) / unit_length
-            right_eye = get_eye_opening(lm, w, h, left=False) / unit_length
-            avg_opening = (left_eye + right_eye) / 2
-            eye_openings.append((idx, avg_opening))
+    def find_peak_frame(
+            self,
+            landmarks_seq: List,
+            w: int, h: int,
+            **kwargs
+    ) -> int:
+        """找最小EAR帧"""
+        peak_idx, _, _ = find_min_ear_frame(landmarks_seq, w, h)
+        return peak_idx
 
-        eye_openings.sort(key=lambda x: x[1])
+    def extract_indicators(
+            self,
+            landmarks,
+            w: int, h: int,
+            neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
+        """提取闭眼指标"""
+        icd = compute_icd(landmarks, w, h)
 
-        top_30_percent = int(len(eye_openings) * 0.3)
-        if top_30_percent < 1:
-            top_30_percent = 1
+        # 获取基准值
+        baseline_l_area = neutral_baseline.left_eye_area if neutral_baseline else None
+        baseline_r_area = neutral_baseline.right_eye_area if neutral_baseline else None
+        baseline_l_palp = neutral_baseline.left_palpebral_length if neutral_baseline else None
+        baseline_r_palp = neutral_baseline.right_palpebral_length if neutral_baseline else None
 
-        median_idx = top_30_percent // 2
-        return eye_openings[median_idx][0]
+        # 眼部测量 (使用基准)
+        eyes = measure_eyes(
+            landmarks, w, h,
+            baseline_l_area, baseline_r_area,
+            baseline_l_palp, baseline_r_palp
+        )
 
-    def extract_indicators(self, landmarks, w, h, neutral_indicators=None):
-        """
-        提取轻闭眼指标，并与静息帧对比
-        """
-        indicators = {}
+        # 闭眼程度对称性
+        closure_diff = abs(eyes.left.closure - eyes.right.closure)
 
-        # === 一级指标：当前状态 ===
+        # 功能百分比 (用于Severity计算)
+        # 对于闭眼: 闭拢度越高=功能越好
+        # 患侧闭眼不完全，所以患侧closure较低
+        if eyes.right.closure > 1e-6:
+            closure_ratio = eyes.left.closure / eyes.right.closure
+        else:
+            closure_ratio = float('inf') if eyes.left.closure > 1e-6 else 1.0
 
-        indicators['left_eye_opening'] = get_eye_opening(landmarks, w, h, left=True)
-        indicators['right_eye_opening'] = get_eye_opening(landmarks, w, h, left=False)
-        indicators['left_eye_area'] = get_eye_area(landmarks, w, h, left=True)
-        indicators['right_eye_area'] = get_eye_area(landmarks, w, h, left=False)
-        indicators['left_eye_length'] = get_eye_length(landmarks, w, h, left=True)
-        indicators['right_eye_length'] = get_eye_length(landmarks, w, h, left=False)
+        # 功能百分比 (弱侧/强侧)
+        min_closure = min(eyes.left.closure, eyes.right.closure)
+        max_closure = max(eyes.left.closure, eyes.right.closure)
+        if max_closure > 1e-6:
+            function_pct = min_closure / max_closure
+        else:
+            function_pct = 1.0
 
-        # === 二级指标：与静息帧对比 ===
+        return {
+            # 眼部
+            'left_eye_openness': eyes.left.openness,
+            'right_eye_openness': eyes.right.openness,
+            'left_eye_closure': eyes.left.closure,
+            'right_eye_closure': eyes.right.closure,
+            'left_complete_closure': float(eyes.left.complete_closure),
+            'right_complete_closure': float(eyes.right.complete_closure),
 
-        if neutral_indicators:
-            # 眼睛闭合度
-            indicators['left_eye_closure'] = (neutral_indicators['left_eye_opening'] -
-                                             indicators['left_eye_opening'])
-            indicators['right_eye_closure'] = (neutral_indicators['right_eye_opening'] -
-                                              indicators['right_eye_opening'])
+            # EAR
+            'left_ear': eyes.left.ear,
+            'right_ear': eyes.right.ear,
 
-            # 闭合完成度百分比
-            indicators['left_eye_closure_pct'] = (indicators['left_eye_closure'] /
-                                                  (neutral_indicators['left_eye_opening'] + 1e-6))
-            indicators['right_eye_closure_pct'] = (indicators['right_eye_closure'] /
-                                                   (neutral_indicators['right_eye_opening'] + 1e-6))
+            # 对称性
+            'openness_ratio': eyes.openness_ratio,
+            'closure_ratio': closure_ratio,
+            'closure_diff': closure_diff,
 
-            # 面积减少百分比
-            indicators['left_eye_area_reduction_pct'] = ((neutral_indicators['left_eye_area'] -
-                                                          indicators['left_eye_area']) /
-                                                         (neutral_indicators['left_eye_area'] + 1e-6))
-            indicators['right_eye_area_reduction_pct'] = ((neutral_indicators['right_eye_area'] -
-                                                           indicators['right_eye_area']) /
-                                                          (neutral_indicators['right_eye_area'] + 1e-6))
+            # 功能评估
+            'function_pct': function_pct,
 
-            # 闭合对称性
-            if indicators['right_eye_closure'] != 0:
-                indicators['eye_closure_ratio'] = (indicators['left_eye_closure'] /
-                                                   indicators['right_eye_closure'])
-            else:
-                indicators['eye_closure_ratio'] = 1.0
+            # ICD
+            'icd': icd,
+        }
 
-        # === 二级指标：当前状态对称性 ===
+    def extract_dynamic_features(
+            self,
+            landmarks_seq: List,
+            w: int, h: int,
+            fps: float = 30.0,
+            neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
+        """提取动态特征 - 闭眼过程的时序信息"""
+        n = len(landmarks_seq)
+        if n < 2:
+            return {}
 
-        indicators['eye_opening_ratio'] = (indicators['left_eye_opening'] /
-                                          (indicators['right_eye_opening'] + 1e-6))
-        indicators['eye_area_ratio'] = (indicators['left_eye_area'] /
-                                       (indicators['right_eye_area'] + 1e-6))
+        # 计算睁眼度序列
+        baseline_l_area = neutral_baseline.left_eye_area if neutral_baseline else None
+        baseline_r_area = neutral_baseline.right_eye_area if neutral_baseline else None
+        baseline_l_palp = neutral_baseline.left_palpebral_length if neutral_baseline else None
+        baseline_r_palp = neutral_baseline.right_palpebral_length if neutral_baseline else None
 
-        # 眼睑收缩度
-        indicators['left_eye_contraction'] = (indicators['left_eye_opening'] /
-                                             (indicators['left_eye_length'] + 1e-6))
-        indicators['right_eye_contraction'] = (indicators['right_eye_opening'] /
-                                              (indicators['right_eye_length'] + 1e-6))
+        l_open, r_open = compute_openness_curve(
+            landmarks_seq, w, h,
+            baseline_l_area or 1.0, baseline_r_area or 1.0,
+            baseline_l_palp or 1.0, baseline_r_palp or 1.0
+        )
 
-        # 形状对称性
-        left_eye_points = get_points(landmarks, LEFT_EYE_POINTS, w, h)
-        right_eye_points = get_points(landmarks, RIGHT_EYE_POINTS, w, h)
-        indicators['eye_shape_disparity'] = get_shape_disparity(left_eye_points, right_eye_points)
+        # 运动范围 (最大-最小)
+        l_range = np.max(l_open) - np.min(l_open)
+        r_range = np.max(r_open) - np.min(r_open)
 
-        return indicators
+        # 速度 (睁眼度变化率)
+        dt = 1.0 / fps
+        l_velocity = np.abs(np.diff(l_open)) / dt
+        r_velocity = np.abs(np.diff(r_open)) / dt
+
+        l_mean_vel = np.mean(l_velocity) if len(l_velocity) > 0 else 0
+        r_mean_vel = np.mean(r_velocity) if len(r_velocity) > 0 else 0
+        l_max_vel = np.max(l_velocity) if len(l_velocity) > 0 else 0
+        r_max_vel = np.max(r_velocity) if len(r_velocity) > 0 else 0
+
+        # 平滑度 (速度的标准差，越小越平滑)
+        l_smoothness = 1.0 / (1.0 + np.std(l_velocity)) if len(l_velocity) > 0 else 1.0
+        r_smoothness = 1.0 / (1.0 + np.std(r_velocity)) if len(r_velocity) > 0 else 1.0
+
+        # 运动不对称性
+        motion_asymmetry = abs(l_range - r_range) / max(l_range, r_range, 1e-6)
+
+        return {
+            'left_motion_range': l_range,
+            'right_motion_range': r_range,
+            'left_mean_velocity': l_mean_vel,
+            'right_mean_velocity': r_mean_vel,
+            'left_max_velocity': l_max_vel,
+            'right_max_velocity': r_max_vel,
+            'left_smoothness': l_smoothness,
+            'right_smoothness': r_smoothness,
+            'motion_asymmetry': motion_asymmetry,
+        }
+
+    def _build_interpretability(
+            self,
+            landmarks_seq: List,
+            w: int, h: int,
+            peak_idx: int,
+            indicators: Dict,
+            neutral_baseline: Optional[NeutralBaseline]
+    ) -> Dict[str, Any]:
+        """构建可解释性数据"""
+        # 计算睁眼度曲线
+        baseline_l_area = neutral_baseline.left_eye_area if neutral_baseline else None
+        baseline_r_area = neutral_baseline.right_eye_area if neutral_baseline else None
+        baseline_l_palp = neutral_baseline.left_palpebral_length if neutral_baseline else None
+        baseline_r_palp = neutral_baseline.right_palpebral_length if neutral_baseline else None
+
+        l_open, r_open = compute_openness_curve(
+            landmarks_seq, w, h,
+            baseline_l_area or 1.0, baseline_r_area or 1.0,
+            baseline_l_palp or 1.0, baseline_r_palp or 1.0
+        )
+
+        return {
+            'peak_frame_idx': peak_idx,
+            'total_frames': len(landmarks_seq),
+            'peak_reason': 'min_ear',
+            'left_openness_curve': l_open,
+            'right_openness_curve': r_open,
+            'left_complete_closure': indicators.get('left_complete_closure', 0),
+            'right_complete_closure': indicators.get('right_complete_closure', 0),
+        }
+
+    def visualize_peak_frame(
+            self,
+            frame: np.ndarray,
+            landmarks,
+            indicators: Dict,
+            w: int, h: int
+    ) -> np.ndarray:
+        """可视化峰值帧"""
+        img = frame.copy()
+
+        # 绘制眼部轮廓
+        l_eye_pts = pts2d(landmarks, LM.EYE_CONTOUR_L, w, h).astype(np.int32)
+        r_eye_pts = pts2d(landmarks, LM.EYE_CONTOUR_R, w, h).astype(np.int32)
+
+        # 根据闭眼程度选择颜色
+        l_color = (0, 255, 0) if indicators.get('left_complete_closure', 0) else (0, 0, 255)
+        r_color = (0, 255, 0) if indicators.get('right_complete_closure', 0) else (0, 0, 255)
+
+        cv2.polylines(img, [l_eye_pts], True, l_color, 2)
+        cv2.polylines(img, [r_eye_pts], True, r_color, 2)
+
+        # 文字标注
+        y = 30
+        cv2.putText(img, f"{self.ACTION_NAME}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        y += 35
+
+        # 睁眼度
+        l_open = indicators.get('left_eye_openness', 0)
+        r_open = indicators.get('right_eye_openness', 0)
+        cv2.putText(img, f"L Openness: {l_open:.1%}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, l_color, 2)
+        y += 25
+        cv2.putText(img, f"R Openness: {r_open:.1%}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, r_color, 2)
+        y += 25
+
+        # 闭拢度
+        l_close = indicators.get('left_eye_closure', 0)
+        r_close = indicators.get('right_eye_closure', 0)
+        cv2.putText(img, f"L Closure: {l_close:.1%}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, l_color, 2)
+        y += 25
+        cv2.putText(img, f"R Closure: {r_close:.1%}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, r_color, 2)
+        y += 25
+
+        # 完全闭眼状态
+        l_complete = "✓" if indicators.get('left_complete_closure', 0) else "✗"
+        r_complete = "✓" if indicators.get('right_complete_closure', 0) else "✗"
+        cv2.putText(img, f"L Complete: {l_complete}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, l_color, 2)
+        y += 25
+        cv2.putText(img, f"R Complete: {r_complete}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, r_color, 2)
+
+        return img

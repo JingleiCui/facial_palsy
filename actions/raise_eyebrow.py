@@ -1,125 +1,295 @@
 """
-抬眉动作 (RaiseEyebrow)
-与静息帧对比，计算眉眼距变化
+RaiseEyebrow (抬眉) 动作
+========================
+
+评估面神经颞支功能
+
+关键帧: 眉眼距最大的帧 (眉毛抬得最高)
+
+核心指标:
+- 眉眼距变化量 (相对静息帧)
+- 眉毛抬起的左右不对称性
+- 联动检测: 抬眉时眼睛可能睁大
+
+注意: 这是唯一可能导致睁眼度>1的动作
 """
+
 import numpy as np
-from .base_action import BaseAction
-from ..core.geometry_utils import *
+from typing import Dict, List, Optional, Any
+import cv2
+
+from .base_action import BaseAction, ActionResult, NeutralBaseline
+from ..core.geometry_utils import (
+    LM, compute_icd, measure_eyes, measure_brow,
+    compute_openness_curve, pts2d, pt2d
+)
 
 
 class RaiseEyebrowAction(BaseAction):
-    """抬眉动作"""
+    """抬眉动作 (Sunnybrook随意运动B1)"""
 
-    def detect_peak_frame(self, landmarks_seq, w, h):
-        """
-        检测峰值帧: 眉眼距最大的帧
-        """
-        valid_indices = [i for i, lm in enumerate(landmarks_seq) if lm is not None]
-        if not valid_indices:
-            return 0
+    ACTION_NAME = "RaiseEyebrow"
+    ACTION_NAME_CN = "抬眉"
 
-        max_distance_normalized = 0
-        peak_idx = valid_indices[0]
+    def find_peak_frame(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        **kwargs
+    ) -> int:
+        """找眉眼距最大帧"""
+        max_dist = -1.0
+        max_idx = 0
 
-        for idx in valid_indices:
-            lm = landmarks_seq[idx]
-            unit_length = get_unit_length(lm, w, h)
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
 
-            left_dist = get_eyebrow_eye_distance(lm, w, h, left=True) / unit_length
-            right_dist = get_eyebrow_eye_distance(lm, w, h, left=False) / unit_length
-            avg_dist_normalized = (left_dist + right_dist) / 2
+            icd = compute_icd(lm, w, h)
+            brow = measure_brow(lm, w, h, icd)
 
-            if avg_dist_normalized > max_distance_normalized:
-                max_distance_normalized = avg_dist_normalized
-                peak_idx = idx
+            # 使用两侧眉眼距的平均值
+            avg_height = (brow.left_height + brow.right_height) / 2
 
-        return peak_idx
+            if avg_height > max_dist:
+                max_dist = avg_height
+                max_idx = i
 
-    def extract_indicators(self, landmarks, w, h, neutral_indicators=None):
-        """
-        提取抬眉指标，并与静息帧对比
+        return max_idx
 
-        Args:
-            landmarks: 当前帧landmarks
-            w, h: 图像尺寸
-            neutral_indicators: 静息帧的指标（原始像素值）
-        """
-        indicators = {}
+    def extract_indicators(
+        self,
+        landmarks,
+        w: int, h: int,
+        neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
+        """提取抬眉指标"""
+        icd = compute_icd(landmarks, w, h)
 
-        # === 一级指标：当前状态 ===
+        # 获取基准
+        baseline_l_brow = neutral_baseline.left_brow_height if neutral_baseline else None
+        baseline_r_brow = neutral_baseline.right_brow_height if neutral_baseline else None
+        baseline_l_area = neutral_baseline.left_eye_area if neutral_baseline else None
+        baseline_r_area = neutral_baseline.right_eye_area if neutral_baseline else None
+        baseline_l_palp = neutral_baseline.left_palpebral_length if neutral_baseline else None
+        baseline_r_palp = neutral_baseline.right_palpebral_length if neutral_baseline else None
 
-        indicators['left_eyebrow_eye_dist'] = get_eyebrow_eye_distance(landmarks, w, h, left=True)
-        indicators['right_eyebrow_eye_dist'] = get_eyebrow_eye_distance(landmarks, w, h, left=False)
+        # 眉毛测量
+        brow = measure_brow(landmarks, w, h, icd, baseline_l_brow, baseline_r_brow)
 
-        left_eyebrow_center = get_eyebrow_center(landmarks, w, h, left=True)
-        right_eyebrow_center = get_eyebrow_center(landmarks, w, h, left=False)
-        indicators['left_eyebrow_y'] = left_eyebrow_center[1]
-        indicators['right_eyebrow_y'] = right_eyebrow_center[1]
+        # 眼部测量 (检测联动: 抬眉时可能睁大眼睛)
+        eyes = measure_eyes(
+            landmarks, w, h,
+            baseline_l_area, baseline_r_area,
+            baseline_l_palp, baseline_r_palp
+        )
 
-        # 眼部（抬眉时可能变化）
-        indicators['left_eye_opening'] = get_eye_opening(landmarks, w, h, left=True)
-        indicators['right_eye_opening'] = get_eye_opening(landmarks, w, h, left=False)
-        indicators['left_eye_area'] = get_eye_area(landmarks, w, h, left=True)
-        indicators['right_eye_area'] = get_eye_area(landmarks, w, h, left=False)
+        # 眉毛抬起量 (归一化)
+        l_lift_norm = brow.left_lift  # 已经除以ICD
+        r_lift_norm = brow.right_lift
 
-        # 额头到眉毛距离
-        forehead = get_point(landmarks, FOREHEAD, w, h)
-        indicators['left_forehead_eyebrow_dist'] = dist.euclidean(forehead, left_eyebrow_center)
-        indicators['right_forehead_eyebrow_dist'] = dist.euclidean(forehead, right_eyebrow_center)
+        # 抬起量比值 (功能百分比)
+        if r_lift_norm > 1e-6:
+            lift_ratio = l_lift_norm / r_lift_norm
+        elif l_lift_norm > 1e-6:
+            lift_ratio = float('inf')
+        else:
+            lift_ratio = 1.0
 
-        # === 二级指标：与静息帧对比（如果提供）===
+        # 功能百分比 (弱侧/强侧)
+        min_lift = min(l_lift_norm, r_lift_norm)
+        max_lift = max(l_lift_norm, r_lift_norm)
+        if max_lift > 1e-6:
+            function_pct = min_lift / max_lift
+        else:
+            function_pct = 1.0
 
-        if neutral_indicators:
-            # 眉眼距变化（绝对值，像素）
-            indicators['left_eyebrow_dist_change'] = (indicators['left_eyebrow_eye_dist'] -
-                                                      neutral_indicators['left_eyebrow_eye_dist'])
-            indicators['right_eyebrow_dist_change'] = (indicators['right_eyebrow_eye_dist'] -
-                                                       neutral_indicators['right_eyebrow_eye_dist'])
+        # 抬眉不对称度
+        lift_asymmetry = abs(l_lift_norm - r_lift_norm)
 
-            # 眉毛上抬幅度（Y坐标减小表示上抬）
-            indicators['left_eyebrow_lift'] = (neutral_indicators['left_eyebrow_y'] -
-                                               indicators['left_eyebrow_y'])
-            indicators['right_eyebrow_lift'] = (neutral_indicators['right_eyebrow_y'] -
-                                                indicators['right_eyebrow_y'])
+        return {
+            # 眉毛
+            'left_brow_height': brow.left_height,
+            'right_brow_height': brow.right_height,
+            'left_brow_height_norm': brow.left_height_norm,
+            'right_brow_height_norm': brow.right_height_norm,
+            'brow_height_ratio': brow.height_ratio,
 
-            # 眼睛开合度变化
-            indicators['left_eye_opening_change'] = (indicators['left_eye_opening'] -
-                                                     neutral_indicators['left_eye_opening'])
-            indicators['right_eye_opening_change'] = (indicators['right_eye_opening'] -
-                                                      neutral_indicators['right_eye_opening'])
+            # 抬起量 (相对静息帧)
+            'left_brow_lift': l_lift_norm,
+            'right_brow_lift': r_lift_norm,
+            'lift_ratio': lift_ratio,
+            'lift_asymmetry': lift_asymmetry,
 
-            # 变化量比例（对称性评估）
-            if indicators['right_eyebrow_dist_change'] != 0:
-                indicators['eyebrow_change_ratio'] = (indicators['left_eyebrow_dist_change'] /
-                                                      indicators['right_eyebrow_dist_change'])
-            else:
-                indicators['eyebrow_change_ratio'] = 1.0
+            # 功能评估
+            'function_pct': function_pct,
 
-            if indicators['right_eyebrow_lift'] != 0:
-                indicators['eyebrow_lift_ratio'] = (indicators['left_eyebrow_lift'] /
-                                                    indicators['right_eyebrow_lift'])
-            else:
-                indicators['eyebrow_lift_ratio'] = 1.0
+            # 联动检测: 眼睛睁大程度
+            'left_eye_openness': eyes.left.openness,
+            'right_eye_openness': eyes.right.openness,
+            'eye_synkinesis': max(eyes.left.openness, eyes.right.openness) > 1.1,  # 超过110%视为联动
 
-        # === 二级指标：当前状态的对称性 ===
+            'icd': icd,
+        }
 
-        indicators['eyebrow_dist_ratio'] = (indicators['left_eyebrow_eye_dist'] /
-                                           (indicators['right_eyebrow_eye_dist'] + 1e-6))
-        indicators['eye_opening_ratio'] = (indicators['left_eye_opening'] /
-                                          (indicators['right_eye_opening'] + 1e-6))
-        indicators['eye_area_ratio'] = (indicators['left_eye_area'] /
-                                       (indicators['right_eye_area'] + 1e-6))
+    def extract_dynamic_features(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        fps: float = 30.0,
+        neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
+        """提取动态特征"""
+        n = len(landmarks_seq)
+        if n < 2:
+            return {}
 
-        # 眉毛高度差
-        indicators['eyebrow_height_diff'] = abs(left_eyebrow_center[1] - right_eyebrow_center[1])
+        # 计算眉眼距序列
+        l_heights = np.zeros(n)
+        r_heights = np.zeros(n)
 
-        # 眉毛形状对称性
-        left_eyebrow_points = get_points(landmarks, EYEBROW_LEFT_POINTS, w, h)
-        right_eyebrow_points = get_points(landmarks, EYEBROW_RIGHT_POINTS, w, h)
-        indicators['eyebrow_shape_disparity'] = get_shape_disparity(left_eyebrow_points, right_eyebrow_points)
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
+            icd = compute_icd(lm, w, h)
+            brow = measure_brow(lm, w, h, icd)
+            l_heights[i] = brow.left_height_norm
+            r_heights[i] = brow.right_height_norm
 
-        # 角度
-        h_line = get_horizontal_line(landmarks, w, h)
-        indicators['eyebrow_horizontal_angle'] = get_horizontal_angle(h_line, left_eyebrow_center, right_eyebrow_center)
+        # 运动范围
+        l_range = np.max(l_heights) - np.min(l_heights)
+        r_range = np.max(r_heights) - np.min(r_heights)
 
-        return indicators
+        # 速度
+        dt = 1.0 / fps
+        l_velocity = np.abs(np.diff(l_heights)) / dt
+        r_velocity = np.abs(np.diff(r_heights)) / dt
+
+        l_mean_vel = np.mean(l_velocity) if len(l_velocity) > 0 else 0
+        r_mean_vel = np.mean(r_velocity) if len(r_velocity) > 0 else 0
+
+        # 平滑度
+        l_smoothness = 1.0 / (1.0 + np.std(l_velocity)) if len(l_velocity) > 0 else 1.0
+        r_smoothness = 1.0 / (1.0 + np.std(r_velocity)) if len(r_velocity) > 0 else 1.0
+
+        # 运动不对称性
+        motion_asymmetry = abs(l_range - r_range) / max(l_range, r_range, 1e-6)
+
+        return {
+            'left_motion_range': l_range,
+            'right_motion_range': r_range,
+            'left_mean_velocity': l_mean_vel,
+            'right_mean_velocity': r_mean_vel,
+            'left_smoothness': l_smoothness,
+            'right_smoothness': r_smoothness,
+            'motion_asymmetry': motion_asymmetry,
+        }
+
+    def _build_interpretability(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        peak_idx: int,
+        indicators: Dict,
+        neutral_baseline: Optional[NeutralBaseline]
+    ) -> Dict[str, Any]:
+        """构建可解释性数据"""
+        # 计算眉眼距曲线
+        n = len(landmarks_seq)
+        l_brow_curve = np.zeros(n)
+        r_brow_curve = np.zeros(n)
+
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
+            icd = compute_icd(lm, w, h)
+            brow = measure_brow(lm, w, h, icd)
+            l_brow_curve[i] = brow.left_height_norm
+            r_brow_curve[i] = brow.right_height_norm
+
+        # 睁眼度曲线 (检测联动)
+        baseline_l_area = neutral_baseline.left_eye_area if neutral_baseline else 1.0
+        baseline_r_area = neutral_baseline.right_eye_area if neutral_baseline else 1.0
+        baseline_l_palp = neutral_baseline.left_palpebral_length if neutral_baseline else 1.0
+        baseline_r_palp = neutral_baseline.right_palpebral_length if neutral_baseline else 1.0
+
+        l_open, r_open = compute_openness_curve(
+            landmarks_seq, w, h,
+            baseline_l_area, baseline_r_area,
+            baseline_l_palp, baseline_r_palp
+        )
+
+        return {
+            'peak_frame_idx': peak_idx,
+            'total_frames': n,
+            'peak_reason': 'max_brow_height',
+            'left_brow_curve': l_brow_curve,
+            'right_brow_curve': r_brow_curve,
+            'left_openness_curve': l_open,
+            'right_openness_curve': r_open,
+        }
+
+    def visualize_peak_frame(
+        self,
+        frame: np.ndarray,
+        landmarks,
+        indicators: Dict,
+        w: int, h: int
+    ) -> np.ndarray:
+        """可视化峰值帧"""
+        img = frame.copy()
+
+        # 绘制眉毛
+        l_brow_pts = pts2d(landmarks, LM.BROW_L, w, h).astype(np.int32)
+        r_brow_pts = pts2d(landmarks, LM.BROW_R, w, h).astype(np.int32)
+        cv2.polylines(img, [l_brow_pts], False, (255, 0, 0), 2)
+        cv2.polylines(img, [r_brow_pts], False, (0, 165, 255), 2)
+
+        # 绘制眉眼连线
+        l_brow_center = tuple(map(int, pt2d(landmarks[LM.BROW_CENTER_L], w, h)))
+        r_brow_center = tuple(map(int, pt2d(landmarks[LM.BROW_CENTER_R], w, h)))
+        l_eye_inner = tuple(map(int, pt2d(landmarks[LM.EYE_INNER_L], w, h)))
+        r_eye_inner = tuple(map(int, pt2d(landmarks[LM.EYE_INNER_R], w, h)))
+
+        cv2.line(img, l_brow_center, l_eye_inner, (255, 0, 0), 1)
+        cv2.line(img, r_brow_center, r_eye_inner, (0, 165, 255), 1)
+
+        # 绘制眼部轮廓
+        l_eye_pts = pts2d(landmarks, LM.EYE_CONTOUR_L, w, h).astype(np.int32)
+        r_eye_pts = pts2d(landmarks, LM.EYE_CONTOUR_R, w, h).astype(np.int32)
+        cv2.polylines(img, [l_eye_pts], True, (255, 0, 0), 1)
+        cv2.polylines(img, [r_eye_pts], True, (0, 165, 255), 1)
+
+        # 文字标注
+        y = 30
+        cv2.putText(img, f"{self.ACTION_NAME}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        y += 35
+
+        # 眉毛抬起量
+        l_lift = indicators.get('left_brow_lift', 0)
+        r_lift = indicators.get('right_brow_lift', 0)
+        cv2.putText(img, f"L Lift: {l_lift:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        y += 25
+        cv2.putText(img, f"R Lift: {r_lift:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+        y += 25
+
+        # 功能百分比
+        func_pct = indicators.get('function_pct', 1.0)
+        cv2.putText(img, f"Function: {func_pct:.1%}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        y += 25
+
+        # 联动检测
+        synk = indicators.get('eye_synkinesis', False)
+        synk_text = "Yes" if synk else "No"
+        synk_color = (0, 255, 255) if synk else (0, 255, 0)
+        cv2.putText(img, f"Synkinesis: {synk_text}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, synk_color, 2)
+        y += 25
+
+        # 眼睛睁大程度
+        l_open = indicators.get('left_eye_openness', 1.0)
+        r_open = indicators.get('right_eye_openness', 1.0)
+        cv2.putText(img, f"L Eye Open: {l_open:.1%}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        y += 20
+        cv2.putText(img, f"R Eye Open: {r_open:.1%}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+        return img

@@ -1,5 +1,5 @@
 """
-视频处理Pipeline V4 - 集成运动特征提取
+视频处理Pipeline - 集成运动特征提取
 ========================================
 
 处理流程:
@@ -45,6 +45,8 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
+import inspect
+import dataclasses
 
 from facialPalsy.core.landmark_extractor import LandmarkExtractor
 from facialPalsy.core.motion_utils import compute_motion_features
@@ -107,6 +109,95 @@ class VideoPipeline:
             w.action_detectors = w.feature_integrator.action_detectors
             self._tls.worker = w
         return w
+
+
+    # ===========================
+    # 适配最新 actions 接口的辅助函数
+    # ===========================
+
+    def _build_neutral_baseline(self, neutral_indicators):
+        """
+        将 NeutralFace 的指标字典尽量转换为 actions/base_action.py 中的 NeutralBaseline 对象。
+        若当前工程没有该类或字段不匹配，则直接返回原 dict 作为兜底。
+        """
+        if neutral_indicators is None:
+            return None
+
+        try:
+            from facialPalsy.actions.base_action import NeutralBaseline  # type: ignore
+        except Exception:
+            return neutral_indicators
+
+        # dataclass: 仅取字段交集，避免 __init__ 参数不匹配
+        try:
+            if hasattr(NeutralBaseline, "__dataclass_fields__"):
+                fields = list(NeutralBaseline.__dataclass_fields__.keys())
+                kwargs = {k: neutral_indicators.get(k) for k in fields if k in neutral_indicators}
+                return NeutralBaseline(**kwargs)
+        except Exception:
+            pass
+
+        # 普通类：尝试直接 **kwargs，失败则回退 dict
+        try:
+            return NeutralBaseline(**neutral_indicators)
+        except Exception:
+            return neutral_indicators
+
+    def _action_result_to_dict(self, result):
+        """支持 dict / dataclass / 普通对象 三种返回形式"""
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            return result
+        try:
+            if dataclasses.is_dataclass(result):
+                return dataclasses.asdict(result)
+        except Exception:
+            pass
+        # 通用对象：取 __dict__
+        if hasattr(result, "__dict__"):
+            return dict(result.__dict__)
+        return result
+
+    def _call_action_process(self, detector, *, landmarks_seq, frames_seq, w, h, fps, neutral_indicators):
+        """
+        调用动作 detector.process，并兼容最新动作代码可能使用的参数名：
+        - neutral_indicators（旧）
+        - neutral_baseline（新，建议）
+        """
+        sig = None
+        try:
+            sig = inspect.signature(detector.process)
+        except Exception:
+            sig = None
+
+        neutral_payload = neutral_indicators
+        # 若对方支持 neutral_baseline，则尽量转成 NeutralBaseline
+        if sig and "neutral_baseline" in sig.parameters:
+            neutral_payload = self._build_neutral_baseline(neutral_indicators)
+
+        kwargs = dict(
+            landmarks_seq=landmarks_seq,
+            frames_seq=frames_seq,
+            w=w,
+            h=h,
+            fps=fps,
+        )
+
+        if sig:
+            if "neutral_baseline" in sig.parameters:
+                kwargs["neutral_baseline"] = neutral_payload
+            elif "neutral_indicators" in sig.parameters:
+                kwargs["neutral_indicators"] = neutral_indicators
+            else:
+                # 兜底：不传 baseline
+                pass
+        else:
+            # 无法 introspect：保留旧参数名（兼容旧版 BaseAction）
+            kwargs["neutral_indicators"] = neutral_indicators
+
+        out = detector.process(**kwargs)
+        return self._action_result_to_dict(out)
 
     def process_examination(self, examination_id):
         """
@@ -280,14 +371,7 @@ class VideoPipeline:
         h, w = frames_seq[0].shape[:2]
         fps = video_info.get('fps')
 
-        result = detector.process(
-            landmarks_seq=landmarks_seq,
-            frames_seq=frames_seq,
-            w=w,
-            h=h,
-            fps=fps,
-            neutral_indicators=neutral_raw
-        )
+        result = self._call_action_process(detector, landmarks_seq=landmarks_seq, frames_seq=frames_seq, w=w, h=h, fps=fps, neutral_indicators=neutral_raw)
 
         # 6. 计算运动特征 (复用landmarks_seq)
         try:
@@ -397,14 +481,7 @@ class VideoPipeline:
         else:
             fps = float(fps)
 
-        result = detector.process(
-            landmarks_seq=landmarks_seq,
-            frames_seq=frames_seq,
-            w=w,
-            h=h,
-            fps=fps,
-            neutral_indicators=neutral_raw
-        )
+        result = self._call_action_process(detector, landmarks_seq=landmarks_seq, frames_seq=frames_seq, w=w, h=h, fps=fps, neutral_indicators=neutral_raw)
 
         # 计算运动特征 (复用landmarks_seq)
         try:

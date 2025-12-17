@@ -1,160 +1,323 @@
 """
-微笑动作 (Smile)
-与静息帧对比，计算嘴角展开和上扬幅度
+Smile (微笑) 动作
+=================
+
+评估面神经颊支功能
+
+关键帧: 嘴角拉伸最大的帧 (嘴宽最大)
+
+核心指标:
+- 嘴角高度差: 患侧嘴角下垂
+- 嘴角上提量: 相对静息帧的变化
+- 鼻唇沟变化: 微笑时鼻唇沟会加深
+
+联动检测:
+- 微笑时眼睛可能眯起 (正常联动)
+- 面瘫恢复期可能出现口-眼联动
 """
+
 import numpy as np
-from .base_action import BaseAction
-from ..core.geometry_utils import *
+from typing import Dict, List, Optional, Any
+import cv2
+
+from .base_action import BaseAction, ActionResult, NeutralBaseline
+from ..core.geometry_utils import (
+    LM, compute_icd, measure_eyes, measure_oral, measure_nlf,
+    compute_openness_curve, pts2d, pt2d, dist
+)
 
 
 class SmileAction(BaseAction):
-    """微笑动作"""
+    """微笑动作 (Sunnybrook随意运动B3)"""
 
-    def detect_peak_frame(self, landmarks_seq, w, h):
-        """
-        检测峰值帧: 嘴角宽度最大
-        """
-        valid_indices = [i for i, lm in enumerate(landmarks_seq) if lm is not None]
-        if not valid_indices:
-            return 0
+    ACTION_NAME = "Smile"
+    ACTION_NAME_CN = "微笑"
 
-        max_width_normalized = 0
-        peak_idx = valid_indices[0]
+    def find_peak_frame(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        **kwargs
+    ) -> int:
+        """找嘴宽最大帧"""
+        max_width = -1.0
+        max_idx = 0
 
-        for idx in valid_indices:
-            lm = landmarks_seq[idx]
-            unit_length = get_unit_length(lm, w, h)
-            mouth_w = get_mouth_width(lm, w, h) / unit_length
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
 
-            if mouth_w > max_width_normalized:
-                max_width_normalized = mouth_w
-                peak_idx = idx
+            l_corner = pt2d(lm[LM.MOUTH_L], w, h)
+            r_corner = pt2d(lm[LM.MOUTH_R], w, h)
+            mouth_width = dist(l_corner, r_corner)
 
-        return peak_idx
+            if mouth_width > max_width:
+                max_width = mouth_width
+                max_idx = i
 
-    def extract_indicators(self, landmarks, w, h, neutral_indicators=None):
-        """
-        提取微笑指标，并与静息帧对比
-        """
-        indicators = {}
+        return max_idx
 
-        # === 一级指标：当前状态 ===
+    def extract_indicators(
+        self,
+        landmarks,
+        w: int, h: int,
+        neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
+        """提取微笑指标"""
+        icd = compute_icd(landmarks, w, h)
 
-        indicators['mouth_width'] = get_mouth_width(landmarks, w, h)
-        indicators['mouth_height'] = get_mouth_height(landmarks, w, h)
-        indicators['mouth_area'] = get_mouth_area(landmarks, w, h)
+        # 口角测量
+        oral = measure_oral(landmarks, w, h, icd)
 
-        # 嘴角位置
-        mouth_left = get_point(landmarks, MOUTH_CORNER_LEFT, w, h)
-        mouth_right = get_point(landmarks, MOUTH_CORNER_RIGHT, w, h)
-        indicators['mouth_corner_left_y'] = mouth_left[1]
-        indicators['mouth_corner_right_y'] = mouth_right[1]
+        # 鼻唇沟测量
+        nlf = measure_nlf(landmarks, w, h, icd)
 
-        # 嘴角到鼻尖距离
-        nose_tip = get_point(landmarks, NOSE_TIP, w, h)
-        indicators['mouth_left_nose_dist'] = dist.euclidean(mouth_left, nose_tip)
-        indicators['mouth_right_nose_dist'] = dist.euclidean(mouth_right, nose_tip)
+        # 基准值
+        baseline_mouth_width = neutral_baseline.mouth_width if neutral_baseline else None
+        baseline_mouth_height = neutral_baseline.mouth_height if neutral_baseline else None
+        baseline_l_nlf = neutral_baseline.left_nlf_length if neutral_baseline else None
+        baseline_r_nlf = neutral_baseline.right_nlf_length if neutral_baseline else None
 
-        # 唇部面积
-        indicators['upper_lip_left_area'] = get_lip_area(landmarks, w, h, upper=True, left=True)
-        indicators['upper_lip_right_area'] = get_lip_area(landmarks, w, h, upper=True, left=False)
-        indicators['lower_lip_left_area'] = get_lip_area(landmarks, w, h, upper=False, left=True)
-        indicators['lower_lip_right_area'] = get_lip_area(landmarks, w, h, upper=False, left=False)
+        baseline_l_area = neutral_baseline.left_eye_area if neutral_baseline else None
+        baseline_r_area = neutral_baseline.right_eye_area if neutral_baseline else None
+        baseline_l_palp = neutral_baseline.left_palpebral_length if neutral_baseline else None
+        baseline_r_palp = neutral_baseline.right_palpebral_length if neutral_baseline else None
 
-        # 眼部（微笑时可能眯眼）
-        indicators['left_eye_opening'] = get_eye_opening(landmarks, w, h, left=True)
-        indicators['right_eye_opening'] = get_eye_opening(landmarks, w, h, left=False)
-        indicators['left_eye_area'] = get_eye_area(landmarks, w, h, left=True)
-        indicators['right_eye_area'] = get_eye_area(landmarks, w, h, left=False)
+        # 嘴角变化量
+        if baseline_mouth_width is not None and baseline_mouth_width > 1e-6:
+            width_change = (oral.mouth_width - baseline_mouth_width) / icd
+            width_change_ratio = oral.mouth_width / baseline_mouth_width
+        else:
+            width_change = 0.0
+            width_change_ratio = 1.0
 
-        # 鼻唇沟
-        nose_left = get_point(landmarks, 392, w, h)
-        nose_right = get_point(landmarks, 166, w, h)
-        indicators['nasolabial_fold_left'] = dist.euclidean(nose_left, mouth_left)
-        indicators['nasolabial_fold_right'] = dist.euclidean(nose_right, mouth_right)
+        # 嘴角上提量 (Y坐标减小=上提)
+        # 需要计算相对于静息帧的变化，这里简化为口角角度
+        l_lift = oral.left_angle  # 正=上提
+        r_lift = oral.right_angle
 
-        # === 二级指标：与静息帧对比 ===
+        # 功能百分比 (弱侧/强侧的抬起程度)
+        # 对于微笑: 正角度表示嘴角上提
+        min_lift = min(l_lift, r_lift)
+        max_lift = max(l_lift, r_lift)
+        if max_lift > 0 and min_lift > 0:
+            function_pct = min_lift / max_lift
+        elif max_lift > 0:
+            # 有一侧上提，另一侧没有或下垂
+            function_pct = 0.0
+        else:
+            function_pct = 1.0  # 两侧都没上提
 
-        if neutral_indicators:
-            # 嘴部展开幅度
-            indicators['mouth_width_change'] = (indicators['mouth_width'] -
-                                               neutral_indicators['mouth_width'])
-            indicators['mouth_width_expansion_pct'] = (indicators['mouth_width_change'] /
-                                                       (neutral_indicators['mouth_width'] + 1e-6))
+        # 鼻唇沟变化
+        if baseline_l_nlf is not None and baseline_l_nlf > 1e-6:
+            l_nlf_change = (nlf.left_length - baseline_l_nlf) / icd
+        else:
+            l_nlf_change = 0.0
 
-            indicators['mouth_height_change'] = (indicators['mouth_height'] -
-                                                neutral_indicators['mouth_height'])
-            indicators['mouth_area_change'] = (indicators['mouth_area'] -
-                                              neutral_indicators['mouth_area'])
+        if baseline_r_nlf is not None and baseline_r_nlf > 1e-6:
+            r_nlf_change = (nlf.right_length - baseline_r_nlf) / icd
+        else:
+            r_nlf_change = 0.0
 
-            # 嘴角上扬幅度（Y坐标减小）
-            indicators['mouth_corner_left_lift'] = (neutral_indicators['mouth_corner_left_y'] -
-                                                   indicators['mouth_corner_left_y'])
-            indicators['mouth_corner_right_lift'] = (neutral_indicators['mouth_corner_right_y'] -
-                                                    indicators['mouth_corner_right_y'])
+        # 眼部测量 (联动检测)
+        eyes = measure_eyes(
+            landmarks, w, h,
+            baseline_l_area, baseline_r_area,
+            baseline_l_palp, baseline_r_palp
+        )
 
-            # 上扬幅度百分比
-            indicators['mouth_corner_left_lift_pct'] = (indicators['mouth_corner_left_lift'] /
-                                                        (neutral_indicators['nose_mouth_left_dist'] + 1e-6))
-            indicators['mouth_corner_right_lift_pct'] = (indicators['mouth_corner_right_lift'] /
-                                                         (neutral_indicators['nose_mouth_right_dist'] + 1e-6))
+        # 眼睛眯起检测 (睁眼度 < 0.9 视为眯眼)
+        eye_squint = eyes.left.openness < 0.9 or eyes.right.openness < 0.9
 
-            # 对称性评估（上扬幅度比）
-            if indicators['mouth_corner_right_lift'] != 0:
-                indicators['smile_lift_ratio'] = (indicators['mouth_corner_left_lift'] /
-                                                  indicators['mouth_corner_right_lift'])
-            else:
-                indicators['smile_lift_ratio'] = 1.0
+        return {
+            # 嘴部
+            'mouth_width': oral.mouth_width,
+            'mouth_height': oral.mouth_height,
+            'mouth_width_norm': oral.mouth_width / icd if icd > 0 else 0,
+            'mouth_height_norm': oral.mouth_height / icd if icd > 0 else 0,
+            'width_change': width_change,
+            'width_change_ratio': width_change_ratio,
 
-            # 鼻唇沟加深程度
-            indicators['nasolabial_fold_left_change'] = (indicators['nasolabial_fold_left'] -
-                                                          neutral_indicators['nose_mouth_left_dist'])
-            indicators['nasolabial_fold_right_change'] = (indicators['nasolabial_fold_right'] -
-                                                           neutral_indicators['nose_mouth_right_dist'])
+            # 口角
+            'left_oral_angle': oral.left_angle,
+            'right_oral_angle': oral.right_angle,
+            'oral_height_diff': oral.height_diff,
+            'oral_angle_diff': oral.left_angle - oral.right_angle,
 
-            # 眼部变化（眯眼程度）
-            indicators['left_eye_opening_change'] = (indicators['left_eye_opening'] -
-                                                     neutral_indicators['left_eye_opening'])
-            indicators['right_eye_opening_change'] = (indicators['right_eye_opening'] -
-                                                      neutral_indicators['right_eye_opening'])
+            # 嘴角对称性
+            'left_corner_lift': l_lift,
+            'right_corner_lift': r_lift,
 
-            indicators['left_eye_area_change'] = (indicators['left_eye_area'] -
-                                                  neutral_indicators['left_eye_area'])
-            indicators['right_eye_area_change'] = (indicators['right_eye_area'] -
-                                                   neutral_indicators['right_eye_area'])
+            # 鼻唇沟
+            'left_nlf_length_norm': nlf.left_length_norm,
+            'right_nlf_length_norm': nlf.right_length_norm,
+            'nlf_length_ratio': nlf.length_ratio,
+            'left_nlf_change': l_nlf_change,
+            'right_nlf_change': r_nlf_change,
 
-            # 眼部变化对称性
-            if indicators['right_eye_opening_change'] != 0:
-                indicators['eye_change_ratio'] = (indicators['left_eye_opening_change'] /
-                                                  indicators['right_eye_opening_change'])
-            else:
-                indicators['eye_change_ratio'] = 1.0
+            # 功能评估
+            'function_pct': function_pct,
 
-        # === 二级指标：当前状态对称性 ===
+            # 联动检测
+            'left_eye_openness': eyes.left.openness,
+            'right_eye_openness': eyes.right.openness,
+            'eye_squint': float(eye_squint),
 
-        indicators['upper_lip_area_ratio'] = (indicators['upper_lip_left_area'] /
-                                             (indicators['upper_lip_right_area'] + 1e-6))
-        indicators['lower_lip_area_ratio'] = (indicators['lower_lip_left_area'] /
-                                             (indicators['lower_lip_right_area'] + 1e-6))
-        indicators['eye_opening_ratio'] = (indicators['left_eye_opening'] /
-                                          (indicators['right_eye_opening'] + 1e-6))
-        indicators['eye_area_ratio'] = (indicators['left_eye_area'] /
-                                       (indicators['right_eye_area'] + 1e-6))
+            'icd': icd,
+        }
 
-        # 嘴角高度差
-        indicators['mouth_corner_height_diff'] = abs(mouth_left[1] - mouth_right[1])
+    def extract_dynamic_features(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        fps: float = 30.0,
+        neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
+        """提取动态特征"""
+        n = len(landmarks_seq)
+        if n < 2:
+            return {}
 
-        # 形状对称性
-        upper_lip_left_points = get_points(landmarks, UPPER_LIP_LEFT_POINTS, w, h)
-        upper_lip_right_points = get_points(landmarks, UPPER_LIP_RIGHT_POINTS, w, h)
-        indicators['upper_lip_shape_disparity'] = get_shape_disparity(upper_lip_left_points, upper_lip_right_points)
+        # 计算嘴宽序列
+        mouth_widths = np.zeros(n)
 
-        left_eye_points = get_points(landmarks, LEFT_EYE_POINTS, w, h)
-        right_eye_points = get_points(landmarks, RIGHT_EYE_POINTS, w, h)
-        indicators['eye_shape_disparity'] = get_shape_disparity(left_eye_points, right_eye_points)
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
+            l_corner = pt2d(lm[LM.MOUTH_L], w, h)
+            r_corner = pt2d(lm[LM.MOUTH_R], w, h)
+            mouth_widths[i] = dist(l_corner, r_corner)
 
-        # 角度
-        h_line = get_horizontal_line(landmarks, w, h)
-        indicators['mouth_horizontal_angle'] = get_horizontal_angle(h_line, mouth_left, mouth_right)
+        # 归一化
+        icd_avg = np.mean([compute_icd(lm, w, h) for lm in landmarks_seq if lm is not None])
+        mouth_widths_norm = mouth_widths / icd_avg if icd_avg > 0 else mouth_widths
 
-        return indicators
+        # 运动范围
+        motion_range = np.max(mouth_widths_norm) - np.min(mouth_widths_norm)
+
+        # 速度
+        dt = 1.0 / fps
+        velocity = np.abs(np.diff(mouth_widths_norm)) / dt
+        mean_velocity = np.mean(velocity) if len(velocity) > 0 else 0
+        max_velocity = np.max(velocity) if len(velocity) > 0 else 0
+
+        # 平滑度
+        smoothness = 1.0 / (1.0 + np.std(velocity)) if len(velocity) > 0 else 1.0
+
+        return {
+            'mouth_motion_range': motion_range,
+            'mouth_mean_velocity': mean_velocity,
+            'mouth_max_velocity': max_velocity,
+            'mouth_smoothness': smoothness,
+        }
+
+    def _build_interpretability(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        peak_idx: int,
+        indicators: Dict,
+        neutral_baseline: Optional[NeutralBaseline]
+    ) -> Dict[str, Any]:
+        """构建可解释性数据"""
+        n = len(landmarks_seq)
+
+        # 嘴宽曲线
+        mouth_width_curve = np.zeros(n)
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
+            l_corner = pt2d(lm[LM.MOUTH_L], w, h)
+            r_corner = pt2d(lm[LM.MOUTH_R], w, h)
+            mouth_width_curve[i] = dist(l_corner, r_corner)
+
+        # 睁眼度曲线 (联动检测)
+        baseline_l_area = neutral_baseline.left_eye_area if neutral_baseline else 1.0
+        baseline_r_area = neutral_baseline.right_eye_area if neutral_baseline else 1.0
+        baseline_l_palp = neutral_baseline.left_palpebral_length if neutral_baseline else 1.0
+        baseline_r_palp = neutral_baseline.right_palpebral_length if neutral_baseline else 1.0
+
+        l_open, r_open = compute_openness_curve(
+            landmarks_seq, w, h,
+            baseline_l_area, baseline_r_area,
+            baseline_l_palp, baseline_r_palp
+        )
+
+        return {
+            'peak_frame_idx': peak_idx,
+            'total_frames': n,
+            'peak_reason': 'max_mouth_width',
+            'mouth_width_curve': mouth_width_curve,
+            'left_openness_curve': l_open,
+            'right_openness_curve': r_open,
+        }
+
+    def visualize_peak_frame(
+        self,
+        frame: np.ndarray,
+        landmarks,
+        indicators: Dict,
+        w: int, h: int
+    ) -> np.ndarray:
+        """可视化峰值帧"""
+        img = frame.copy()
+
+        # 绘制嘴角
+        l_corner = tuple(map(int, pt2d(landmarks[LM.MOUTH_L], w, h)))
+        r_corner = tuple(map(int, pt2d(landmarks[LM.MOUTH_R], w, h)))
+
+        # 根据高度差选择颜色
+        height_diff = indicators.get('oral_height_diff', 0)
+        if height_diff > 0.02:
+            l_color = (0, 0, 255)  # 红=下垂
+            r_color = (0, 255, 0)
+        elif height_diff < -0.02:
+            l_color = (0, 255, 0)
+            r_color = (0, 0, 255)
+        else:
+            l_color = (0, 255, 0)
+            r_color = (0, 255, 0)
+
+        cv2.circle(img, l_corner, 8, l_color, -1)
+        cv2.circle(img, r_corner, 8, r_color, -1)
+        cv2.line(img, l_corner, r_corner, (255, 255, 255), 1)
+
+        # 绘制口裂水平线
+        midline_y = int((l_corner[1] + r_corner[1]) / 2)
+        cv2.line(img, (l_corner[0] - 20, midline_y), (r_corner[0] + 20, midline_y),
+                (128, 128, 128), 1)
+
+        # 绘制鼻唇沟
+        l_ala = tuple(map(int, pt2d(landmarks[LM.NOSE_ALA_L], w, h)))
+        r_ala = tuple(map(int, pt2d(landmarks[LM.NOSE_ALA_R], w, h)))
+        cv2.line(img, l_ala, l_corner, (255, 0, 0), 2)
+        cv2.line(img, r_ala, r_corner, (0, 165, 255), 2)
+
+        # 文字标注
+        y = 30
+        cv2.putText(img, f"{self.ACTION_NAME}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        y += 35
+
+        # 口角角度
+        l_angle = indicators.get('left_oral_angle', 0)
+        r_angle = indicators.get('right_oral_angle', 0)
+        cv2.putText(img, f"L Angle: {l_angle:.1f}°", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, l_color, 2)
+        y += 25
+        cv2.putText(img, f"R Angle: {r_angle:.1f}°", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, r_color, 2)
+        y += 25
+
+        # 高度差
+        cv2.putText(img, f"Height Diff: {height_diff:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        y += 25
+
+        # 功能百分比
+        func_pct = indicators.get('function_pct', 1.0)
+        cv2.putText(img, f"Function: {func_pct:.1%}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        y += 25
+
+        # 联动检测
+        squint = indicators.get('eye_squint', 0)
+        squint_text = "Yes" if squint else "No"
+        cv2.putText(img, f"Eye Squint: {squint_text}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        return img

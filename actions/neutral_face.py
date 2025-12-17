@@ -1,150 +1,264 @@
 """
-静息动作 (NeutralFace)
-作为所有动作的基准参考
+NeutralFace (静息帧) 动作
+=========================
+
+静息帧是所有其他动作的基准，用于:
+1. 计算基准眼裂面积 (睁眼度计算的分母)
+2. 计算基准眉眼距 (眉毛抬起的参考)
+3. Sunnybrook表A静态对称性评估
+4. 确定患侧
+
+关键帧选择: 使用最大EAR帧 (眼睛睁得最大的帧)
 """
+
 import numpy as np
-from .base_action import BaseAction
-from ..core.geometry_utils import *
+from typing import Dict, List, Optional, Any
+import cv2
+
+from .base_action import BaseAction, ActionResult, NeutralBaseline
+from ..core.geometry_utils import (
+    LM, compute_icd, compute_ear,
+    measure_eyes, measure_oral, measure_nlf, measure_brow,
+    find_max_ear_frame, pts2d, pt2d, LM
+)
+
 
 
 class NeutralFaceAction(BaseAction):
-    """静息动作 - 基准状态"""
+    """静息帧动作"""
 
-    def detect_peak_frame(self, landmarks_seq, w, h):
+    ACTION_NAME = "NeutralFace"
+    ACTION_NAME_CN = "静息"
+
+    def find_peak_frame(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        **kwargs
+    ) -> int:
         """
-        检测峰值帧: 取中间40%最稳定的帧
+        找最大EAR帧作为关键帧
+
+        原因: 静息时应该是自然睁眼状态，EAR最大代表眼睛睁得最开
         """
-        valid_indices = [i for i, lm in enumerate(landmarks_seq) if lm is not None]
-        if not valid_indices:
-            return 0
+        peak_idx, _, _ = find_max_ear_frame(landmarks_seq, w, h)
+        return peak_idx
 
-        total = len(valid_indices)
-        start_idx = int(total * 0.3)
-        end_idx = int(total * 0.7)
-
-        if end_idx <= start_idx:
-            return valid_indices[total // 2]
-
-        middle_indices = valid_indices[start_idx:end_idx]
-
-        # 计算每帧的归一化眼睛开合度
-        eye_openings_norm = []
-        for idx in middle_indices:
-            lm = landmarks_seq[idx]
-            unit_length = get_unit_length(lm, w, h)
-            left_eye = get_eye_opening(lm, w, h, left=True) / unit_length
-            right_eye = get_eye_opening(lm, w, h, left=False) / unit_length
-            eye_openings_norm.append((left_eye + right_eye) / 2)
-
-        # 找最稳定的帧
-        if len(eye_openings_norm) < 3:
-            return middle_indices[len(middle_indices) // 2]
-
-        stabilities = []
-        for i in range(1, len(eye_openings_norm) - 1):
-            diff = (abs(eye_openings_norm[i] - eye_openings_norm[i-1]) +
-                    abs(eye_openings_norm[i] - eye_openings_norm[i+1]))
-            stabilities.append(diff)
-
-        most_stable_idx = np.argmin(stabilities) + 1
-        return middle_indices[most_stable_idx]
-
-    def extract_indicators(self, landmarks, w, h, neutral_indicators=None):
+    def extract_indicators(
+        self,
+        landmarks,
+        w: int, h: int,
+        neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
         """
-        提取静息状态的一级指标（原始像素值）
-        这些指标将作为其他动作的基准
+        提取静息帧指标
+
+        静息帧本身就是基准，所以不需要neutral_baseline
+
+        返回指标:
+        - 眼部: 眼裂面积、眼睑裂长度、EAR、面积比、睁眼度
+        - 口角: 嘴宽、嘴高、口角角度、高度差
+        - 鼻唇沟: 长度、深度代理
+        - 眉毛: 眉眼距
+        - 对称性评分
         """
-        indicators = {}
+        icd = compute_icd(landmarks, w, h)
 
-        # === 一级指标：基础测量（原始像素值）===
+        # 眼部测量 (无基准)
+        eyes = measure_eyes(landmarks, w, h)
 
-        # 眼部
-        indicators['left_eye_opening'] = get_eye_opening(landmarks, w, h, left=True)
-        indicators['right_eye_opening'] = get_eye_opening(landmarks, w, h, left=False)
-        indicators['left_eye_length'] = get_eye_length(landmarks, w, h, left=True)
-        indicators['right_eye_length'] = get_eye_length(landmarks, w, h, left=False)
-        indicators['left_eye_area'] = get_eye_area(landmarks, w, h, left=True)
-        indicators['right_eye_area'] = get_eye_area(landmarks, w, h, left=False)
+        # 口角测量
+        oral = measure_oral(landmarks, w, h, icd)
 
-        # 眉毛
-        indicators['left_eyebrow_eye_dist'] = get_eyebrow_eye_distance(landmarks, w, h, left=True)
-        indicators['right_eyebrow_eye_dist'] = get_eyebrow_eye_distance(landmarks, w, h, left=False)
+        # 鼻唇沟测量
+        nlf = measure_nlf(landmarks, w, h, icd)
 
-        left_eyebrow_center = get_eyebrow_center(landmarks, w, h, left=True)
-        right_eyebrow_center = get_eyebrow_center(landmarks, w, h, left=False)
-        indicators['left_eyebrow_y'] = left_eyebrow_center[1]
-        indicators['right_eyebrow_y'] = right_eyebrow_center[1]
+        # 眉毛测量 (无基准)
+        brow = measure_brow(landmarks, w, h, icd)
 
-        # 嘴部
-        indicators['mouth_width'] = get_mouth_width(landmarks, w, h)
-        indicators['mouth_height'] = get_mouth_height(landmarks, w, h)
-        indicators['mouth_area'] = get_mouth_area(landmarks, w, h)
+        # 面部对称性评分 (综合各部位不对称度)
+        eye_asymmetry = eyes.asymmetry
+        oral_asymmetry = abs(oral.height_diff)
+        nlf_asymmetry = abs(1.0 - nlf.length_ratio)
+        brow_asymmetry = abs(1.0 - brow.height_ratio)
 
-        mouth_left = get_point(landmarks, MOUTH_CORNER_LEFT, w, h)
-        mouth_right = get_point(landmarks, MOUTH_CORNER_RIGHT, w, h)
-        indicators['mouth_corner_left_y'] = mouth_left[1]
-        indicators['mouth_corner_right_y'] = mouth_right[1]
+        # 综合对称性评分 (0-1, 1=完全对称)
+        face_symmetry_score = 1.0 - (
+            0.3 * min(1.0, eye_asymmetry) +
+            0.3 * min(1.0, oral_asymmetry * 5) +  # 放大口角差异
+            0.2 * min(1.0, nlf_asymmetry) +
+            0.2 * min(1.0, brow_asymmetry)
+        )
+        face_symmetry_score = max(0.0, face_symmetry_score)
 
-        # 上唇
-        upper_lip_center = get_point(landmarks, UPPER_LIP_CENTER, w, h)
-        indicators['upper_lip_y'] = upper_lip_center[1]
+        return {
+            # ICD (基准)
+            'icd': icd,
 
-        indicators['upper_lip_left_area'] = get_lip_area(landmarks, w, h, upper=True, left=True)
-        indicators['upper_lip_right_area'] = get_lip_area(landmarks, w, h, upper=True, left=False)
+            # 左眼
+            'left_eye_area': eyes.left.area_raw,
+            'left_eye_area_norm': eyes.left.area_norm,
+            'left_palpebral_length': eyes.left.palpebral_length,
+            'left_palpebral_height': eyes.left.palpebral_height,
+            'left_eye_openness': eyes.left.openness,
+            'left_eye_closure': eyes.left.closure,
+            'left_eye_ear': eyes.left.ear,
 
-        # 下唇
-        indicators['lower_lip_left_area'] = get_lip_area(landmarks, w, h, upper=False, left=True)
-        indicators['lower_lip_right_area'] = get_lip_area(landmarks, w, h, upper=False, left=False)
+            # 右眼
+            'right_eye_area': eyes.right.area_raw,
+            'right_eye_area_norm': eyes.right.area_norm,
+            'right_palpebral_length': eyes.right.palpebral_length,
+            'right_palpebral_height': eyes.right.palpebral_height,
+            'right_eye_openness': eyes.right.openness,
+            'right_eye_closure': eyes.right.closure,
+            'right_eye_ear': eyes.right.ear,
 
-        # 鼻唇距
-        nose_tip = get_point(landmarks, NOSE_TIP, w, h)
-        indicators['nose_upper_lip_dist'] = dist.euclidean(nose_tip, upper_lip_center)
-        indicators['nose_mouth_left_dist'] = dist.euclidean(nose_tip, mouth_left)
-        indicators['nose_mouth_right_dist'] = dist.euclidean(nose_tip, mouth_right)
+            # 眼部对称性
+            'eye_area_ratio': eyes.area_ratio,
+            'eye_asymmetry': eyes.asymmetry,
 
-        # === 二级指标：对称性比例 ===
+            # 口角
+            'mouth_width': oral.mouth_width,
+            'mouth_height': oral.mouth_height,
+            'mouth_width_norm': oral.mouth_width / icd if icd > 0 else 0,
+            'mouth_height_norm': oral.mouth_height / icd if icd > 0 else 0,
+            'left_oral_angle': oral.left_angle,
+            'right_oral_angle': oral.right_angle,
+            'oral_height_diff': oral.height_diff,
+            'oral_angle_diff': oral.left_angle - oral.right_angle,
 
-        indicators['eye_opening_ratio'] = (indicators['left_eye_opening'] /
-                                          (indicators['right_eye_opening'] + 1e-6))
-        indicators['eye_area_ratio'] = (indicators['left_eye_area'] /
-                                       (indicators['right_eye_area'] + 1e-6))
-        indicators['eyebrow_dist_ratio'] = (indicators['left_eyebrow_eye_dist'] /
-                                           (indicators['right_eyebrow_eye_dist'] + 1e-6))
-        indicators['upper_lip_area_ratio'] = (indicators['upper_lip_left_area'] /
-                                             (indicators['upper_lip_right_area'] + 1e-6))
-        indicators['lower_lip_area_ratio'] = (indicators['lower_lip_left_area'] /
-                                             (indicators['lower_lip_right_area'] + 1e-6))
+            # 鼻唇沟
+            'left_nlf_length': nlf.left_length,
+            'right_nlf_length': nlf.right_length,
+            'left_nlf_length_norm': nlf.left_length_norm,
+            'right_nlf_length_norm': nlf.right_length_norm,
+            'nlf_length_ratio': nlf.length_ratio,
+            'left_nlf_depth_proxy': nlf.left_depth_proxy,
+            'right_nlf_depth_proxy': nlf.right_depth_proxy,
+            'nlf_depth_ratio': nlf.depth_ratio,
 
-        # 嘴角高度差
-        indicators['mouth_corner_height_diff'] = abs(mouth_left[1] - mouth_right[1])
+            # 眉毛
+            'left_brow_height': brow.left_height,
+            'right_brow_height': brow.right_height,
+            'left_brow_height_norm': brow.left_height_norm,
+            'right_brow_height_norm': brow.right_height_norm,
+            'brow_height_ratio': brow.height_ratio,
 
-        # 眉毛高度差
-        indicators['eyebrow_height_diff'] = abs(left_eyebrow_center[1] - right_eyebrow_center[1])
+            # 综合对称性
+            'face_symmetry_score': face_symmetry_score,
+        }
 
-        # === 二级指标：形状对称性（Procrustes）===
+    def _build_interpretability(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        peak_idx: int,
+        indicators: Dict,
+        neutral_baseline: Optional[NeutralBaseline]
+    ) -> Dict[str, Any]:
+        """构建可解释性数据"""
+        # EAR曲线
+        left_ear_curve = np.zeros(len(landmarks_seq))
+        right_ear_curve = np.zeros(len(landmarks_seq))
 
-        left_eye_points = get_points(landmarks, LEFT_EYE_POINTS, w, h)
-        right_eye_points = get_points(landmarks, RIGHT_EYE_POINTS, w, h)
-        indicators['eye_shape_disparity'] = get_shape_disparity(left_eye_points, right_eye_points)
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
+            left_ear_curve[i] = compute_ear(lm, w, h, True)
+            right_ear_curve[i] = compute_ear(lm, w, h, False)
 
-        upper_lip_left_points = get_points(landmarks, UPPER_LIP_LEFT_POINTS, w, h)
-        upper_lip_right_points = get_points(landmarks, UPPER_LIP_RIGHT_POINTS, w, h)
-        indicators['upper_lip_shape_disparity'] = get_shape_disparity(upper_lip_left_points, upper_lip_right_points)
+        return {
+            'peak_frame_idx': peak_idx,
+            'total_frames': len(landmarks_seq),
+            'left_ear_curve': left_ear_curve,
+            'right_ear_curve': right_ear_curve,
+            'peak_reason': 'max_ear',
 
-        lower_lip_left_points = get_points(landmarks, LOWER_LIP_LEFT_POINTS, w, h)
-        lower_lip_right_points = get_points(landmarks, LOWER_LIP_RIGHT_POINTS, w, h)
-        indicators['lower_lip_shape_disparity'] = get_shape_disparity(lower_lip_left_points, lower_lip_right_points)
+            # Sunnybrook表A静态评分 (0=正常)
+            'sunnybrook_static': {
+                'eye_score': 1 if indicators['eye_asymmetry'] > 0.15 else 0,
+                'cheek_score': self._compute_cheek_score(indicators),
+                'mouth_score': 1 if abs(indicators['oral_height_diff']) > 0.02 else 0,
+            },
+        }
 
-        # === 二级指标：角度 ===
+    def _compute_cheek_score(self, indicators: Dict) -> int:
+        """计算颊部(鼻唇沟)评分"""
+        ratio = indicators.get('nlf_length_ratio', 1.0)
+        if 0.90 <= ratio <= 1.10:
+            return 0  # 正常
+        elif ratio < 0.75 or ratio > 1.33:
+            return 2  # 消失/严重
+        else:
+            return 1  # 不明显/轻度
 
-        h_line = get_horizontal_line(landmarks, w, h)
+    def visualize_peak_frame(
+        self,
+        frame: np.ndarray,
+        landmarks,
+        indicators: Dict,
+        w: int, h: int
+    ) -> np.ndarray:
+        """可视化峰值帧"""
+        img = frame.copy()
 
-        left_inner = get_point(landmarks, EYE_INNER_CANTHUS_LEFT, w, h)
-        right_inner = get_point(landmarks, EYE_INNER_CANTHUS_RIGHT, w, h)
-        indicators['eye_horizontal_angle'] = get_horizontal_angle(h_line, left_inner, right_inner)
+        # 绘制眼部轮廓
+        l_eye_pts = pts2d(landmarks, LM.EYE_CONTOUR_L, w, h).astype(np.int32)
+        r_eye_pts = pts2d(landmarks, LM.EYE_CONTOUR_R, w, h).astype(np.int32)
+        cv2.polylines(img, [l_eye_pts], True, (255, 0, 0), 2)  # 蓝=左
+        cv2.polylines(img, [r_eye_pts], True, (0, 165, 255), 2)  # 橙=右
 
-        indicators['mouth_horizontal_angle'] = get_horizontal_angle(h_line, mouth_left, mouth_right)
+        # 绘制鼻唇沟线
+        l_ala = tuple(map(int, pt2d(landmarks[LM.NOSE_ALA_L], w, h)))
+        r_ala = tuple(map(int, pt2d(landmarks[LM.NOSE_ALA_R], w, h)))
+        l_mouth = tuple(map(int, pt2d(landmarks[LM.MOUTH_L], w, h)))
+        r_mouth = tuple(map(int, pt2d(landmarks[LM.MOUTH_R], w, h)))
+        cv2.line(img, l_ala, l_mouth, (255, 0, 0), 2)
+        cv2.line(img, r_ala, r_mouth, (0, 165, 255), 2)
 
-        indicators['eyebrow_horizontal_angle'] = get_horizontal_angle(h_line, left_eyebrow_center, right_eyebrow_center)
+        # 绘制嘴角
+        cv2.circle(img, l_mouth, 5, (255, 0, 0), -1)
+        cv2.circle(img, r_mouth, 5, (0, 165, 255), -1)
 
-        return indicators
+        # 绘制ICD线
+        l_inner = tuple(map(int, pt2d(landmarks[LM.EYE_INNER_L], w, h)))
+        r_inner = tuple(map(int, pt2d(landmarks[LM.EYE_INNER_R], w, h)))
+        cv2.line(img, l_inner, r_inner, (128, 128, 128), 1)
+
+        # 文字标注
+        y = 30
+        cv2.putText(img, f"NeutralFace", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        y += 30
+        cv2.putText(img, f"ICD: {indicators['icd']:.1f}px", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        y += 25
+        cv2.putText(img, f"Eye Ratio: {indicators['eye_area_ratio']:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        y += 25
+        cv2.putText(img, f"Symmetry: {indicators['face_symmetry_score']:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        y += 25
+
+        # 眼裂面积
+        cv2.putText(img, f"L Eye Area: {indicators['left_eye_area']:.0f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        y += 20
+        cv2.putText(img, f"R Eye Area: {indicators['right_eye_area']:.0f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+        return img
+
+    def get_baseline_dict(self, indicators: Dict) -> Dict:
+        """
+        从indicators提取基准数据字典
+
+        供其他动作使用
+        """
+        return {
+            'icd': indicators.get('icd', 0),
+            'left_eye_area': indicators.get('left_eye_area', 0),
+            'right_eye_area': indicators.get('right_eye_area', 0),
+            'left_palpebral_length': indicators.get('left_palpebral_length', 0),
+            'right_palpebral_length': indicators.get('right_palpebral_length', 0),
+            'left_brow_height': indicators.get('left_brow_height', 0),
+            'right_brow_height': indicators.get('right_brow_height', 0),
+            'mouth_width': indicators.get('mouth_width', 0),
+            'mouth_height': indicators.get('mouth_height', 0),
+            'left_nlf_length': indicators.get('left_nlf_length', 0),
+            'right_nlf_length': indicators.get('right_nlf_length', 0),
+        }

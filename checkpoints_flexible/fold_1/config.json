@@ -1,0 +1,20 @@
+{
+  "fold": 1,
+  "batch_size": 8,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.01,
+  "epochs": 100,
+  "best_metric": 0.44183815735114995,
+  "model_params": {
+    "total": 2909572,
+    "trainable": 2909572
+  },
+  "feature_config": {
+    "enabled_features": [
+      "wrinkle"
+    ],
+    "ordinal_method": "coral",
+    "fusion_type": "concat"
+  },
+  "timestamp": "2025-12-15T16:25:14.636427"
+}

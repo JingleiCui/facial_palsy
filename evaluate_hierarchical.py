@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-H-GFA Net 层级多任务评估脚本
+H-GFA Net 灵活配置评估脚本
+============================================
 
-功能：
-1. 加载训练好的模型
-2. 在验证集上评估所有任务
-3. 生成详细的评估报告:
-   - 动作级: severity分类准确率、混淆矩阵
-   - 检查级: has_palsy, palsy_side, hb_grade混淆矩阵
-   - 回归任务: sunnybrook MAE、散点图
-4. 可视化注意力权重
+支持:
+1. 序数分类评估 (MAE, 混淆矩阵)
+2. 相邻类别准确率 (Adjacent Accuracy)
+3. 可视化分析
 
 直接在PyCharm中点击运行即可！
-修改下面的FOLD变量来评估不同的fold
 """
 
 import torch
@@ -23,6 +19,7 @@ from pathlib import Path
 import argparse
 from tqdm import tqdm
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -42,17 +39,12 @@ from hgfa_net import HGFANet
 from dataset_palsy import HierarchicalPalsyDataset, collate_hierarchical
 
 # ==================== 配置参数 ====================
-#   >=0 : 只评估对应 fold
-#   <0  : 自动评估所有 fold (0,1,2)
-FOLD = -1
+FOLD = -1  # <0 评估所有fold
 N_FOLDS = 3
-
-CHECKPOINT_TYPE = "best"  # "best" 或 "final"
-
+CHECKPOINT_TYPE = "best"
 DB_PATH = "facialPalsy.db"
-CHECKPOINT_DIR = Path("checkpoints")
-OUTPUT_DIR = Path("evaluation")
-
+CHECKPOINT_DIR = Path("checkpoints_flexible")
+OUTPUT_DIR = Path("evaluation_flexible")
 BATCH_SIZE = 8
 SPLIT_VERSION = "v1.0"
 
@@ -76,11 +68,44 @@ def move_to_device(batch, device):
     return batch
 
 
-def evaluate_model(model, dataloader, device):
+def get_predictions_from_outputs(outputs, ordinal_method):
+    """从模型输出获取预测"""
+    preds = {}
+
+    # Action severity
+    if ordinal_method == 'standard':
+        severity_logits = outputs['action_severity']
+        preds['action_severity'] = severity_logits.argmax(dim=-1)
+    else:
+        severity_probs = outputs['action_severity_probs']
+        preds['action_severity'] = severity_probs.argmax(dim=-1)
+
+    # Session level
+    session = outputs['session_outputs']
+    preds['has_palsy'] = session['has_palsy'].argmax(dim=1)
+    preds['palsy_side'] = session['palsy_side'].argmax(dim=1)
+
+    # HB Grade
+    if ordinal_method == 'standard':
+        preds['hb_grade'] = session['hb_grade'].argmax(dim=1)
+    else:
+        hb_logits = session['hb_grade']
+        if ordinal_method == 'coral':
+            probs = torch.sigmoid(hb_logits)
+            preds['hb_grade'] = (probs > 0.5).sum(dim=-1).long()
+        else:  # cumulative
+            probs = torch.sigmoid(hb_logits)
+            preds['hb_grade'] = (probs < 0.5).sum(dim=-1).long()
+
+    preds['sunnybrook'] = session['sunnybrook']
+
+    return preds
+
+
+def evaluate_model(model, dataloader, device, ordinal_method='standard'):
     """评估模型"""
     model.eval()
 
-    # 收集预测和标签
     all_preds = {
         'has_palsy': [], 'palsy_side': [], 'hb_grade': [],
         'sunnybrook_pred': [], 'sunnybrook_true': []
@@ -91,74 +116,131 @@ def evaluate_model(model, dataloader, device):
     action_preds = {name: [] for name in HGFANet.ACTION_NAMES}
     action_labels = {name: [] for name in HGFANet.ACTION_NAMES}
 
-    # 注意力权重
-    attention_weights_list = []
-
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
             batch = move_to_device(batch, device)
 
             try:
                 outputs = model(batch)
-                session = outputs['session_outputs']
+                preds = get_predictions_from_outputs(outputs, ordinal_method)
 
                 # 检查级预测
                 for task in ['has_palsy', 'palsy_side', 'hb_grade']:
-                    preds = session[task].argmax(dim=1).cpu().numpy()
-                    labels = batch['targets'][task].cpu().numpy()
-                    all_preds[task].extend(preds)
-                    all_labels[task].extend(labels)
+                    all_preds[task].extend(preds[task].cpu().numpy())
+                    all_labels[task].extend(batch['targets'][task].cpu().numpy())
 
                 # Sunnybrook
-                all_preds['sunnybrook_pred'].extend(session['sunnybrook'].cpu().numpy() * 100)
+                all_preds['sunnybrook_pred'].extend(preds['sunnybrook'].cpu().numpy() * 100)
                 all_preds['sunnybrook_true'].extend(batch['targets']['sunnybrook'].cpu().numpy())
 
-                # 动作级预测 (适配新的输出格式: action_severity 为 (B, num_actions, num_classes) 张量)
-                action_severity_logits = outputs['action_severity']  # (B, 11, 5)
+                # 动作级
+                severity_preds = preds['action_severity']  # (B, 11)
+                severity_targets = batch['targets']['action_severity']  # (B, 11)
 
-                for action_idx, action_name in enumerate(HierarchicalPalsyDataset.ACTION_NAMES):
-                    # 只有当该动作在本 batch 存在标签时才评估
-                    if action_name not in batch['targets']['action_severity']:
-                        continue
-
-                    exam_indices = batch['action_indices'].get(action_name, [])
-                    if not exam_indices:
-                        continue
-
-                    # 这些 exam_indices 对应的是 batch 内的检查下标
-                    exam_indices_tensor = torch.tensor(
-                        exam_indices, dtype=torch.long, device=device
-                    )
-
-                    # 取出对应检查、对应动作的 logits: 形状 (n_i, 5)
-                    logits = action_severity_logits[exam_indices_tensor, action_idx, :]
-
-                    preds = logits.argmax(dim=1).cpu().numpy()
-                    labels = batch['targets']['action_severity'][action_name].cpu().numpy()
-
-                    action_preds[action_name].extend(preds)
-                    action_labels[action_name].extend(labels)
-
-                # 注意力权重
-                if 'attention_weights' in session:
-                    attention_weights_list.append(session['attention_weights'].cpu().numpy())
+                for action_idx, action_name in enumerate(HGFANet.ACTION_NAMES):
+                    for sample_idx in range(severity_preds.size(0)):
+                        target = severity_targets[sample_idx, action_idx].item()
+                        if target != -1:  # 有效标签
+                            pred = severity_preds[sample_idx, action_idx].item()
+                            action_preds[action_name].append(pred)
+                            action_labels[action_name].append(target)
 
             except Exception as e:
                 print(f"Error: {e}")
                 continue
 
-    return all_preds, all_labels, action_preds, action_labels, attention_weights_list
+    return all_preds, all_labels, action_preds, action_labels
+
+
+def adjacent_accuracy(y_true, y_pred, tolerance=1):
+    """
+    计算相邻类别准确率
+
+    对于序数分类，预测在正确答案±tolerance范围内都算正确
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    correct = np.abs(y_true - y_pred) <= tolerance
+    return correct.mean()
 
 
 def plot_confusion_matrix(y_true, y_pred, labels, title, output_path):
     """绘制混淆矩阵"""
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(labels))))
+
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=labels, yticklabels=labels)
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.title(title)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def plot_ordinal_analysis(y_true, y_pred, num_classes, title, output_path):
+    """
+    序数分类专用分析图
+
+    包含:
+    1. 混淆矩阵 (带权重显示距离)
+    2. 预测偏差分布
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # 1. 混淆矩阵
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+    ax = axes[0]
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                xticklabels=[f'{i}' for i in range(num_classes)],
+                yticklabels=[f'{i}' for i in range(num_classes)])
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('True')
+    ax.set_title('Confusion Matrix')
+
+    # 2. 偏差分布
+    ax = axes[1]
+    errors = y_pred - y_true
+    error_counts = {}
+    for e in range(-num_classes + 1, num_classes):
+        error_counts[e] = np.sum(errors == e)
+
+    bars = ax.bar(list(error_counts.keys()), list(error_counts.values()),
+                  color=['red' if k != 0 else 'green' for k in error_counts.keys()])
+    ax.set_xlabel('Prediction Error (Pred - True)')
+    ax.set_ylabel('Count')
+    ax.set_title('Prediction Error Distribution')
+    ax.axvline(x=0, color='k', linestyle='--', alpha=0.5)
+
+    # 3. 每个类别的准确率
+    ax = axes[2]
+    class_acc = []
+    class_adj_acc = []  # 相邻准确率
+    for c in range(num_classes):
+        mask = y_true == c
+        if mask.sum() > 0:
+            class_acc.append(np.mean(y_pred[mask] == c))
+            class_adj_acc.append(np.mean(np.abs(y_pred[mask] - c) <= 1))
+        else:
+            class_acc.append(0)
+            class_adj_acc.append(0)
+
+    x = np.arange(num_classes)
+    width = 0.35
+    ax.bar(x - width / 2, class_acc, width, label='Exact Acc')
+    ax.bar(x + width / 2, class_adj_acc, width, label='Adjacent Acc (±1)')
+    ax.set_xlabel('Class')
+    ax.set_ylabel('Accuracy')
+    ax.set_title('Per-Class Accuracy')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'{i}' for i in range(num_classes)])
+    ax.legend()
+
+    plt.suptitle(title)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -180,31 +262,16 @@ def plot_regression_scatter(y_true, y_pred, title, output_path):
     plt.close()
 
 
-def plot_attention_heatmap(attention_weights, output_path):
-    """绘制注意力权重热力图"""
-    if not attention_weights:
-        return
-
-    # 平均注意力权重
-    avg_attn = np.mean(np.concatenate(attention_weights, axis=0), axis=0)
-
-    plt.figure(figsize=(12, 4))
-    sns.heatmap(avg_attn, annot=True, fmt='.3f', cmap='YlOrRd',
-                xticklabels=HGFANet.ACTION_NAMES,
-                yticklabels=['Session Query'])
-    plt.xlabel('Actions')
-    plt.title('Average Attention Weights')
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-
-
-def generate_report(all_preds, all_labels, action_preds, action_labels, output_dir):
+def generate_report(all_preds, all_labels, action_preds, action_labels,
+                    output_dir, ordinal_method='standard'):
     """生成评估报告"""
     report_lines = []
     report_lines.append("=" * 60)
-    report_lines.append("H-GFA Net 层级多任务评估报告")
+    report_lines.append("H-GFA Net 灵活配置评估报告")
+    report_lines.append(f"序数分类方法: {ordinal_method}")
     report_lines.append("=" * 60)
+
+    metrics = {}
 
     # 1. 检查级任务
     report_lines.append("\n" + "=" * 60)
@@ -221,10 +288,7 @@ def generate_report(all_preds, all_labels, action_preds, action_labels, output_d
     report_lines.append(f"Precision: {prec:.4f}")
     report_lines.append(f"Recall: {rec:.4f}")
     report_lines.append(f"F1-Score: {f1:.4f}")
-    report_lines.append("\n" + classification_report(
-        all_labels['has_palsy'], all_preds['has_palsy'],
-        target_names=['No Palsy', 'Palsy'], zero_division=0
-    ))
+    metrics['has_palsy_acc'] = acc
 
     # Palsy Side
     report_lines.append("\n--- 面瘫侧别 (Palsy Side) ---")
@@ -236,28 +300,27 @@ def generate_report(all_preds, all_labels, action_preds, action_labels, output_d
     report_lines.append(f"Precision: {prec:.4f}")
     report_lines.append(f"Recall: {rec:.4f}")
     report_lines.append(f"F1-Score: {f1:.4f}")
-    report_lines.append("\n" + classification_report(
-        all_labels['palsy_side'], all_preds['palsy_side'],
-        target_names=['None', 'Left', 'Right'], zero_division=0
-    ))
+    metrics['palsy_side_acc'] = acc
 
-    # HB Grade
-    report_lines.append("\n--- HB分级 (HB Grade) ---")
+    # HB Grade (序数任务重点)
+    report_lines.append("\n--- HB分级 (HB Grade) [序数任务] ---")
     acc = accuracy_score(all_labels['hb_grade'], all_preds['hb_grade'])
-    prec, rec, f1, _ = precision_recall_fscore_support(
-        all_labels['hb_grade'], all_preds['hb_grade'], average='weighted', zero_division=0
-    )
-    report_lines.append(f"Accuracy: {acc:.4f}")
-    report_lines.append(f"Precision: {prec:.4f}")
-    report_lines.append(f"Recall: {rec:.4f}")
-    report_lines.append(f"F1-Score: {f1:.4f}")
-    report_lines.append("\n" + classification_report(
-        all_labels['hb_grade'],
-        all_preds['hb_grade'],
-        labels=list(range(6)),  # <<< 明确告诉它有 6 个类：0~5
+    mae = mean_absolute_error(all_labels['hb_grade'], all_preds['hb_grade'])
+    adj_acc = adjacent_accuracy(all_labels['hb_grade'], all_preds['hb_grade'], tolerance=1)
+
+    report_lines.append(f"Exact Accuracy: {acc:.4f}")
+    report_lines.append(f"Adjacent Accuracy (±1): {adj_acc:.4f}")
+    report_lines.append(f"MAE: {mae:.4f}")
+    report_lines.append(f"\n分类报告:")
+    report_lines.append(classification_report(
+        all_labels['hb_grade'], all_preds['hb_grade'],
+        labels=list(range(6)),
         target_names=[f'Grade {i + 1}' for i in range(6)],
-        zero_division=0  # support=0 的类，precision/recall 等直接写 0
+        zero_division=0
     ))
+    metrics['hb_grade_acc'] = acc
+    metrics['hb_grade_adj_acc'] = adj_acc
+    metrics['hb_grade_mae'] = mae
 
     # Sunnybrook
     report_lines.append("\n--- Sunnybrook分数 (回归) ---")
@@ -267,18 +330,47 @@ def generate_report(all_preds, all_labels, action_preds, action_labels, output_d
     report_lines.append(f"MAE: {mae:.2f}")
     report_lines.append(f"RMSE: {rmse:.2f}")
     report_lines.append(f"R²: {r2:.4f}")
+    metrics['sunnybrook_mae'] = mae
+    metrics['sunnybrook_rmse'] = rmse
+    metrics['sunnybrook_r2'] = r2
 
     # 2. 动作级任务
     report_lines.append("\n" + "=" * 60)
-    report_lines.append("动作级任务 (Action-Level)")
+    report_lines.append("动作级任务 (Action-Level) [序数任务]")
     report_lines.append("=" * 60)
+
+    all_action_preds = []
+    all_action_labels = []
 
     for action_name in HGFANet.ACTION_NAMES:
         if len(action_labels[action_name]) > 0:
             report_lines.append(f"\n--- {action_name} ---")
             acc = accuracy_score(action_labels[action_name], action_preds[action_name])
-            report_lines.append(f"Accuracy: {acc:.4f}")
+            mae = mean_absolute_error(action_labels[action_name], action_preds[action_name])
+            adj_acc = adjacent_accuracy(action_labels[action_name], action_preds[action_name])
+
+            report_lines.append(f"Exact Accuracy: {acc:.4f}")
+            report_lines.append(f"Adjacent Accuracy (±1): {adj_acc:.4f}")
+            report_lines.append(f"MAE: {mae:.4f}")
             report_lines.append(f"Samples: {len(action_labels[action_name])}")
+
+            all_action_preds.extend(action_preds[action_name])
+            all_action_labels.extend(action_labels[action_name])
+
+    # 汇总动作级指标
+    if all_action_labels:
+        report_lines.append("\n--- 总体动作级指标 ---")
+        overall_acc = accuracy_score(all_action_labels, all_action_preds)
+        overall_mae = mean_absolute_error(all_action_labels, all_action_preds)
+        overall_adj_acc = adjacent_accuracy(all_action_labels, all_action_preds)
+
+        report_lines.append(f"Overall Exact Accuracy: {overall_acc:.4f}")
+        report_lines.append(f"Overall Adjacent Accuracy (±1): {overall_adj_acc:.4f}")
+        report_lines.append(f"Overall MAE: {overall_mae:.4f}")
+
+        metrics['action_severity_acc'] = overall_acc
+        metrics['action_severity_adj_acc'] = overall_adj_acc
+        metrics['action_severity_mae'] = overall_mae
 
     # 保存报告
     report_text = '\n'.join(report_lines)
@@ -287,26 +379,24 @@ def generate_report(all_preds, all_labels, action_preds, action_labels, output_d
 
     print(report_text)
 
-    has_palsy_acc = accuracy_score(all_labels['has_palsy'], all_preds['has_palsy'])
-    palsy_side_acc = accuracy_score(all_labels['palsy_side'], all_preds['palsy_side'])
-    hb_grade_acc = accuracy_score(all_labels['hb_grade'], all_preds['hb_grade'])
+    # 确保 metrics 里的数值都是 Python 原生 float，避免 json.dump 报错
+    clean_metrics = {}
+    for k, v in metrics.items():
+        # numpy 标量 / torch 标量都转成 float
+        if isinstance(v, (np.generic, np.floating)):
+            clean_metrics[k] = float(v)
+        else:
+            clean_metrics[k] = v
 
-    return {
-        'has_palsy_acc': float(has_palsy_acc),
-        'palsy_side_acc': float(palsy_side_acc),
-        'hb_grade_acc': float(hb_grade_acc),
-        'sunnybrook_mae': float(mae),
-        # 既然上面算了，可以顺便把 rmse、r2 也一起存进去
-        'sunnybrook_rmse': float(rmse),
-        'sunnybrook_r2': float(r2),
-    }
+    return clean_metrics
+
 
 def run_single_fold(args):
-    """评估单个 fold 的主流程"""
+    """评估单个fold"""
     device = get_device()
 
     print("=" * 60)
-    print("H-GFA Net 层级多任务评估")
+    print("H-GFA Net 灵活配置评估")
     print("=" * 60)
     print(f"Device: {device}")
     print(f"Fold: {args.fold}")
@@ -316,7 +406,7 @@ def run_single_fold(args):
     checkpoint_path = Path(args.checkpoint_dir) / f"fold_{args.fold}" / f"{args.checkpoint_type}.pth"
     if not checkpoint_path.exists():
         print(f"错误: 检查点不存在 - {checkpoint_path}")
-        return
+        return None
 
     # 输出目录
     output_dir = Path(args.output_dir) / f"fold_{args.fold}"
@@ -325,8 +415,17 @@ def run_single_fold(args):
     # 加载模型
     print(f"\n加载模型...")
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    config = checkpoint.get('config')
 
-    model = HGFANet(config=checkpoint.get('config')).to(device)
+    if config is None:
+        print("警告: 检查点中没有config，使用默认配置")
+        config = HGFANet.get_default_config()
+
+    ordinal_method = config.get('ordinal_method', 'standard')
+    print(f"序数分类方法: {ordinal_method}")
+    print(f"启用特征: {config.get('enabled_features', ['wrinkle'])}")
+
+    model = HGFANet(config=config).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
@@ -344,7 +443,7 @@ def run_single_fold(args):
 
     if len(val_dataset) == 0:
         print("错误: 验证集为空！")
-        return
+        return None
 
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
@@ -353,17 +452,20 @@ def run_single_fold(args):
 
     # 评估
     print(f"\n开始评估 Fold {args.fold} ...")
-    all_preds, all_labels, action_preds, action_labels, attn_weights = evaluate_model(
-        model, val_loader, device
+    all_preds, all_labels, action_preds, action_labels = evaluate_model(
+        model, val_loader, device, ordinal_method
     )
 
     # 生成报告
-    metrics = generate_report(all_preds, all_labels, action_preds, action_labels, output_dir)
+    metrics = generate_report(
+        all_preds, all_labels, action_preds, action_labels,
+        output_dir, ordinal_method
+    )
 
-    # 绘制混淆矩阵
+    # 绘制可视化
     print(f"\n生成可视化...")
 
-    # Has Palsy
+    # Has Palsy混淆矩阵
     plot_confusion_matrix(
         all_labels['has_palsy'], all_preds['has_palsy'],
         ['No Palsy', 'Palsy'],
@@ -371,7 +473,7 @@ def run_single_fold(args):
         output_dir / 'cm_has_palsy.png'
     )
 
-    # Palsy Side
+    # Palsy Side混淆矩阵
     plot_confusion_matrix(
         all_labels['palsy_side'], all_preds['palsy_side'],
         ['None', 'Left', 'Right'],
@@ -379,12 +481,12 @@ def run_single_fold(args):
         output_dir / 'cm_palsy_side.png'
     )
 
-    # HB Grade
-    plot_confusion_matrix(
+    # HB Grade序数分析
+    plot_ordinal_analysis(
         all_labels['hb_grade'], all_preds['hb_grade'],
-        [f'G{i+1}' for i in range(6)],
-        'HB Grade Confusion Matrix',
-        output_dir / 'cm_hb_grade.png'
+        num_classes=6,
+        title='HB Grade Ordinal Analysis',
+        output_path=output_dir / 'ordinal_hb_grade.png'
     )
 
     # Sunnybrook散点图
@@ -394,21 +496,35 @@ def run_single_fold(args):
         output_dir / 'scatter_sunnybrook.png'
     )
 
-    # 注意力热力图
-    plot_attention_heatmap(attn_weights, output_dir / 'attention_heatmap.png')
+    # 汇总动作级序数分析
+    all_action_preds = []
+    all_action_labels = []
+    for action_name in HGFANet.ACTION_NAMES:
+        all_action_preds.extend(action_preds[action_name])
+        all_action_labels.extend(action_labels[action_name])
+
+    if all_action_labels:
+        plot_ordinal_analysis(
+            all_action_labels, all_action_preds,
+            num_classes=5,
+            title='Action Severity Ordinal Analysis',
+            output_path=output_dir / 'ordinal_action_severity.png'
+        )
 
     # 保存指标
     with open(output_dir / 'metrics.json', 'w') as f:
         json.dump(metrics, f, indent=2)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Fold {args.fold} 评估完成！")
     print(f"结果保存到: {output_dir}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
+
+    return metrics
 
 
 def main(args=None):
-    """支持单 fold / 多 fold 评估的入口"""
+    """主入口"""
     if args is None:
         parser = argparse.ArgumentParser()
         parser.add_argument('--db_path', type=str, default=DB_PATH)
@@ -421,14 +537,46 @@ def main(args=None):
         args = parser.parse_args()
 
     if args.fold < 0:
-        # 自动评估所有 fold
+        # 评估所有fold并汇总
+        all_metrics = []
         for fold in range(N_FOLDS):
             print(f"\n================== 开始评估 Fold {fold} ==================\n")
             args_single = argparse.Namespace(**vars(args))
             args_single.fold = fold
-            run_single_fold(args_single)
+            metrics = run_single_fold(args_single)
+            if metrics:
+                all_metrics.append(metrics)
+
+        # 汇总结果
+        if all_metrics:
+            print("\n" + "=" * 60)
+            print("跨Fold汇总结果")
+            print("=" * 60)
+
+            summary = {}
+            for key in all_metrics[0].keys():
+                values = [m[key] for m in all_metrics if key in m]
+
+                # 先把 values 里也都转成普通 float，保证干净
+                values_clean = [float(v) for v in values]
+
+                mean_v = float(np.mean(values_clean))
+                std_v = float(np.std(values_clean))
+
+                summary[key] = {
+                    'mean': mean_v,
+                    'std': std_v,
+                    'values': values_clean,
+                }
+                print(f"{key}: {mean_v:.4f} ± {std_v:.4f}")
+
+            # 保存汇总
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with open(output_dir / 'summary.json', 'w') as f:
+                json.dump(summary, f, indent=2)
+
     else:
-        # 只评估指定 fold
         run_single_fold(args)
 
 

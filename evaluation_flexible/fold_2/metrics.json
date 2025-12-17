@@ -1,0 +1,13 @@
+{
+  "has_palsy_acc": 0.7083333333333334,
+  "palsy_side_acc": 0.4583333333333333,
+  "hb_grade_acc": 0.16666666666666666,
+  "hb_grade_adj_acc": 0.3333333333333333,
+  "hb_grade_mae": 1.5,
+  "sunnybrook_mae": 30.262481689453125,
+  "sunnybrook_rmse": 32.46371078491211,
+  "sunnybrook_r2": -0.08751679494024867,
+  "action_severity_acc": 0.3269961977186312,
+  "action_severity_adj_acc": 0.42585551330798477,
+  "action_severity_mae": 1.6806083650190113
+}

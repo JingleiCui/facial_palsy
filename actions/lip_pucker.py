@@ -1,115 +1,114 @@
 """
-噘嘴动作 (LipPucker)
-与静息帧对比，计算嘴部前伸程度
+LipPucker - 撅嘴 (Sunnybrook B5)
 """
+
 import numpy as np
-from .base_action import BaseAction
-from ..core.geometry_utils import *
+from typing import Dict, List, Optional, Any
+import cv2
+
+from .base_action import BaseAction, NeutralBaseline
+from ..core.geometry_utils import (
+    LM, compute_icd, measure_oral, measure_nlf,
+    pts2d, pt2d, dist
+)
 
 
 class LipPuckerAction(BaseAction):
-    """噘嘴动作"""
+    """撅嘴动作 (Sunnybrook随意运动B5)"""
 
-    def detect_peak_frame(self, landmarks_seq, w, h):
-        """
-        检测峰值帧: 嘴部高度最大
-        """
-        valid_indices = [i for i, lm in enumerate(landmarks_seq) if lm is not None]
-        if not valid_indices:
-            return 0
+    ACTION_NAME = "LipPucker"
+    ACTION_NAME_CN = "撅嘴"
 
-        max_height_normalized = 0
-        peak_idx = valid_indices[0]
+    def find_peak_frame(
+            self,
+            landmarks_seq: List,
+            w: int, h: int,
+            **kwargs
+    ) -> int:
+        """找嘴宽最小帧 (撅嘴时嘴收缩)"""
+        min_width = float('inf')
+        min_idx = 0
 
-        for idx in valid_indices:
-            lm = landmarks_seq[idx]
-            unit_length = get_unit_length(lm, w, h)
-            mouth_h = get_mouth_height(lm, w, h) / unit_length
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
 
-            if mouth_h > max_height_normalized:
-                max_height_normalized = mouth_h
-                peak_idx = idx
+            l_corner = pt2d(lm[LM.MOUTH_L], w, h)
+            r_corner = pt2d(lm[LM.MOUTH_R], w, h)
+            mouth_width = dist(l_corner, r_corner)
 
-        return peak_idx
+            if mouth_width < min_width:
+                min_width = mouth_width
+                min_idx = i
 
-    def extract_indicators(self, landmarks, w, h, neutral_indicators=None):
-        """
-        提取噘嘴指标，并与静息帧对比
-        """
-        indicators = {}
+        return min_idx
 
-        # === 一级指标：当前状态 ===
+    def extract_indicators(
+            self,
+            landmarks,
+            w: int, h: int,
+            neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
+        """提取撅嘴指标"""
+        icd = compute_icd(landmarks, w, h)
+        oral = measure_oral(landmarks, w, h, icd)
 
-        indicators['mouth_width'] = get_mouth_width(landmarks, w, h)
-        indicators['mouth_height'] = get_mouth_height(landmarks, w, h)
-        indicators['mouth_area'] = get_mouth_area(landmarks, w, h)
+        # 嘴宽变化 (撅嘴时应该变窄)
+        baseline_mouth_width = neutral_baseline.mouth_width if neutral_baseline else None
+        if baseline_mouth_width is not None and baseline_mouth_width > 1e-6:
+            width_change = (baseline_mouth_width - oral.mouth_width) / icd  # 正=收缩
+            contraction_ratio = 1.0 - (oral.mouth_width / baseline_mouth_width)  # 收缩百分比
+        else:
+            width_change = 0.0
+            contraction_ratio = 0.0
 
-        # 唇部中心点
-        upper_lip_center = get_point(landmarks, UPPER_LIP_CENTER, w, h)
-        lower_lip_center = get_point(landmarks, LOWER_LIP_BOTTOM_CENTER, w, h)
+        contraction_ratio = max(0.0, contraction_ratio)
 
-        # 唇部到鼻尖距离（噘嘴时前伸）
-        nose_tip = get_point(landmarks, NOSE_TIP, w, h)
-        indicators['upper_lip_nose_dist'] = dist.euclidean(upper_lip_center, nose_tip)
-        indicators['lower_lip_nose_dist'] = dist.euclidean(lower_lip_center, nose_tip)
+        # 口角对称性
+        function_pct = 1.0 - min(1.0, abs(oral.height_diff) * 5)
+        function_pct = max(0.0, function_pct)
 
-        # 嘴角到中心距离
-        mouth_left = get_point(landmarks, MOUTH_CORNER_LEFT, w, h)
-        mouth_right = get_point(landmarks, MOUTH_CORNER_RIGHT, w, h)
-        mouth_center_x = (mouth_left[0] + mouth_right[0]) / 2
-        mouth_center_y = (mouth_left[1] + mouth_right[1]) / 2
-        mouth_center = (mouth_center_x, mouth_center_y)
+        return {
+            'mouth_width': oral.mouth_width,
+            'mouth_height': oral.mouth_height,
+            'mouth_width_norm': oral.mouth_width / icd if icd > 0 else 0,
+            'mouth_height_norm': oral.mouth_height / icd if icd > 0 else 0,
+            'width_change': width_change,
+            'contraction_ratio': contraction_ratio,
+            'oral_height_diff': oral.height_diff,
+            'left_oral_angle': oral.left_angle,
+            'right_oral_angle': oral.right_angle,
+            'function_pct': function_pct,
+            'icd': icd,
+        }
 
-        indicators['mouth_left_center_dist'] = dist.euclidean(mouth_left, mouth_center)
-        indicators['mouth_right_center_dist'] = dist.euclidean(mouth_right, mouth_center)
+    def visualize_peak_frame(
+            self,
+            frame: np.ndarray,
+            landmarks,
+            indicators: Dict,
+            w: int, h: int
+    ) -> np.ndarray:
+        img = frame.copy()
 
-        # 唇部面积
-        indicators['upper_lip_left_area'] = get_lip_area(landmarks, w, h, upper=True, left=True)
-        indicators['upper_lip_right_area'] = get_lip_area(landmarks, w, h, upper=True, left=False)
+        # 绘制嘴部
+        l_corner = tuple(map(int, pt2d(landmarks[LM.MOUTH_L], w, h)))
+        r_corner = tuple(map(int, pt2d(landmarks[LM.MOUTH_R], w, h)))
+        cv2.circle(img, l_corner, 5, (255, 0, 0), -1)
+        cv2.circle(img, r_corner, 5, (0, 165, 255), -1)
+        cv2.line(img, l_corner, r_corner, (0, 255, 0), 2)
 
-        # === 二级指标：与静息帧对比 ===
+        # 文字
+        y = 30
+        cv2.putText(img, f"{self.ACTION_NAME}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        y += 35
+        cv2.putText(img, f"Mouth Width: {indicators.get('mouth_width_norm', 0):.3f}",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        y += 25
+        cv2.putText(img, f"Contraction: {indicators.get('contraction_ratio', 0):.1%}",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        y += 25
+        cv2.putText(img, f"Height Diff: {indicators.get('oral_height_diff', 0):.3f}",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        if neutral_indicators:
-            # 嘴部尺寸变化
-            indicators['mouth_width_change'] = (indicators['mouth_width'] -
-                                               neutral_indicators['mouth_width'])
-            indicators['mouth_height_change'] = (indicators['mouth_height'] -
-                                                neutral_indicators['mouth_height'])
-
-            # 噘嘴程度（宽度减小，高度增加）
-            indicators['pucker_width_ratio'] = (indicators['mouth_width'] /
-                                               (neutral_indicators['mouth_width'] + 1e-6))
-            indicators['pucker_height_ratio'] = (indicators['mouth_height'] /
-                                                (neutral_indicators['mouth_height'] + 1e-6))
-
-            # 唇部前伸度（鼻唇距减小）
-            indicators['upper_lip_protrusion'] = (neutral_indicators['nose_upper_lip_dist'] -
-                                                 indicators['upper_lip_nose_dist'])
-
-            # 嘴角收缩度
-            indicators['mouth_corner_retraction_left'] = (neutral_indicators['mouth_width'] / 2 -
-                                                          indicators['mouth_left_center_dist'])
-            indicators['mouth_corner_retraction_right'] = (neutral_indicators['mouth_width'] / 2 -
-                                                           indicators['mouth_right_center_dist'])
-
-            # 对称性
-            if indicators['mouth_corner_retraction_right'] != 0:
-                indicators['corner_retraction_ratio'] = (indicators['mouth_corner_retraction_left'] /
-                                                          indicators['mouth_corner_retraction_right'])
-            else:
-                indicators['corner_retraction_ratio'] = 1.0
-
-        # === 二级指标：当前状态对称性 ===
-
-        indicators['upper_lip_area_ratio'] = (indicators['upper_lip_left_area'] /
-                                             (indicators['upper_lip_right_area'] + 1e-6))
-
-        # 嘴角高度差
-        indicators['mouth_corner_height_diff'] = abs(mouth_left[1] - mouth_right[1])
-
-        # 形状对称性
-        upper_lip_left_points = get_points(landmarks, UPPER_LIP_LEFT_POINTS, w, h)
-        upper_lip_right_points = get_points(landmarks, UPPER_LIP_RIGHT_POINTS, w, h)
-        indicators['upper_lip_shape_disparity'] = get_shape_disparity(upper_lip_left_points, upper_lip_right_points)
-
-        return indicators
+        return img

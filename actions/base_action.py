@@ -1,195 +1,270 @@
 """
-动作基类 - 统一的处理流程，支持与静息帧对比
+动作基类 (Base Action)
+======================
+
+所有11个动作的基类，定义统一接口和通用功能
+
+核心设计:
+1. 每个动作都有 process() 方法处理视频序列
+2. 每个动作都有 find_peak_frame() 方法找关键帧
+3. 每个动作返回统一格式的 ActionResult
 """
-from abc import ABC, abstractmethod
+
 import numpy as np
-from facialPalsy.core.geometry_utils import *
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, Tuple
+import cv2
+
+
+@dataclass
+class NeutralBaseline:
+    """NeutralFace基准数据"""
+    icd: float                     # 单位长度
+    left_eye_area: float           # 左眼裂面积
+    right_eye_area: float          # 右眼裂面积
+    left_palpebral_length: float   # 左眼睑裂长度
+    right_palpebral_length: float  # 右眼睑裂长度
+    left_brow_height: float        # 左眉眼距
+    right_brow_height: float       # 右眉眼距
+    mouth_width: float             # 嘴宽
+    mouth_height: float            # 嘴高
+    left_nlf_length: float         # 左鼻唇沟长度
+    right_nlf_length: float        # 右鼻唇沟长度
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> 'NeutralBaseline':
+        """从字典创建"""
+        return cls(
+            icd=d.get('icd', 0),
+            left_eye_area=d.get('left_eye_area', 0),
+            right_eye_area=d.get('right_eye_area', 0),
+            left_palpebral_length=d.get('left_palpebral_length', 0),
+            right_palpebral_length=d.get('right_palpebral_length', 0),
+            left_brow_height=d.get('left_brow_height', 0),
+            right_brow_height=d.get('right_brow_height', 0),
+            mouth_width=d.get('mouth_width', 0),
+            mouth_height=d.get('mouth_height', 0),
+            left_nlf_length=d.get('left_nlf_length', 0),
+            right_nlf_length=d.get('right_nlf_length', 0),
+        )
+
+    def to_dict(self) -> Dict:
+        """转为字典"""
+        return {
+            'icd': self.icd,
+            'left_eye_area': self.left_eye_area,
+            'right_eye_area': self.right_eye_area,
+            'left_palpebral_length': self.left_palpebral_length,
+            'right_palpebral_length': self.right_palpebral_length,
+            'left_brow_height': self.left_brow_height,
+            'right_brow_height': self.right_brow_height,
+            'mouth_width': self.mouth_width,
+            'mouth_height': self.mouth_height,
+            'left_nlf_length': self.left_nlf_length,
+            'right_nlf_length': self.right_nlf_length,
+        }
+
+
+@dataclass
+class ActionResult:
+    """动作处理结果"""
+    action_name: str                        # 动作名称
+    peak_frame_idx: int                     # 峰值帧索引
+    peak_frame: np.ndarray                  # 峰值帧图像
+    unit_length: float                      # 单位长度 (ICD)
+
+    # 核心指标
+    indicators: Dict[str, float] = field(default_factory=dict)
+
+    # 归一化指标 (用于模型训练)
+    normalized_indicators: Dict[str, float] = field(default_factory=dict)
+
+    # 动态特征 (时序信息)
+    dynamic_features: Dict[str, float] = field(default_factory=dict)
+    normalized_dynamic_features: Dict[str, float] = field(default_factory=dict)
+
+    # 可解释性数据 (用于可视化)
+    interpretability: Dict[str, Any] = field(default_factory=dict)
+
+    # 睁眼度曲线 (用于眼部相关动作)
+    left_openness_curve: Optional[np.ndarray] = None
+    right_openness_curve: Optional[np.ndarray] = None
 
 
 class BaseAction(ABC):
     """动作基类"""
 
-    def __init__(self, action_name=None, action_config=None):
-        """
-        初始化
+    # 子类必须定义
+    ACTION_NAME: str = "BaseAction"
+    ACTION_NAME_CN: str = "基础动作"
 
-        Args:
-            action_name: 动作名称（英文）
-            action_config: 动作配置字典
-        """
-        # 1) 自动推一个英文名: NeutralFaceAction -> "NeutralFace"
-        if action_name is None:
-            cls_name = self.__class__.__name__
-            if cls_name.endswith("Action"):
-                action_name = cls_name[:-6]
-            self.action_name = action_name
-        else:
-            self.action_name = action_name
-
-        # 2) 如果没提供配置，就给一个兜底配置
-        if action_config is None:
-            action_config = {
-                # 你现在 pipeline 又不用 BaseAction.action_id，
-                # 所以先给 None 占位即可
-                "action_id": None,
-                # 中文名先用英文名占位，将来要的话再从 config 表里读
-                "name_cn": self.action_name,
-            }
-
-        self.action_config = action_config
-        self.action_id = action_config['action_id']
-        self.name_cn = action_config['name_cn']
+    def __init__(self):
+        pass
 
     @abstractmethod
-    def detect_peak_frame(self, landmarks_seq, w, h):
+    def find_peak_frame(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        **kwargs
+    ) -> int:
         """
-        检测峰值帧 - 子类必须实现
+        找到峰值帧索引
 
-        注意：在比较时，临时计算unit_length并归一化
-
-        Args:
-            landmarks_seq: landmarks序列
-            w: 图像宽度
-            h: 图像高度
-
-        Returns:
-            int: 峰值帧索引
+        不同动作有不同的峰值定义:
+        - NeutralFace: 最大EAR帧
+        - CloseEye: 最小EAR帧
+        - Smile: 最大嘴宽帧
+        - RaiseEyebrow: 最大眉眼距帧
         """
         pass
 
     @abstractmethod
-    def extract_indicators(self, landmarks, w, h, neutral_indicators=None):
+    def extract_indicators(
+        self,
+        landmarks,
+        w: int, h: int,
+        neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
         """
-        提取指标 - 子类必须实现
+        从单帧提取指标
 
-        返回原始指标（像素值），并与静息帧对比（如果提供）
-
-        Args:
-            landmarks: MediaPipe face landmarks对象
-            w: 图像宽度
-            h: 图像高度
-            neutral_indicators: 静息帧的指标（原始像素值），用于对比
-
-        Returns:
-            dict: 原始指标字典
+        每个动作定义自己关注的指标
         """
         pass
 
-    def extract_dynamic_features(self, landmarks_seq, w, h, fps):
+    def extract_dynamic_features(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        fps: float = 30.0,
+        neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
         """
-        提取动态特征（可选，子类可重写）
+        提取动态特征 (默认实现，子类可覆盖)
+
+        返回:
+            motion_range_left/right: 运动范围
+            velocity_left/right: 平均速度
+            smoothness_left/right: 平滑度
+        """
+        # 默认返回空
+        return {}
+
+    def process(
+        self,
+        landmarks_seq: List,
+        frames_seq: List[np.ndarray],
+        w: int, h: int,
+        fps: float = 30.0,
+        neutral_indicators: Optional[Dict] = None
+    ) -> Optional[ActionResult]:
+        """
+        处理视频序列
 
         Args:
-            landmarks_seq: landmarks序列
-            w: 图像宽度
-            h: 图像高度
+            landmarks_seq: 关键点序列
+            frames_seq: 帧序列
+            w, h: 图像尺寸
             fps: 帧率
+            neutral_indicators: 静息帧指标 (用于其他动作对比)
 
         Returns:
-            dict: 动态特征字典
+            ActionResult 包含所有结果
         """
-        dynamic_features = {}
+        if not landmarks_seq or not frames_seq:
+            return None
 
-        valid_landmarks = [lm for lm in landmarks_seq if lm is not None]
+        # 1. 转换neutral_indicators为NeutralBaseline
+        neutral_baseline = None
+        if neutral_indicators is not None:
+            neutral_baseline = NeutralBaseline.from_dict(neutral_indicators)
 
-        if len(valid_landmarks) < 2:
-            return dynamic_features
+        # 2. 找峰值帧
+        peak_idx = self.find_peak_frame(
+            landmarks_seq, w, h,
+            neutral_baseline=neutral_baseline
+        )
+        peak_idx = max(0, min(peak_idx, len(landmarks_seq) - 1))
 
-        # 计算时序测量值
-        left_eye_openings = [get_eye_opening(lm, w, h, left=True)
-                            for lm in valid_landmarks]
-        right_eye_openings = [get_eye_opening(lm, w, h, left=False)
-                             for lm in valid_landmarks]
-        mouth_widths = [get_mouth_width(lm, w, h)
-                       for lm in valid_landmarks]
-        eyebrow_dists_left = [get_eyebrow_eye_distance(lm, w, h, left=True)
-                             for lm in valid_landmarks]
-
-        # 运动范围（原始像素值）
-        dynamic_features['left_eye_motion_range'] = compute_motion_range(left_eye_openings)
-        dynamic_features['right_eye_motion_range'] = compute_motion_range(right_eye_openings)
-        dynamic_features['mouth_motion_range'] = compute_motion_range(mouth_widths)
-        dynamic_features['eyebrow_motion_range'] = compute_motion_range(eyebrow_dists_left)
-
-        # 平均速度（原始像素/秒）
-        dynamic_features['left_eye_mean_velocity'] = compute_mean_velocity(left_eye_openings, fps)
-        dynamic_features['right_eye_mean_velocity'] = compute_mean_velocity(right_eye_openings, fps)
-        dynamic_features['mouth_mean_velocity'] = compute_mean_velocity(mouth_widths, fps)
-        dynamic_features['eyebrow_mean_velocity'] = compute_mean_velocity(eyebrow_dists_left, fps)
-
-        # 最大速度（原始像素/秒）
-        dynamic_features['left_eye_max_velocity'] = compute_max_velocity(left_eye_openings, fps)
-        dynamic_features['right_eye_max_velocity'] = compute_max_velocity(right_eye_openings, fps)
-        dynamic_features['mouth_max_velocity'] = compute_max_velocity(mouth_widths, fps)
-        dynamic_features['eyebrow_max_velocity'] = compute_max_velocity(eyebrow_dists_left, fps)
-
-        # 平滑度（jerk，无单位）
-        dynamic_features['left_eye_smoothness'] = compute_smoothness(left_eye_openings)
-        dynamic_features['right_eye_smoothness'] = compute_smoothness(right_eye_openings)
-        dynamic_features['mouth_smoothness'] = compute_smoothness(mouth_widths)
-        dynamic_features['eyebrow_smoothness'] = compute_smoothness(eyebrow_dists_left)
-
-        return dynamic_features
-
-    def process(self, landmarks_seq, frames_seq, w, h, fps, neutral_indicators=None):
-        """
-        完整处理流程
-
-        Args:
-            landmarks_seq: landmarks序列
-            frames_seq: frames序列
-            w: 图像宽度
-            h: 图像高度
-            fps: 帧率
-            neutral_indicators: 静息帧的指标（原始像素值），用于对比
-
-        Returns:
-            dict: {
-                'peak_frame_idx': int,
-                'peak_frame': np.ndarray,
-                'peak_landmarks': landmarks,
-                'unit_length': float,
-                'raw_indicators': dict,
-                'normalized_indicators': dict,
-                'dynamic_features': dict,
-                'normalized_dynamic_features': dict
-            }
-        """
-        # 1. 检测峰值帧
-        peak_idx = self.detect_peak_frame(landmarks_seq, w, h)
-
-        # 2. 获取峰值帧
         peak_landmarks = landmarks_seq[peak_idx]
-        peak_frame = frames_seq[peak_idx]
+        peak_frame = frames_seq[peak_idx].copy()
 
         if peak_landmarks is None:
             return None
 
-        # 3. 计算单位长度
-        unit_length = get_unit_length(peak_landmarks, w, h)
+        # 3. 提取峰值帧指标
+        indicators = self.extract_indicators(
+            peak_landmarks, w, h, neutral_baseline
+        )
 
-        # 4. 提取原始指标（可能包含与静息帧的对比）
-        raw_indicators = self.extract_indicators(peak_landmarks, w, h, neutral_indicators)
+        # 4. 提取动态特征
+        dynamic_features = self.extract_dynamic_features(
+            landmarks_seq, w, h, fps, neutral_baseline
+        )
 
-        # 5. 统一归一化静态指标
-        normalized_indicators = normalize_indicators(raw_indicators, unit_length)
+        # 5. 获取单位长度
+        from .geometry import compute_icd
+        icd = compute_icd(peak_landmarks, w, h)
 
-        # 6. 提取动态特征
-        dynamic_features = self.extract_dynamic_features(landmarks_seq, w, h, fps)
+        # 6. 归一化指标 (已经是归一化的，直接复制)
+        normalized_indicators = indicators.copy()
+        normalized_dynamic_features = dynamic_features.copy()
 
-        # 7. 归一化动态特征
-        normalized_dynamic_features = normalize_indicators(dynamic_features, unit_length)
+        # 7. 构建可解释性数据
+        interpretability = self._build_interpretability(
+            landmarks_seq, w, h,
+            peak_idx, indicators,
+            neutral_baseline
+        )
 
+        return ActionResult(
+            action_name=self.ACTION_NAME,
+            peak_frame_idx=peak_idx,
+            peak_frame=peak_frame,
+            unit_length=icd,
+            indicators=indicators,
+            normalized_indicators=normalized_indicators,
+            dynamic_features=dynamic_features,
+            normalized_dynamic_features=normalized_dynamic_features,
+            interpretability=interpretability,
+            left_openness_curve=interpretability.get('left_openness_curve'),
+            right_openness_curve=interpretability.get('right_openness_curve'),
+        )
+
+    def _build_interpretability(
+        self,
+        landmarks_seq: List,
+        w: int, h: int,
+        peak_idx: int,
+        indicators: Dict,
+        neutral_baseline: Optional[NeutralBaseline]
+    ) -> Dict[str, Any]:
+        """
+        构建可解释性数据 (子类可覆盖扩展)
+        """
         return {
             'peak_frame_idx': peak_idx,
-            'peak_frame': peak_frame,
-            'peak_landmarks': peak_landmarks,
-            'unit_length': unit_length,
-            'raw_indicators': raw_indicators,
-            'normalized_indicators': normalized_indicators,
-            'dynamic_features': dynamic_features,
-            'normalized_dynamic_features': normalized_dynamic_features
+            'total_frames': len(landmarks_seq),
         }
 
-    def __str__(self):
-        return f"{self.action_name} ({self.name_cn})"
+    def visualize_peak_frame(
+        self,
+        frame: np.ndarray,
+        landmarks,
+        indicators: Dict,
+        w: int, h: int
+    ) -> np.ndarray:
+        """
+        在峰值帧上绘制可视化标注
+
+        子类应该覆盖此方法添加动作特定的可视化
+        """
+        img = frame.copy()
+
+        # 绘制动作名称
+        cv2.putText(img, f"{self.ACTION_NAME}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        return img

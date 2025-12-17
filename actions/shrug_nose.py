@@ -1,128 +1,125 @@
 """
-耸鼻动作 (ShrugNose)
-与静息帧对比，计算上唇上提和鼻翼变化
+ShrugNose - 皱鼻 (Sunnybrook B4)
 """
+
 import numpy as np
-from .base_action import BaseAction
-from ..core.geometry_utils import *
+from typing import Dict, List, Optional, Any
+import cv2
+
+from .base_action import BaseAction, NeutralBaseline
+from ..core.geometry_utils import (
+    LM, compute_icd, measure_oral, measure_nlf,
+    pts2d, pt2d, dist
+)
 
 
 class ShrugNoseAction(BaseAction):
-    """耸鼻动作"""
+    """皱鼻动作 (Sunnybrook随意运动B4)"""
 
-    def detect_peak_frame(self, landmarks_seq, w, h):
-        """
-        检测峰值帧: 上唇上提最大
-        """
-        valid_indices = [i for i, lm in enumerate(landmarks_seq) if lm is not None]
-        if not valid_indices:
-            return 0
+    ACTION_NAME = "ShrugNose"
+    ACTION_NAME_CN = "皱鼻"
 
-        # 以第一帧为基准
-        baseline_lm = landmarks_seq[valid_indices[0]]
-        baseline_upper_lip = get_point(baseline_lm, UPPER_LIP_CENTER, w, h)[1]
-        baseline_unit = get_unit_length(baseline_lm, w, h)
+    def find_peak_frame(
+            self,
+            landmarks_seq: List,
+            w: int, h: int,
+            **kwargs
+    ) -> int:
+        """找鼻唇距最小帧 (皱鼻时鼻子和上唇接近)"""
+        min_dist = float('inf')
+        min_idx = 0
 
-        max_lift_normalized = 0
-        peak_idx = valid_indices[0]
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
 
-        for idx in valid_indices[1:]:
-            lm = landmarks_seq[idx]
-            current_upper_lip = get_point(lm, UPPER_LIP_CENTER, w, h)[1]
-            current_unit = get_unit_length(lm, w, h)
+            nose_tip = pt2d(lm[LM.NOSE_TIP], w, h)
+            lip_top = pt2d(lm[LM.LIP_TOP], w, h)
+            nose_lip_dist = dist(nose_tip, lip_top)
 
-            lift = (baseline_upper_lip - current_upper_lip) / current_unit
+            if nose_lip_dist < min_dist:
+                min_dist = nose_lip_dist
+                min_idx = i
 
-            if lift > max_lift_normalized:
-                max_lift_normalized = lift
-                peak_idx = idx
+        return min_idx
 
-        return peak_idx
+    def extract_indicators(
+            self,
+            landmarks,
+            w: int, h: int,
+            neutral_baseline: Optional[NeutralBaseline] = None
+    ) -> Dict[str, float]:
+        """提取皱鼻指标"""
+        icd = compute_icd(landmarks, w, h)
 
-    def extract_indicators(self, landmarks, w, h, neutral_indicators=None):
-        """
-        提取耸鼻指标，并与静息帧对比
-        """
-        indicators = {}
+        # 鼻唇距
+        nose_tip = pt2d(landmarks[LM.NOSE_TIP], w, h)
+        lip_top = pt2d(landmarks[LM.LIP_TOP], w, h)
+        nose_lip_dist = dist(nose_tip, lip_top)
+        nose_lip_dist_norm = nose_lip_dist / icd if icd > 0 else 0
 
-        # === 一级指标：当前状态 ===
+        # 鼻唇沟
+        nlf = measure_nlf(landmarks, w, h, icd)
 
-        # 上唇位置
-        upper_lip_center = get_point(landmarks, UPPER_LIP_CENTER, w, h)
-        upper_lip_bottom = get_point(landmarks, UPPER_LIP_BOTTOM_CENTER, w, h)
-        indicators['upper_lip_y'] = upper_lip_center[1]
-        indicators['upper_lip_bottom_y'] = upper_lip_bottom[1]
+        # 上唇上提量
+        baseline_mouth_height = neutral_baseline.mouth_height if neutral_baseline else None
+        oral = measure_oral(landmarks, w, h, icd)
 
-        # 鼻尖和上唇距离
-        nose_tip = get_point(landmarks, NOSE_TIP, w, h)
-        indicators['nose_upper_lip_dist'] = dist.euclidean(nose_tip, upper_lip_center)
+        if baseline_mouth_height is not None and baseline_mouth_height > 1e-6:
+            lip_lift = (baseline_mouth_height - oral.mouth_height) / icd
+        else:
+            lip_lift = 0.0
 
-        # 鼻翼宽度（耸鼻时可能变化）
-        nose_left = get_point(landmarks, 392, w, h)
-        nose_right = get_point(landmarks, 166, w, h)
-        indicators['nose_width'] = dist.euclidean(nose_left, nose_right)
+        # 功能百分比
+        # 皱鼻主要看鼻唇沟的变化
+        if nlf.right_length > 1e-6:
+            function_pct = min(nlf.left_length, nlf.right_length) / max(nlf.left_length, nlf.right_length)
+        else:
+            function_pct = 1.0
 
-        # 上唇高度
-        indicators['upper_lip_height'] = abs(upper_lip_center[1] - upper_lip_bottom[1])
+        return {
+            'nose_lip_dist': nose_lip_dist,
+            'nose_lip_dist_norm': nose_lip_dist_norm,
+            'left_nlf_length_norm': nlf.left_length_norm,
+            'right_nlf_length_norm': nlf.right_length_norm,
+            'nlf_length_ratio': nlf.length_ratio,
+            'lip_lift': lip_lift,
+            'function_pct': function_pct,
+            'icd': icd,
+        }
 
-        # 嘴部
-        mouth_left = get_point(landmarks, MOUTH_CORNER_LEFT, w, h)
-        mouth_right = get_point(landmarks, MOUTH_CORNER_RIGHT, w, h)
-        indicators['mouth_width'] = dist.euclidean(mouth_left, mouth_right)
-        indicators['mouth_height'] = get_mouth_height(landmarks, w, h)
+    def visualize_peak_frame(
+            self,
+            frame: np.ndarray,
+            landmarks,
+            indicators: Dict,
+            w: int, h: int
+    ) -> np.ndarray:
+        img = frame.copy()
 
-        # 唇部面积
-        indicators['upper_lip_left_area'] = get_lip_area(landmarks, w, h, upper=True, left=True)
-        indicators['upper_lip_right_area'] = get_lip_area(landmarks, w, h, upper=True, left=False)
+        # 绘制鼻唇距线
+        nose_tip = tuple(map(int, pt2d(landmarks[LM.NOSE_TIP], w, h)))
+        lip_top = tuple(map(int, pt2d(landmarks[LM.LIP_TOP], w, h)))
+        cv2.line(img, nose_tip, lip_top, (0, 255, 0), 2)
+        cv2.circle(img, nose_tip, 5, (255, 0, 0), -1)
+        cv2.circle(img, lip_top, 5, (0, 165, 255), -1)
 
-        # 鼻唇沟（用鼻翼到嘴角距离）
-        indicators['nose_mouth_left_dist'] = dist.euclidean(nose_left, mouth_left)
-        indicators['nose_mouth_right_dist'] = dist.euclidean(nose_right, mouth_right)
+        # 绘制鼻唇沟
+        l_ala = tuple(map(int, pt2d(landmarks[LM.NOSE_ALA_L], w, h)))
+        r_ala = tuple(map(int, pt2d(landmarks[LM.NOSE_ALA_R], w, h)))
+        l_mouth = tuple(map(int, pt2d(landmarks[LM.MOUTH_L], w, h)))
+        r_mouth = tuple(map(int, pt2d(landmarks[LM.MOUTH_R], w, h)))
+        cv2.line(img, l_ala, l_mouth, (255, 0, 0), 2)
+        cv2.line(img, r_ala, r_mouth, (0, 165, 255), 2)
 
-        # === 二级指标：与静息帧对比 ===
+        # 文字
+        y = 30
+        cv2.putText(img, f"{self.ACTION_NAME}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        y += 35
+        cv2.putText(img, f"Nose-Lip: {indicators.get('nose_lip_dist_norm', 0):.3f}",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        y += 25
+        cv2.putText(img, f"NLF Ratio: {indicators.get('nlf_length_ratio', 1):.3f}",
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        if neutral_indicators:
-            # 上唇上提幅度
-            indicators['upper_lip_lift'] = (neutral_indicators['upper_lip_y'] -
-                                           indicators['upper_lip_y'])
-            indicators['upper_lip_lift_pct'] = (indicators['upper_lip_lift'] /
-                                               (neutral_indicators['nose_upper_lip_dist'] + 1e-6))
-
-            # 鼻唇距变化
-            indicators['nose_lip_dist_change'] = (neutral_indicators['nose_upper_lip_dist'] -
-                                                 indicators['nose_upper_lip_dist'])
-
-            # 鼻翼宽度变化
-            indicators['nose_width_change'] = (indicators['nose_width'] -
-                                              neutral_indicators.get('nose_width', indicators['nose_width']))
-
-            # 上唇高度变化
-            indicators['upper_lip_height_change'] = (indicators['upper_lip_height'] -
-                                                     neutral_indicators.get('upper_lip_height', indicators['upper_lip_height']))
-
-            # 鼻唇沟深度变化
-            indicators['nasolabial_fold_left_change'] = (indicators['nose_mouth_left_dist'] -
-                                                          neutral_indicators['nose_mouth_left_dist'])
-            indicators['nasolabial_fold_right_change'] = (indicators['nose_mouth_right_dist'] -
-                                                           neutral_indicators['nose_mouth_right_dist'])
-
-            # 对称性评估
-            if indicators['nasolabial_fold_right_change'] != 0:
-                indicators['nasolabial_change_ratio'] = (indicators['nasolabial_fold_left_change'] /
-                                                          indicators['nasolabial_fold_right_change'])
-            else:
-                indicators['nasolabial_change_ratio'] = 1.0
-
-        # === 二级指标：当前状态对称性 ===
-
-        indicators['upper_lip_area_ratio'] = (indicators['upper_lip_left_area'] /
-                                             (indicators['upper_lip_right_area'] + 1e-6))
-        indicators['nasolabial_fold_ratio'] = (indicators['nose_mouth_left_dist'] /
-                                               (indicators['nose_mouth_right_dist'] + 1e-6))
-
-        # 形状对称性
-        upper_lip_left_points = get_points(landmarks, UPPER_LIP_LEFT_POINTS, w, h)
-        upper_lip_right_points = get_points(landmarks, UPPER_LIP_RIGHT_POINTS, w, h)
-        indicators['upper_lip_shape_disparity'] = get_shape_disparity(upper_lip_left_points, upper_lip_right_points)
-
-        return indicators
+        return img

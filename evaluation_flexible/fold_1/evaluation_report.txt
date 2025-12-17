@@ -1,0 +1,120 @@
+============================================================
+H-GFA Net 灵活配置评估报告
+序数分类方法: coral
+============================================================
+
+============================================================
+检查级任务 (Session-Level)
+============================================================
+
+--- 是否面瘫 (Has Palsy) ---
+Accuracy: 0.5263
+Precision: 0.2770
+Recall: 0.5263
+F1-Score: 0.3630
+
+--- 面瘫侧别 (Palsy Side) ---
+Accuracy: 0.3158
+Precision: 0.3363
+Recall: 0.3158
+F1-Score: 0.2021
+
+--- HB分级 (HB Grade) [序数任务] ---
+Exact Accuracy: 0.1053
+Adjacent Accuracy (±1): 0.2632
+MAE: 1.6316
+
+分类报告:
+              precision    recall  f1-score   support
+
+     Grade 1       0.00      0.00      0.00         9
+     Grade 2       0.00      0.00      0.00         0
+     Grade 3       0.11      1.00      0.19         2
+     Grade 4       0.00      0.00      0.00         3
+     Grade 5       0.00      0.00      0.00         5
+     Grade 6       0.00      0.00      0.00         0
+
+    accuracy                           0.11        19
+   macro avg       0.02      0.17      0.03        19
+weighted avg       0.01      0.11      0.02        19
+
+
+--- Sunnybrook分数 (回归) ---
+MAE: 31.85
+RMSE: 33.38
+R²: 0.1064
+
+============================================================
+动作级任务 (Action-Level) [序数任务]
+============================================================
+
+--- NeutralFace ---
+Exact Accuracy: 0.5000
+Adjacent Accuracy (±1): 0.7778
+MAE: 0.7222
+Samples: 18
+
+--- Smile ---
+Exact Accuracy: 0.5000
+Adjacent Accuracy (±1): 0.5556
+MAE: 1.0556
+Samples: 18
+
+--- RaiseEyebrow ---
+Exact Accuracy: 0.4444
+Adjacent Accuracy (±1): 0.5000
+MAE: 1.4444
+Samples: 18
+
+--- CloseEyeHardly ---
+Exact Accuracy: 0.6316
+Adjacent Accuracy (±1): 0.7895
+MAE: 0.7895
+Samples: 19
+
+--- CloseEyeSoftly ---
+Exact Accuracy: 0.6316
+Adjacent Accuracy (±1): 0.6842
+MAE: 1.0000
+Samples: 19
+
+--- BlowCheek ---
+Exact Accuracy: 0.4444
+Adjacent Accuracy (±1): 0.4444
+MAE: 1.4444
+Samples: 18
+
+--- LipPucker ---
+Exact Accuracy: 0.4118
+Adjacent Accuracy (±1): 0.4706
+MAE: 1.4706
+Samples: 17
+
+--- ShowTeeth ---
+Exact Accuracy: 0.4444
+Adjacent Accuracy (±1): 0.5556
+MAE: 1.2222
+Samples: 18
+
+--- ShrugNose ---
+Exact Accuracy: 0.4444
+Adjacent Accuracy (±1): 0.5000
+MAE: 1.3333
+Samples: 18
+
+--- SpontaneousEyeBlink ---
+Exact Accuracy: 0.5789
+Adjacent Accuracy (±1): 0.7368
+MAE: 0.8947
+Samples: 19
+
+--- VoluntaryEyeBlink ---
+Exact Accuracy: 0.6842
+Adjacent Accuracy (±1): 0.7895
+MAE: 0.5263
+Samples: 19
+
+--- 总体动作级指标 ---
+Overall Exact Accuracy: 0.5224
+Overall Adjacent Accuracy (±1): 0.6219
+Overall MAE: 1.0746
