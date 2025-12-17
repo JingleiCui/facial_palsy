@@ -1,13 +1,12 @@
 """
-H-GFA Net 数据库 Schema V2.0
+H-GFA Net 数据库 Schema
 ===============================
 
 主要更新:
 1. 将所有特征统一存储到 video_features 表
-   - 原有: static_features, dynamic_features, visual_features
-   - 新增: wrinkle_features, motion_heatmap_features
-2. 新增数据集划分表 (患者级划分)
-3. 新增数据增强配置表
+
+2. 数据集划分表 (患者级划分)
+3. 数据增强配置表
 
 设计原则:
 - 所有特征存储在同一行，避免训练时JOIN查询
@@ -25,7 +24,7 @@ from typing import Optional
 
 SCHEMA_SQL = """
 -- ============================================================
--- H-GFA Net 数据库模式 V2.0
+-- H-GFA Net 数据库模式
 -- 核心更新: 所有特征统一存储，支持多模态融合
 -- ============================================================
 
@@ -168,7 +167,7 @@ CREATE INDEX IF NOT EXISTS idx_action_labels_severity ON action_labels(severity_
 
 
 -- ============================================================
--- 4. 核心特征表 (V2.0 重新设计)
+-- 4. 核心特征表
 -- ============================================================
 -- 设计原则: 所有特征存储在同一行，训练时无需JOIN
 
@@ -194,13 +193,13 @@ CREATE TABLE IF NOT EXISTS video_features (
     visual_features BLOB,                     -- 1280维全局视觉特征
     visual_dim INTEGER DEFAULT 1280,
     
-    -- ========== 皱纹特征 (新增 V2.0) ==========
+    -- ========== 皱纹特征 ==========
     wrinkle_features BLOB,                    -- 皱纹量化特征
     wrinkle_dim INTEGER DEFAULT 10,           -- 默认10维
     wrinkle_heatmap BLOB,                     -- 皱纹热力图 (压缩后，可选)
     wrinkle_mask BLOB,                        -- 皱纹掩码 (压缩后，可选)
     
-    -- ========== 运动热力图特征 (新增 V2.0) ==========
+    -- ========== 运动热力图特征 ==========
     motion_features BLOB,                     -- 运动统计特征
     motion_dim INTEGER DEFAULT 12,            -- 默认12维
     motion_heatmap BLOB,                      -- 运动热力图 (压缩后，可选)
@@ -274,7 +273,7 @@ CREATE INDEX IF NOT EXISTS idx_dm_patient ON dataset_members(patient_id);
 CREATE TABLE IF NOT EXISTS training_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_name TEXT NOT NULL,
-    model_name TEXT NOT NULL,                 -- 'HGFANet_v2'
+    model_name TEXT NOT NULL,                 -- 'HGFANet'
     model_version TEXT,
     config_json TEXT,                         -- 完整配置 JSON
     split_id INTEGER,                         -- 使用的数据划分
