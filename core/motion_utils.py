@@ -2,51 +2,35 @@
 运动特征计算工具 - Motion Feature Utilities
 ============================================
 
-为 geometry_utils.py 补充运动特征计算相关的函数和常量。
-用于从landmarks序列计算12维运动特征向量。
+从landmarks序列计算12维全局运动特征向量。
 
-设计原则:
-1. 复用 geometry_utils.py 中已有的关键点索引
-2. 不重复定义关键点
-3. 提供纯函数式接口，便于在 video_pipeline.py 中调用
+这些特征是全局性的运动描述，与动作特定的dynamic_features不同：
+- 动作特定的dynamic_features: 关注特定区域（眼、口等）的运动
+- 全局motion_features: 描述整体运动模式（位移、速度、对称性等）
+
+两者可以并行使用，互为补充。
+
+特征维度 (12维):
+    0: mean_displacement     - 平均位移
+    1: max_displacement      - 最大位移
+    2: std_displacement      - 位移标准差
+    3: motion_energy         - 运动能量
+    4: motion_asymmetry      - 运动不对称性
+    5: temporal_smoothness   - 时间平滑度
+    6: spatial_concentration - 空间集中度
+    7: peak_ratio            - 峰值区域比例
+    8: motion_center_x       - 运动重心X
+    9: motion_center_y       - 运动重心Y
+    10: velocity_mean        - 平均速度
+    11: acceleration_std     - 加速度变化
 """
 
 import numpy as np
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
-# 导入已有的关键点定义
-from .geometry_utils import (
-    LEFT_EYE_POINTS, RIGHT_EYE_POINTS,
-    EYEBROW_LEFT_POINTS, EYEBROW_RIGHT_POINTS,
-    UPPER_LIP_LEFT_POINTS, UPPER_LIP_RIGHT_POINTS,
-    LOWER_LIP_LEFT_POINTS, LOWER_LIP_RIGHT_POINTS,
-    LEFT_CHEEK, RIGHT_CHEEK,
-    get_point, get_unit_length
-)
-
-# =============================================================================
-# 面部区域索引 (用于运动不对称性计算)
-# 基于 MediaPipe 478点模型
-# =============================================================================
-
-# 左右对称区域对 - 复用已有定义并补充腮部
-MOTION_SYMMETRIC_REGIONS = {
-    'left_eye': LEFT_EYE_POINTS,
-    'right_eye': RIGHT_EYE_POINTS,
-    'left_brow': EYEBROW_LEFT_POINTS,
-    'right_brow': EYEBROW_RIGHT_POINTS,
-    # 腮部区域 (脸颊)
-    'left_cheek': LEFT_CHEEK,
-    'right_cheek': RIGHT_CHEEK,
-}
-
-# 左右对应区域对
-SYMMETRIC_PAIRS = [
-    ('left_eye', 'right_eye'),
-    ('left_brow', 'right_brow'),
-    ('left_cheek', 'right_cheek'),
-]
+# 从constants模块导入常量
+from .constants import MotionRegions, MOTION_FEATURE_NAMES
 
 
 # =============================================================================
@@ -56,20 +40,7 @@ SYMMETRIC_PAIRS = [
 @dataclass
 class MotionMetrics:
     """
-    运动量化指标
-
-    包含12维特征:
-        0: mean_displacement     - 平均位移
-        1: max_displacement      - 最大位移
-        2: std_displacement      - 位移标准差
-        3: motion_energy         - 运动能量
-        4: motion_asymmetry      - 运动不对称性
-        5: temporal_smoothness   - 时间平滑度
-        6: spatial_concentration - 空间集中度
-        7: peak_ratio            - 峰值区域比例
-        8-9: motion_center       - 运动重心
-        10: velocity_mean        - 平均速度
-        11: acceleration_std     - 加速度变化
+    运动量化指标 (12维)
     """
     mean_displacement: float = 0.0
     max_displacement: float = 0.0
@@ -87,29 +58,46 @@ class MotionMetrics:
         """转换为12维特征向量 (归一化到0-1范围)"""
         features = np.zeros(12, dtype=np.float32)
 
-        # 位移统计
+        # 位移统计 (归一化)
         features[0] = min(self.mean_displacement / 50.0, 1.0)
         features[1] = min(self.max_displacement / 200.0, 1.0)
         features[2] = min(self.std_displacement / 30.0, 1.0)
         features[3] = min(self.motion_energy / 10000.0, 1.0)
 
-        # 不对称性
+        # 不对称性 (已经是0-1)
         features[4] = min(self.motion_asymmetry, 1.0)
 
-        # 时间/空间特性
+        # 时间/空间特性 (已经是0-1)
         features[5] = self.temporal_smoothness
         features[6] = self.spatial_concentration
         features[7] = self.peak_ratio
 
-        # 运动重心
+        # 运动重心 (已经是0-1)
         features[8] = self.motion_center[0]
         features[9] = self.motion_center[1]
 
-        # 速度/加速度
+        # 速度/加速度 (归一化)
         features[10] = min(self.velocity_mean / 20.0, 1.0)
         features[11] = min(self.acceleration_std / 10.0, 1.0)
 
         return features
+
+    def to_dict(self) -> dict:
+        """转换为字典格式"""
+        return {
+            'mean_displacement': self.mean_displacement,
+            'max_displacement': self.max_displacement,
+            'std_displacement': self.std_displacement,
+            'motion_energy': self.motion_energy,
+            'motion_asymmetry': self.motion_asymmetry,
+            'temporal_smoothness': self.temporal_smoothness,
+            'spatial_concentration': self.spatial_concentration,
+            'peak_ratio': self.peak_ratio,
+            'motion_center_x': self.motion_center[0],
+            'motion_center_y': self.motion_center[1],
+            'velocity_mean': self.velocity_mean,
+            'acceleration_std': self.acceleration_std,
+        }
 
 
 # =============================================================================
@@ -126,7 +114,7 @@ def landmarks_to_array(landmarks, w: int, h: int) -> Optional[np.ndarray]:
         h: 图像高度
 
     Returns:
-        coords: (478, 2) ndarray 或 None
+        coords: (N, 2) ndarray 或 None
     """
     if landmarks is None:
         return None
@@ -174,8 +162,8 @@ def compute_displacement(coords_list: List[np.ndarray]) -> np.ndarray:
 
 
 def compute_velocity_acceleration(
-        coords_list: List[np.ndarray],
-        fps: float = 30.0
+    coords_list: List[np.ndarray],
+    fps: float = 30.0
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     计算速度和加速度
@@ -220,10 +208,14 @@ def compute_asymmetry(displacement: np.ndarray) -> float:
         asymmetry: 0-1, 0表示完全对称
     """
     asymmetries = []
+    n = len(displacement)
 
-    for left_region, right_region in SYMMETRIC_PAIRS:
-        left_indices = MOTION_SYMMETRIC_REGIONS.get(left_region, [])
-        right_indices = MOTION_SYMMETRIC_REGIONS.get(right_region, [])
+    for left_region, right_region in MotionRegions.SYMMETRIC_PAIRS:
+        left_indices = [i for i in MotionRegions.ALL_REGIONS.get(left_region, []) if i < n]
+        right_indices = [i for i in MotionRegions.ALL_REGIONS.get(right_region, []) if i < n]
+
+        if not left_indices or not right_indices:
+            continue
 
         left_motion = np.mean(displacement[left_indices])
         right_motion = np.mean(displacement[right_indices])
@@ -237,8 +229,8 @@ def compute_asymmetry(displacement: np.ndarray) -> float:
 
 
 def compute_motion_center(
-        displacement: np.ndarray,
-        coords: np.ndarray
+    displacement: np.ndarray,
+    coords: np.ndarray
 ) -> Tuple[float, float]:
     """
     计算运动重心 (位移加权坐标)
@@ -310,7 +302,8 @@ def compute_temporal_smoothness(coords_list: List[np.ndarray]) -> float:
 
     frame_disps = []
     for i in range(len(coords_list) - 1):
-        d = np.linalg.norm(coords_list[i + 1] - coords_list[i], axis=1).mean()
+        n = min(coords_list[i].shape[0], coords_list[i + 1].shape[0])
+        d = np.linalg.norm(coords_list[i + 1][:n] - coords_list[i][:n], axis=1).mean()
         frame_disps.append(d)
 
     if len(frame_disps) < 2:
@@ -331,10 +324,10 @@ def compute_temporal_smoothness(coords_list: List[np.ndarray]) -> float:
 # =============================================================================
 
 def compute_motion_features(
-        landmarks_seq: List,
-        w: int,
-        h: int,
-        fps: float = 30.0
+    landmarks_seq: List,
+    w: int,
+    h: int,
+    fps: float = 30.0
 ) -> np.ndarray:
     """
     从landmarks序列计算12维运动特征
@@ -398,3 +391,71 @@ def compute_motion_features(
         print(f"  [WARN] 运动特征计算异常: {e}")
 
     return metrics.to_feature_vector()
+
+
+def compute_motion_features_detailed(
+    landmarks_seq: List,
+    w: int,
+    h: int,
+    fps: float = 30.0
+) -> Tuple[np.ndarray, dict]:
+    """
+    计算12维运动特征并返回详细指标
+
+    Args:
+        landmarks_seq: MediaPipe landmarks对象列表
+        w: 图像宽度
+        h: 图像高度
+        fps: 视频帧率
+
+    Returns:
+        features: (12,) 运动特征向量
+        metrics_dict: 详细指标字典
+    """
+    metrics = MotionMetrics()
+
+    # 转换为坐标数组
+    coords_list = []
+    for lm in landmarks_seq:
+        coords = landmarks_to_array(lm, w, h)
+        if coords is not None:
+            coords_list.append(coords)
+
+    if len(coords_list) < 3:
+        return metrics.to_feature_vector(), metrics.to_dict()
+
+    try:
+        displacement = compute_displacement(coords_list)
+
+        metrics.mean_displacement = float(np.mean(displacement))
+        metrics.max_displacement = float(np.max(displacement))
+        metrics.std_displacement = float(np.std(displacement))
+        metrics.motion_energy = float(np.sum(displacement ** 2))
+
+        velocities, accelerations = compute_velocity_acceleration(coords_list, fps)
+        if len(velocities) > 0:
+            metrics.velocity_mean = float(np.mean(velocities))
+        if len(accelerations) > 0:
+            metrics.acceleration_std = float(np.std(accelerations))
+
+        metrics.temporal_smoothness = compute_temporal_smoothness(coords_list)
+        metrics.spatial_concentration = compute_spatial_entropy(displacement)
+        metrics.motion_asymmetry = compute_asymmetry(displacement)
+
+        threshold = np.percentile(displacement, 75)
+        metrics.peak_ratio = float(np.sum(displacement > threshold) / len(displacement))
+        metrics.motion_center = compute_motion_center(displacement, coords_list[0])
+
+    except Exception as e:
+        print(f"  [WARN] 运动特征计算异常: {e}")
+
+    return metrics.to_feature_vector(), metrics.to_dict()
+
+
+# =============================================================================
+# 辅助函数
+# =============================================================================
+
+def get_motion_feature_names() -> List[str]:
+    """返回12维运动特征的名称列表"""
+    return MOTION_FEATURE_NAMES.copy()
