@@ -1,6 +1,12 @@
 """
-视频处理Pipeline - 集成运动特征提取
+视频处理Pipeline - 适配V2 Actions架构
 ========================================
+
+本模块已更新以适配最新的 actions/ 模块结构:
+1. 使用 BaseAction 基类的统一 process() 接口
+2. 支持 NeutralBaseline dataclass 和 ActionResult dataclass
+3. 动作类实例化和注册机制
+4. 与 ActionFeatureIntegrator 的无缝集成
 
 处理流程:
 1. 读取视频 → 提取landmarks序列和frames序列
@@ -10,9 +16,9 @@
 5. 存储到数据库
 
 输出特征:
-- static_features:  5-11维 (因动作而异)
-- dynamic_features: 0-8维  (因动作而异)
-- motion_features:  12维   (统一维度)
+- static_features:  维度因动作而异
+- dynamic_features: 维度因动作而异
+- motion_features:  12维 (统一维度)
 
 运动特征说明 (12维):
     0: mean_displacement     - 平均位移
@@ -26,12 +32,6 @@
     8-9: motion_center       - 运动重心
     10: velocity_mean        - 平均速度
     11: acceleration_std     - 加速度变化
-
-内存优化:
-- 降低并行度(6线程)避免MediaPipe GPU冲突
-- 及时释放帧序列内存
-- 定期强制垃圾回收
-- 分批处理examinations
 """
 
 import os
@@ -41,167 +41,295 @@ import cv2
 import numpy as np
 import sqlite3
 import gc
+import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
-import inspect
 import dataclasses
+from typing import Dict, List, Optional, Any, Tuple
+
+# =============================================================================
+# 导入核心模块
+# =============================================================================
+
+# 根据实际项目结构调整导入路径
 
 from facialPalsy.core.landmark_extractor import LandmarkExtractor
 from facialPalsy.core.motion_utils import compute_motion_features
+from facialPalsy.core.constants import ActionNames
 from facialPalsy.action_feature_integrator import ActionFeatureIntegrator
-from facialPalsy.core.augmentation_utils import (
-        flip_palsy_side,
-        horizontal_flip_landmarks_seq,
-        rotate_landmarks_seq,
-        adjust_brightness_contrast,
-    )
+
+# 导入所有动作类
+from facialPalsy.actions.base_action import BaseAction, ActionResult, NeutralBaseline
+from facialPalsy.actions.neutral_face import NeutralFaceAction
+from facialPalsy.actions.raise_eyebrow import RaiseEyebrowAction
+from facialPalsy.actions.close_eye_softly import CloseEyeSoftlyAction
+from facialPalsy.actions.close_eye_hardly import CloseEyeHardlyAction
+from facialPalsy.actions.smile import SmileAction
+from facialPalsy.actions.shrug_nose import ShrugNoseAction
+from facialPalsy.actions.lip_pucker import LipPuckerAction
+from facialPalsy.actions.show_teeth import ShowTeethAction
+from facialPalsy.actions.blow_cheek import BlowCheekAction
+from facialPalsy.actions.voluntary_eye_blink import VoluntaryEyeBlinkAction
+from facialPalsy.actions.spontaneous_eye_blink import SpontaneousEyeBlinkAction
+
+
+
+# =============================================================================
+# 动作类注册表
+# =============================================================================
+
+# 动作名称到动作类的映射
+ACTION_CLASSES: Dict[str, type] = {
+    'NeutralFace': NeutralFaceAction,
+    'RaiseEyebrow': RaiseEyebrowAction,
+    'CloseEyeSoftly': CloseEyeSoftlyAction,
+    'CloseEyeHardly': CloseEyeHardlyAction,
+    'Smile': SmileAction,
+    'ShrugNose': ShrugNoseAction,
+    'LipPucker': LipPuckerAction,
+    'ShowTeeth': ShowTeethAction,
+    'BlowCheek': BlowCheekAction,
+    'VoluntaryEyeBlink': VoluntaryEyeBlinkAction,
+    'SpontaneousEyeBlink': SpontaneousEyeBlinkAction,
+}
+
+
+def create_action_detectors() -> Dict[str, BaseAction]:
+    """
+    创建所有动作检测器实例
+
+    Returns:
+        字典，键为动作名称，值为动作类实例
+    """
+    detectors = {}
+    for name, cls in ACTION_CLASSES.items():
+        try:
+            detectors[name] = cls()
+        except Exception as e:
+            print(f"[WARN] 创建动作检测器 {name} 失败: {e}")
+    return detectors
+
+
+# =============================================================================
+# VideoPipeline 类
+# =============================================================================
 
 class VideoPipeline:
     """
     视频处理Pipeline
 
-    集成功能:
-    1. 几何特征提取 (static + dynamic)
-    2. 运动特征提取 (motion) - 复用landmarks_seq
-    3. 峰值帧保存
-    4. 内存优化
+    适配最新的 actions 架构:
+    1. 使用 BaseAction.process() 统一接口
+    2. 支持 NeutralBaseline 和 ActionResult dataclass
+    3. 集成 ActionFeatureIntegrator
     """
 
-    def __init__(self, db_path, model_path, keyframe_root_dir):
+    def __init__(self, db_path: str, model_path: str, keyframe_root_dir: str):
         """
+        初始化 Pipeline
+
         Args:
             db_path: 数据库路径
             model_path: MediaPipe FaceLandmarker模型路径
             keyframe_root_dir: 关键帧保存根目录
         """
         self.db_path = db_path
+        self.model_path = model_path
         self.keyframe_root_dir = Path(keyframe_root_dir)
         self.keyframe_root_dir.mkdir(parents=True, exist_ok=True)
 
-        # 初始化landmark提取器
+        # 初始化 landmark 提取器
         self.landmark_extractor = LandmarkExtractor(model_path)
 
         # 初始化特征整合器
         self.feature_integrator = ActionFeatureIntegrator()
 
-        # 初始化动作检测器
-        self.action_detectors = self.feature_integrator.action_detectors
+        # 创建动作检测器实例
+        self.action_detectors = create_action_detectors()
 
-        # 静息帧缓存
-        self.neutral_cache = {}
+        # 静息帧缓存 (examination_id -> NeutralBaseline dict)
+        self.neutral_cache: Dict[int, Dict] = {}
 
-        self.model_path = model_path
-
-        # 降低并行度避免MediaPipe GPU冲突
+        # 并行处理配置
         self.num_workers = 8
 
+        # 线程本地存储
         self._tls = threading.local()
 
     def _get_worker(self):
-        """获取线程本地的worker实例"""
+        """
+        获取线程本地的 worker 实例
+
+        为每个工作线程创建独立的:
+        - LandmarkExtractor
+        - ActionFeatureIntegrator
+        - action_detectors
+        """
         w = getattr(self._tls, "worker", None)
         if w is None:
             w = type("Worker", (), {})()
             w.landmark_extractor = LandmarkExtractor(self.model_path)
             w.feature_integrator = ActionFeatureIntegrator()
-            w.action_detectors = w.feature_integrator.action_detectors
+            w.action_detectors = create_action_detectors()
             self._tls.worker = w
         return w
 
+    # =========================================================================
+    # NeutralBaseline 处理
+    # =========================================================================
 
-    # ===========================
-    # 适配最新 actions 接口的辅助函数
-    # ===========================
-
-    def _build_neutral_baseline(self, neutral_indicators):
+    def _build_neutral_baseline(self, neutral_indicators: Optional[Dict]) -> Optional[NeutralBaseline]:
         """
-        将 NeutralFace 的指标字典尽量转换为 actions/base_action.py 中的 NeutralBaseline 对象。
-        若当前工程没有该类或字段不匹配，则直接返回原 dict 作为兜底。
+        从指标字典构建 NeutralBaseline 对象
+
+        Args:
+            neutral_indicators: 静息帧指标字典
+
+        Returns:
+            NeutralBaseline 对象，或 None
         """
         if neutral_indicators is None:
             return None
 
         try:
-            from facialPalsy.actions.base_action import NeutralBaseline  # type: ignore
+            return NeutralBaseline.from_dict(neutral_indicators)
         except Exception:
-            return neutral_indicators
+            # 如果 from_dict 不存在，尝试直接构造
+            try:
+                # 获取 dataclass 字段
+                if dataclasses.is_dataclass(NeutralBaseline):
+                    fields = [f.name for f in dataclasses.fields(NeutralBaseline)]
+                    kwargs = {k: neutral_indicators.get(k, 0) for k in fields}
+                    return NeutralBaseline(**kwargs)
+            except Exception:
+                pass
 
-        # dataclass: 仅取字段交集，避免 __init__ 参数不匹配
-        try:
-            if hasattr(NeutralBaseline, "__dataclass_fields__"):
-                fields = list(NeutralBaseline.__dataclass_fields__.keys())
-                kwargs = {k: neutral_indicators.get(k) for k in fields if k in neutral_indicators}
-                return NeutralBaseline(**kwargs)
-        except Exception:
-            pass
+        return None
 
-        # 普通类：尝试直接 **kwargs，失败则回退 dict
-        try:
-            return NeutralBaseline(**neutral_indicators)
-        except Exception:
-            return neutral_indicators
+    def _neutral_baseline_to_dict(self, baseline: Optional[NeutralBaseline]) -> Optional[Dict]:
+        """
+        将 NeutralBaseline 转换为字典
+        """
+        if baseline is None:
+            return None
 
-    def _action_result_to_dict(self, result):
-        """支持 dict / dataclass / 普通对象 三种返回形式"""
+        if dataclasses.is_dataclass(baseline):
+            return dataclasses.asdict(baseline)
+
+        if hasattr(baseline, 'to_dict'):
+            return baseline.to_dict()
+
+        if hasattr(baseline, '__dict__'):
+            return dict(baseline.__dict__)
+
+        return None
+
+    # =========================================================================
+    # ActionResult 处理
+    # =========================================================================
+
+    def _action_result_to_dict(self, result: Any) -> Optional[Dict]:
+        """
+        将 ActionResult 或其他结果类型转换为字典
+
+        支持:
+        - dict: 直接返回
+        - dataclass: 使用 asdict
+        - 普通对象: 取 __dict__
+        """
         if result is None:
             return None
+
         if isinstance(result, dict):
             return result
-        try:
-            if dataclasses.is_dataclass(result):
-                return dataclasses.asdict(result)
-        except Exception:
-            pass
-        # 通用对象：取 __dict__
-        if hasattr(result, "__dict__"):
+
+        if dataclasses.is_dataclass(result):
+            d = dataclasses.asdict(result)
+            # 特殊处理 numpy 数组
+            for k, v in d.items():
+                if isinstance(v, np.ndarray):
+                    d[k] = v  # 保持 numpy 数组
+            return d
+
+        if hasattr(result, '__dict__'):
             return dict(result.__dict__)
-        return result
 
-    def _call_action_process(self, detector, *, landmarks_seq, frames_seq, w, h, fps, neutral_indicators):
+        return None
+
+    # =========================================================================
+    # 动作处理调用
+    # =========================================================================
+
+    def _call_action_process(
+        self,
+        detector: BaseAction,
+        landmarks_seq: List,
+        frames_seq: List[np.ndarray],
+        w: int,
+        h: int,
+        fps: float,
+        neutral_indicators: Optional[Dict]
+    ) -> Optional[Dict]:
         """
-        调用动作 detector.process，并兼容最新动作代码可能使用的参数名：
-        - neutral_indicators（旧）
-        - neutral_baseline（新，建议）
+        调用动作检测器的 process 方法
+
+        统一处理新旧两种接口:
+        - 新接口: neutral_indicators 作为字典传入，内部转换为 NeutralBaseline
+        - 旧接口: 直接传递 neutral_indicators 字典
+
+        Args:
+            detector: 动作检测器实例
+            landmarks_seq: 关键点序列
+            frames_seq: 帧序列
+            w, h: 图像尺寸
+            fps: 帧率
+            neutral_indicators: 静息帧指标字典
+
+        Returns:
+            处理结果字典，或 None
         """
-        sig = None
         try:
-            sig = inspect.signature(detector.process)
-        except Exception:
-            sig = None
+            # BaseAction.process() 接口
+            result = detector.process(
+                landmarks_seq=landmarks_seq,
+                frames_seq=frames_seq,
+                w=w,
+                h=h,
+                fps=fps,
+                neutral_indicators=neutral_indicators
+            )
 
-        neutral_payload = neutral_indicators
-        # 若对方支持 neutral_baseline，则尽量转成 NeutralBaseline
-        if sig and "neutral_baseline" in sig.parameters:
-            neutral_payload = self._build_neutral_baseline(neutral_indicators)
+            return self._action_result_to_dict(result)
 
-        kwargs = dict(
-            landmarks_seq=landmarks_seq,
-            frames_seq=frames_seq,
-            w=w,
-            h=h,
-            fps=fps,
-        )
+        except TypeError as e:
+            # 可能是参数名不匹配，尝试其他方式
+            print(f"[WARN] 动作处理调用失败: {e}")
+            return None
+        except Exception as e:
+            print(f"[ERROR] 动作处理异常: {e}")
+            return None
 
-        if sig:
-            if "neutral_baseline" in sig.parameters:
-                kwargs["neutral_baseline"] = neutral_payload
-            elif "neutral_indicators" in sig.parameters:
-                kwargs["neutral_indicators"] = neutral_indicators
-            else:
-                # 兜底：不传 baseline
-                pass
-        else:
-            # 无法 introspect：保留旧参数名（兼容旧版 BaseAction）
-            kwargs["neutral_indicators"] = neutral_indicators
+    # =========================================================================
+    # 主处理流程
+    # =========================================================================
 
-        out = detector.process(**kwargs)
-        return self._action_result_to_dict(out)
-
-    def process_examination(self, examination_id):
+    def process_examination(self, examination_id: int) -> Optional[Dict]:
         """
-        处理一个完整的examination(11个动作)
+        处理一个完整的 examination (11个动作)
+
+        流程:
+        1. 获取该 examination 的所有视频
+        2. 首先处理 NeutralFace 获取基准
+        3. 并行处理其余 10 个动作
+        4. 保存结果到数据库
+
+        Args:
+            examination_id: 检查 ID
+
+        Returns:
+            处理结果字典
         """
         print(f"\n{'=' * 60}")
         print(f"处理检查 ID: {examination_id}")
@@ -209,7 +337,7 @@ class VideoPipeline:
 
         start_time = datetime.now()
 
-        # 1. 获取该examination的所有视频
+        # 1. 获取该 examination 的所有视频
         videos = self._get_examination_videos(examination_id)
 
         if not videos:
@@ -218,9 +346,12 @@ class VideoPipeline:
 
         print(f"找到 {len(videos)} 个视频")
 
-        # 2. 首先处理NeutralFace(静息帧)
+        # 2. 首先处理 NeutralFace (静息帧)
         neutral_result = None
-        neutral_video = next((v for v in videos if v['action_name_en'] == 'NeutralFace'), None)
+        neutral_video = next(
+            (v for v in videos if v['action_name_en'] == 'NeutralFace'),
+            None
+        )
 
         if neutral_video:
             print("\n[步骤1] 处理静息帧...")
@@ -230,49 +361,72 @@ class VideoPipeline:
             )
 
             if neutral_result:
+                # 缓存静息帧指标
                 self.neutral_cache[examination_id] = {
                     'normalized_indicators': neutral_result['normalized_indicators'],
                     'peak_frame_idx': neutral_result['peak_frame_idx']
                 }
                 print(f"✓ 静息帧处理完成")
 
-        # 3. 处理其他10个动作
+        # 3. 获取静息帧指标用于其他动作
+        neutral_indicators = None
+        if examination_id in self.neutral_cache:
+            neutral_indicators = self.neutral_cache[examination_id]['normalized_indicators']
+
+        # 4. 并行处理其他动作
         results = {}
         other_videos = [v for v in videos if v['action_name_en'] != 'NeutralFace']
 
         print(f"\n[步骤2] 并行处理其余 {len(other_videos)} 个动作...")
 
-        neutral_indicators = None
-        if examination_id in self.neutral_cache:
-            neutral_indicators = self.neutral_cache[examination_id]['normalized_indicators']
-
         failures = []
         computed = []
 
-        with ThreadPoolExecutor(max_workers=self.num_workers) as ex:
-            fut_map = {ex.submit(self._compute_video_only, v, neutral_indicators): v for v in other_videos}
-            for fut in as_completed(fut_map):
-                v = fut_map[fut]
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            future_map = {
+                executor.submit(
+                    self._compute_video_only,
+                    v,
+                    neutral_indicators
+                ): v
+                for v in other_videos
+            }
+
+            for future in as_completed(future_map):
+                v = future_map[future]
                 try:
-                    out = fut.result()
+                    out = future.result()
                 except Exception as e:
                     failures.append((v['video_id'], v['action_name_en'], str(e)))
                     continue
+
                 if not out.get("ok"):
-                    failures.append((v['video_id'], v['action_name_en'], out.get("error", "unknown")))
+                    failures.append((
+                        v['video_id'],
+                        v['action_name_en'],
+                        out.get("error", "unknown")
+                    ))
                     continue
+
                 computed.append(out)
 
-        # 串行保存(避免 SQLite 写锁)
+        # 5. 串行保存到数据库 (避免 SQLite 写锁冲突)
         for out in computed:
             vinfo = next(v for v in other_videos if v["video_id"] == out["video_id"])
             action_name = out["action_name"]
             r = out["result"]
 
-            peak_frame_path = self._save_peak_frame(r['peak_frame'], vinfo['examination_id'], action_name)
+            # 保存峰值帧
+            peak_frame_path = self._save_peak_frame(
+                r['peak_frame'],
+                vinfo['examination_id'],
+                action_name
+            )
 
+            # 删除帧数据避免序列化
             del r['peak_frame']
 
+            # 保存到数据库
             self._save_to_database(
                 video_id=vinfo['video_id'],
                 peak_frame_idx=r['peak_frame_idx'],
@@ -300,15 +454,17 @@ class VideoPipeline:
 
             del out["result"]
 
+        # 6. 报告失败
         if failures:
             print(f"  [WARN] 本次 examination 有 {len(failures)} 个动作失败：")
             for vid, act, err in failures[:10]:
                 print(f"    - video_id={vid} act={act} err={err}")
 
-        # 4. 添加静息帧结果
+        # 7. 添加静息帧结果
         if neutral_result:
             results['NeutralFace'] = neutral_result
 
+        # 8. 计算处理时间
         processing_time = (datetime.now() - start_time).total_seconds() * 1000
 
         print(f"\n{'=' * 60}")
@@ -316,6 +472,7 @@ class VideoPipeline:
         print(f"成功处理: {len(results)}/11 个动作")
         print(f"{'=' * 60}")
 
+        # 清理内存
         del computed
         gc.collect()
 
@@ -325,9 +482,20 @@ class VideoPipeline:
             'processing_time_ms': processing_time
         }
 
-    def process_video(self, video_id, neutral_indicators=None):
+    def process_video(
+        self,
+        video_id: int,
+        neutral_indicators: Optional[Dict] = None
+    ) -> Optional[Dict]:
         """
         处理单个视频 (主线程版本)
+
+        Args:
+            video_id: 视频 ID
+            neutral_indicators: 静息帧指标字典
+
+        Returns:
+            处理结果字典
         """
         # 1. 获取视频信息
         video_info = self._get_video_info(video_id)
@@ -338,12 +506,12 @@ class VideoPipeline:
         action_name = video_info['action_name_en']
         print(f"  动作: {action_name} ({video_info['action_name_cn']})")
 
-        # 2. 检查文件
+        # 2. 检查文件存在
         if not os.path.exists(video_info['file_path']):
             print(f"  [ERROR] 文件不存在: {video_info['file_path']}")
             return None
 
-        # 3. 提取landmarks序列和frames
+        # 3. 提取 landmarks 序列和 frames
         landmarks_seq, frames_seq = self._extract_sequence(
             video_info['file_path'],
             video_info['start_frame'],
@@ -362,25 +530,32 @@ class VideoPipeline:
             del frames_seq
             return None
 
-        # 5. 使用动作类的process方法
-        neutral_raw = self._denormalize_indicators(
-            neutral_indicators,
-            video_info
-        ) if neutral_indicators else None
-
+        # 5. 获取视频尺寸和帧率
         h, w = frames_seq[0].shape[:2]
-        fps = video_info.get('fps')
+        fps = video_info.get('fps', 30.0)
+        if fps is None:
+            fps = 30.0
+        fps = float(fps)
 
-        result = self._call_action_process(detector, landmarks_seq=landmarks_seq, frames_seq=frames_seq, w=w, h=h, fps=fps, neutral_indicators=neutral_raw)
+        # 6. 调用动作处理
+        result = self._call_action_process(
+            detector,
+            landmarks_seq=landmarks_seq,
+            frames_seq=frames_seq,
+            w=w,
+            h=h,
+            fps=fps,
+            neutral_indicators=neutral_indicators
+        )
 
-        # 6. 计算运动特征 (复用landmarks_seq)
+        # 7. 计算运动特征 (复用 landmarks_seq)
+        motion_features = None
         try:
             motion_features = compute_motion_features(landmarks_seq, w, h, fps)
         except Exception as e:
-            print(f"[WARN] 运动特征计算异常: {e}")
-            motion_features = None
+            print(f"  [WARN] 运动特征计算异常: {e}")
 
-        # 释放序列
+        # 释放序列内存
         del landmarks_seq
         del frames_seq
 
@@ -388,42 +563,32 @@ class VideoPipeline:
             print(f"  [ERROR] 处理失败")
             return None
 
-        # 7. 提取特征向量
+        # 8. 提取特征向量
         feature_vector = self.feature_integrator.extract_action_features(
             action_name,
-            result['normalized_indicators'],
-            result['normalized_dynamic_features']
+            result.get('normalized_indicators', {}),
+            result.get('normalized_dynamic_features', {})
         )
 
         print(f"  ✓ 几何特征: {feature_vector.shape[0]}维, 运动特征: 12维")
 
-        conn_tmp = sqlite3.connect(self.db_path)
-        cur_tmp = conn_tmp.cursor()
-        cur_tmp.execute("SELECT palsy_side FROM examination_labels WHERE examination_id = ?",
-                        (video_info['examination_id'],))
-        palsy_side = cur_tmp.fetchone()[0] if cur_tmp.fetchone() else None
-        conn_tmp.close()
-
-        # 8. 保存峰值帧
+        # 9. 保存峰值帧
         peak_frame_path = self._save_peak_frame(
             result['peak_frame'],
             video_info['examination_id'],
-            action_name,
-            augmentation_type='none'
+            action_name
         )
 
-        # 9. 存储到数据库
+        # 10. 保存到数据库
         self._save_to_database(
             video_id=video_id,
             peak_frame_idx=result['peak_frame_idx'],
             peak_frame_path=str(peak_frame_path),
             unit_length=result['unit_length'],
             feature_vector=feature_vector,
-            normalized_indicators=result['normalized_indicators'],
-            normalized_dynamic_features=result['normalized_dynamic_features'],
+            normalized_indicators=result.get('normalized_indicators', {}),
+            normalized_dynamic_features=result.get('normalized_dynamic_features', {}),
             motion_features=motion_features,
-            augmentation_type='none',
-            aug_palsy_side=palsy_side,
         )
 
         return {
@@ -436,22 +601,36 @@ class VideoPipeline:
             'motion_dim': 12,
             'feature_vector': feature_vector,
             'motion_features': motion_features,
-            'normalized_indicators': result['normalized_indicators'],
-            'normalized_dynamic_features': result['normalized_dynamic_features']
+            'normalized_indicators': result.get('normalized_indicators', {}),
+            'normalized_dynamic_features': result.get('normalized_dynamic_features', {})
         }
 
-    def _compute_video_only(self, video_info, neutral_indicators=None):
+    def _compute_video_only(
+        self,
+        video_info: Dict,
+        neutral_indicators: Optional[Dict] = None
+    ) -> Dict:
         """
         工作线程中计算单个视频
+
+        Args:
+            video_info: 视频信息字典
+            neutral_indicators: 静息帧指标字典
+
+        Returns:
+            处理结果字典
         """
         t0 = time.perf_counter()
         action_name = video_info['action_name_en']
 
+        # 检查文件
         if not os.path.exists(video_info['file_path']):
             return {"ok": False, "error": f"文件不存在: {video_info['file_path']}"}
 
+        # 获取线程本地 worker
         worker = self._get_worker()
 
+        # 提取序列
         landmarks_seq, frames_seq = self._extract_sequence(
             video_info['file_path'],
             video_info['start_frame'],
@@ -462,18 +641,16 @@ class VideoPipeline:
         if not landmarks_seq:
             return {"ok": False, "error": "关键点提取失败"}
 
+        # 获取动作检测器
         detector = worker.action_detectors.get(action_name)
         if not detector:
             del landmarks_seq
             del frames_seq
             return {"ok": False, "error": f"未找到动作检测器: {action_name}"}
 
-        neutral_raw = self._denormalize_indicators(neutral_indicators, video_info) if neutral_indicators else None
-
+        # 获取视频尺寸和帧率
         h, w = frames_seq[0].shape[:2]
-        fps = video_info.get('fps')
-
-        # 确保fps是数值类型
+        fps = video_info.get('fps', 30.0)
         if fps is None:
             fps = 30.0
         elif isinstance(fps, (list, tuple)):
@@ -481,26 +658,36 @@ class VideoPipeline:
         else:
             fps = float(fps)
 
-        result = self._call_action_process(detector, landmarks_seq=landmarks_seq, frames_seq=frames_seq, w=w, h=h, fps=fps, neutral_indicators=neutral_raw)
+        # 调用动作处理
+        result = self._call_action_process(
+            detector,
+            landmarks_seq=landmarks_seq,
+            frames_seq=frames_seq,
+            w=w,
+            h=h,
+            fps=fps,
+            neutral_indicators=neutral_indicators
+        )
 
-        # 计算运动特征 (复用landmarks_seq)
+        # 计算运动特征
+        motion_features = None
         try:
             motion_features = compute_motion_features(landmarks_seq, w, h, fps)
         except Exception as e:
-            print(f"[WARN] 运动特征计算异常: {e}")
-            motion_features = None
+            print(f"  [WARN] 运动特征计算异常: {e}")
 
-        # 释放序列内存
+        # 释放内存
         del landmarks_seq
         del frames_seq
 
         if not result:
             return {"ok": False, "error": "动作处理失败(detector.process 返回空)"}
 
+        # 提取特征向量
         feature_vector = worker.feature_integrator.extract_action_features(
             action_name,
-            result['normalized_indicators'],
-            result['normalized_dynamic_features']
+            result.get('normalized_indicators', {}),
+            result.get('normalized_dynamic_features', {})
         )
 
         return {
@@ -514,12 +701,20 @@ class VideoPipeline:
             "elapsed_ms": (time.perf_counter() - t0) * 1000.0
         }
 
-    def process_all_examinations(self, batch_size=10):
-        """批量处理所有未处理的examinations（包括motion_features为空的情况）"""
+    def process_all_examinations(self, batch_size: int = 10) -> List[Dict]:
+        """
+        批量处理所有未处理的 examinations
+
+        Args:
+            batch_size: 每批处理数量
+
+        Returns:
+            处理结果列表
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # 修改查询：选择未处理的examination 或 已处理但motion_features为空的examination
+        # 查找未处理或 motion_features 为空的 examination
         cursor.execute("""
             SELECT DISTINCT e.examination_id
             FROM examinations e
@@ -564,7 +759,7 @@ class VideoPipeline:
 
         return results
 
-    def update_motion_features_only(self, batch_size=10):
+    def update_motion_features_only(self, batch_size: int = 10):
         """
         仅更新运动特征 (用于已处理过几何特征但缺少运动特征的数据)
         """
@@ -602,7 +797,7 @@ class VideoPipeline:
                     fail_count += 1
                     continue
 
-                # 提取landmarks
+                # 提取 landmarks
                 landmarks_seq, frames_seq = self._extract_sequence(
                     file_path, start_frame, end_frame
                 )
@@ -614,7 +809,7 @@ class VideoPipeline:
                 h, w = frames_seq[0].shape[:2]
 
                 # 计算运动特征
-                motion_features = compute_motion_features(landmarks_seq, w, h, fps)
+                motion_features = compute_motion_features(landmarks_seq, w, h, fps or 30.0)
 
                 del landmarks_seq
                 del frames_seq
@@ -646,10 +841,10 @@ class VideoPipeline:
         print(f"\n[Motion更新完成] 成功:{success_count} 失败:{fail_count}")
 
     # =========================================================================
-    # 辅助方法
+    # 数据库操作
     # =========================================================================
 
-    def _get_video_info(self, video_id):
+    def _get_video_info(self, video_id: int) -> Optional[Dict]:
         """从数据库获取视频信息"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -675,8 +870,8 @@ class VideoPipeline:
 
         return dict(row) if row else None
 
-    def _get_examination_videos(self, examination_id):
-        """获取某个examination的所有视频"""
+    def _get_examination_videos(self, examination_id: int) -> List[Dict]:
+        """获取某个 examination 的所有视频"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -703,8 +898,25 @@ class VideoPipeline:
 
         return [dict(row) for row in rows]
 
-    def _extract_sequence(self, video_path, start_frame, end_frame, extractor=None):
-        """提取视频序列"""
+    def _extract_sequence(
+        self,
+        video_path: str,
+        start_frame: int,
+        end_frame: int,
+        extractor: Optional[LandmarkExtractor] = None
+    ) -> Tuple[Optional[List], Optional[List[np.ndarray]]]:
+        """
+        提取视频序列
+
+        Args:
+            video_path: 视频文件路径
+            start_frame: 起始帧
+            end_frame: 结束帧
+            extractor: landmark 提取器
+
+        Returns:
+            (landmarks_seq, frames_seq)
+        """
         cap = cv2.VideoCapture(video_path)
 
         if not cap.isOpened():
@@ -737,14 +949,17 @@ class VideoPipeline:
 
         return landmarks_seq, frames_seq
 
-    def _denormalize_indicators(self, normalized_indicators, video_info):
-        """将归一化指标转换回原始像素值"""
-        return normalized_indicators
-
-    def _save_peak_frame(self, frame, examination_id, action_name, augmentation_type: str = 'none'):
+    def _save_peak_frame(
+        self,
+        frame: np.ndarray,
+        examination_id: int,
+        action_name: str,
+        augmentation_type: str = 'none'
+    ) -> Path:
         """保存峰值帧"""
         action_dir = self.keyframe_root_dir / action_name
         action_dir.mkdir(parents=True, exist_ok=True)
+
         aug = '' if augmentation_type in (None, '', 'none') else f"_{augmentation_type}"
         filename = f"{examination_id}_{action_name}{aug}.jpg"
         filepath = action_dir / filename
@@ -753,12 +968,21 @@ class VideoPipeline:
 
         return filepath
 
-    def _save_to_database(self, video_id, peak_frame_idx, peak_frame_path,
-                          unit_length, feature_vector, normalized_indicators,
-                          normalized_dynamic_features, motion_features=None,
-                          augmentation_type='none', aug_palsy_side=None):
+    def _save_to_database(
+        self,
+        video_id: int,
+        peak_frame_idx: int,
+        peak_frame_path: str,
+        unit_length: float,
+        feature_vector: np.ndarray,
+        normalized_indicators: Dict,
+        normalized_dynamic_features: Dict,
+        motion_features: Optional[np.ndarray] = None,
+        augmentation_type: str = 'none',
+        aug_palsy_side: Optional[str] = None
+    ):
         """
-        保存到数据库 (包含motion_features)
+        保存到数据库 (包含 motion_features)
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -766,6 +990,7 @@ class VideoPipeline:
         video_info = self._get_video_info(video_id)
         action_name = video_info['action_name_en']
 
+        # 获取该动作的关键指标定义
         key_indicators = self.feature_integrator.action_key_indicators.get(action_name, None)
         if key_indicators is None:
             print(f"  [WARN] 未在 action_key_indicators 中找到 {action_name}，跳过入库")
@@ -775,12 +1000,15 @@ class VideoPipeline:
         static_names = key_indicators['static']
         dynamic_names = key_indicators['dynamic']
 
+        # 提取静态特征
         static_vals = [
-            float(normalized_indicators.get(name, 0.0))
+            float(normalized_indicators.get(name, 0.0) or 0.0)
             for name in static_names
         ]
+
+        # 提取动态特征
         dynamic_vals = [
-            float(normalized_dynamic_features.get(name, 0.0))
+            float(normalized_dynamic_features.get(name, 0.0) or 0.0)
             for name in dynamic_names
         ]
 
@@ -800,6 +1028,12 @@ class VideoPipeline:
             motion_blob = motion_features.astype(np.float32).tobytes()
             motion_dim = 12
 
+        # 可解释性数据 (JSON)
+        interpretability_json = json.dumps({
+            'normalized_indicators': normalized_indicators,
+            'normalized_dynamic_features': normalized_dynamic_features
+        }, ensure_ascii=False, default=str)
+
         try:
             cursor.execute("""
                 INSERT INTO video_features (
@@ -815,9 +1049,10 @@ class VideoPipeline:
                     dynamic_dim,
                     motion_features,
                     motion_dim,
+                    interpretability,
                     geometry_processed_at,
                     motion_processed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """, (
                 video_id,
                 augmentation_type,
@@ -830,13 +1065,14 @@ class VideoPipeline:
                 static_dim,
                 dynamic_dim,
                 motion_blob,
-                motion_dim
+                motion_dim,
+                interpretability_json
             ))
 
             conn.commit()
 
         except sqlite3.IntegrityError:
-            # 更新
+            # 已存在则更新
             cursor.execute("""
                 UPDATE video_features
                 SET augmentation_type = ?,
@@ -850,6 +1086,7 @@ class VideoPipeline:
                     dynamic_dim = ?,
                     motion_features = ?,
                     motion_dim = ?,
+                    interpretability = ?,
                     geometry_processed_at = CURRENT_TIMESTAMP,
                     motion_processed_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
@@ -866,6 +1103,7 @@ class VideoPipeline:
                 dynamic_dim,
                 motion_blob,
                 motion_dim,
+                interpretability_json,
                 video_id
             ))
 
@@ -882,10 +1120,10 @@ class VideoPipeline:
 def main():
     """主函数"""
 
-    # 基本路径配置
+    # 基本路径配置 - 根据实际环境修改
     db_path = 'facialPalsy.db'
-    model_path = '/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task'
-    keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes'
+    model_path = '/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task'  # 修改为实际路径
+    keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes_new'           # 修改为实际路径
     os.makedirs(keyframe_dir, exist_ok=True)
 
     # 运行模式

@@ -4,13 +4,6 @@
 
 所有面部测量的几何计算基础
 
-规范化指标:
-- C001: eye_area_ratio (眼裂面积比)
-- C002L/R: left/right_eye_area_norm (归一化眼裂面积)
-- C005: left/right_eye_openness (睁眼度)
-- C006: left/right_eye_closure (眼闭拢度)
-- C004: complete_closure (完全闭眼)
-
 单位长度: ICD (Inner Canthi Distance) = 双眼内眦距离
 """
 
@@ -18,70 +11,8 @@ import numpy as np
 from typing import Tuple, List, Optional
 from dataclasses import dataclass
 
-
-# =============================================================================
-# MediaPipe 478点关键点索引
-# =============================================================================
-
-class LM:
-    """MediaPipe FaceLandmarker 478点索引 (Landmark indices)"""
-
-    # 眼部内外眦点
-    EYE_INNER_L = 362      # 左眼内眦
-    EYE_INNER_R = 133      # 右眼内眦
-    EYE_OUTER_L = 263      # 左眼外眦
-    EYE_OUTER_R = 33       # 右眼外眦
-
-    # 眼睑中点
-    EYE_TOP_L = 386        # 左眼上眼睑中点
-    EYE_BOT_L = 374        # 左眼下眼睑中点
-    EYE_TOP_R = 159        # 右眼上眼睑中点
-    EYE_BOT_R = 145        # 右眼下眼睑中点
-
-    # 眼部轮廓 (16点)
-    EYE_CONTOUR_L = [263, 466, 388, 387, 386, 385, 384, 398,
-                    362, 382, 381, 380, 374, 373, 390, 249]
-    EYE_CONTOUR_R = [33, 246, 161, 160, 159, 158, 157, 173,
-                    133, 155, 154, 153, 145, 144, 163, 7]
-
-    # EAR计算用点
-    EAR_L = [263, 386, 387, 362, 373, 374]  # 左眼EAR点
-    EAR_R = [33, 159, 158, 133, 144, 145]   # 右眼EAR点
-
-    # 眉毛
-    BROW_L = [276, 283, 282, 295, 300]
-    BROW_R = [46, 53, 52, 65, 70]
-    BROW_CENTER_L = 282
-    BROW_CENTER_R = 52
-
-    # 嘴部
-    MOUTH_L = 291          # 左嘴角
-    MOUTH_R = 61           # 右嘴角
-    LIP_TOP = 13           # 上唇顶
-    LIP_BOT = 14           # 下唇底
-    LIP_TOP_CENTER = 0     # 上唇中心
-    LIP_BOT_CENTER = 17    # 下唇中心
-
-    # 唇峰 (口角角度计算用)
-    LIP_PEAK_L = 37
-    LIP_PEAK_R = 267
-
-    # 鼻部
-    NOSE_TIP = 4
-    NOSE_ALA_L = 129       # 左鼻翼
-    NOSE_ALA_R = 358       # 右鼻翼
-
-    # 面颊
-    CHEEK_L = [425, 426, 427, 411, 280]
-    CHEEK_R = [205, 206, 207, 187, 50]
-
-    # 面部轮廓
-    FACE_CONTOUR_L = [234, 93, 132, 58, 172]
-    FACE_CONTOUR_R = [454, 323, 361, 288, 397]
-
-    # 其他
-    FOREHEAD = 10
-    CHIN = 152
+# 从constants模块导入所有常量
+from .constants import LM, Thresholds
 
 
 # =============================================================================
@@ -120,7 +51,7 @@ def pt_to_line_dist(pt, line_start, line_end) -> float:
     """点到线段的垂直距离"""
     lv = (line_end[0] - line_start[0], line_end[1] - line_start[1])
     ll = np.sqrt(lv[0]**2 + lv[1]**2)
-    if ll < 1e-9:
+    if ll < Thresholds.EPSILON:
         return dist(pt, line_start)
     pv = (pt[0] - line_start[0], pt[1] - line_start[1])
     cross = abs(lv[0] * pv[1] - lv[1] * pv[0])
@@ -179,7 +110,7 @@ def compute_ear(landmarks, w: int, h: int, left: bool = True) -> float:
     v1 = dist(p[1], p[5])
     v2 = dist(p[2], p[4])
     h_dist = dist(p[0], p[3])
-    if h_dist < 1e-9:
+    if h_dist < Thresholds.EPSILON:
         return 0.0
     return (v1 + v2) / (2.0 * h_dist)
 
@@ -188,12 +119,12 @@ def compute_ear(landmarks, w: int, h: int, left: bool = True) -> float:
 class EyeMeasure:
     """单眼测量结果"""
     area_raw: float           # 原始眼裂面积
-    area_norm: float          # C002: 归一化眼裂面积
+    area_norm: float          #  归一化眼裂面积
     palpebral_length: float   # 眼睑裂长度
     palpebral_height: float   # 眼睑裂高度
-    openness: float           # C005: 睁眼度 (0-1+)
-    closure: float            # C006: 闭拢度 (0-1)
-    complete_closure: bool    # C004: 完全闭眼
+    openness: float           # 睁眼度 (0-1+)
+    closure: float            # 闭拢度 (0-1)
+    complete_closure: bool    # 完全闭眼
     ear: float                # EAR值
     contour: np.ndarray       # 轮廓点
 
@@ -215,24 +146,24 @@ def measure_eye(
     palp_hgt = compute_palpebral_height(landmarks, w, h, left)
     ear = compute_ear(landmarks, w, h, left)
 
-    # C002: 归一化面积
+    # 归一化面积
     icd_sq = icd ** 2
-    area_norm = area_raw / icd_sq if icd_sq > 1e-9 else 0.0
+    area_norm = area_raw / icd_sq if icd_sq > Thresholds.EPSILON else 0.0
 
-    # C005: 睁眼度
-    if baseline_area is not None and baseline_area > 1e-9:
+    # 睁眼度
+    if baseline_area is not None and baseline_area > Thresholds.EPSILON:
         # 有基准: 计算scale并调整
-        if baseline_palp_len is not None and baseline_palp_len > 1e-9:
+        if baseline_palp_len is not None and baseline_palp_len > Thresholds.EPSILON:
             scale = palp_len / baseline_palp_len
             scale_sq = scale ** 2
-            adjusted_area = area_raw / scale_sq if scale_sq > 1e-9 else area_raw
+            adjusted_area = area_raw / scale_sq if scale_sq > Thresholds.EPSILON else area_raw
             openness = adjusted_area / baseline_area
         else:
             openness = area_raw / baseline_area
     else:
         # 无基准: 使用面积/长度²
         palp_len_sq = palp_len ** 2
-        if palp_len_sq > 1e-9:
+        if palp_len_sq > Thresholds.EPSILON:
             raw_openness = area_raw / palp_len_sq
             # 经验归一化 (典型睁眼时约0.2-0.3)
             openness = min(1.0, raw_openness / 0.25)
@@ -241,11 +172,11 @@ def measure_eye(
 
     openness = max(0.0, openness)
 
-    # C006: 闭拢度
+    # 闭拢度
     closure = max(0.0, 1.0 - min(1.0, openness))
 
-    # C004: 完全闭眼 (睁眼度 <= 6.25%)
-    complete_closure = openness <= 0.0625
+    # 完全闭眼
+    complete_closure = openness <= Thresholds.COMPLETE_CLOSURE
 
     return EyeMeasure(
         area_raw=area_raw,
@@ -289,9 +220,9 @@ def measure_eyes(
                         baseline_palp_len=baseline_r_palp_len)
 
     # C001
-    area_ratio = left.area_raw / right.area_raw if right.area_raw > 1e-9 else float('inf')
-    openness_ratio = left.openness / right.openness if right.openness > 1e-9 else (
-        float('inf') if left.openness > 1e-9 else 1.0)
+    area_ratio = left.area_raw / right.area_raw if right.area_raw > Thresholds.EPSILON else float('inf')
+    openness_ratio = left.openness / right.openness if right.openness > Thresholds.EPSILON else (
+        float('inf') if left.openness > Thresholds.EPSILON else 1.0)
     asymmetry = abs(1.0 - area_ratio) if area_ratio != float('inf') else 1.0
 
     return BilateralEyeMeasure(
@@ -320,7 +251,7 @@ class OralMeasure:
 
 
 def measure_oral(landmarks, w: int, h: int, icd: float) -> OralMeasure:
-    """口角测量 (参考Kim 2021)"""
+    """口角测量"""
     l_corner = pt2d(landmarks[LM.MOUTH_L], w, h)
     r_corner = pt2d(landmarks[LM.MOUTH_R], w, h)
 
@@ -331,7 +262,7 @@ def measure_oral(landmarks, w: int, h: int, icd: float) -> OralMeasure:
     def angle(corner):
         dy = midline_y - corner[1]  # 正=上方
         dx = abs(corner[0] - midpoint_x)
-        if dx < 1e-9:
+        if dx < Thresholds.EPSILON:
             return 90.0 if dy > 0 else -90.0 if dy < 0 else 0.0
         return np.degrees(np.arctan2(dy, dx))
 
@@ -339,7 +270,7 @@ def measure_oral(landmarks, w: int, h: int, icd: float) -> OralMeasure:
     right_angle = angle(r_corner)
 
     # 高度差 (正=左侧更低=左侧下垂)
-    height_diff = (l_corner[1] - r_corner[1]) / icd if icd > 1e-9 else 0.0
+    height_diff = (l_corner[1] - r_corner[1]) / icd if icd > Thresholds.EPSILON else 0.0
 
     # 嘴宽高
     mouth_width = dist(l_corner, r_corner)
@@ -377,7 +308,7 @@ class NLFMeasure:
 
 
 def measure_nlf(landmarks, w: int, h: int, icd: float) -> NLFMeasure:
-    """鼻唇沟测量 (参考Wang 2022)"""
+    """鼻唇沟测量"""
     l_ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
     r_ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
     l_mouth = pt2d(landmarks[LM.MOUTH_L], w, h)
@@ -386,9 +317,9 @@ def measure_nlf(landmarks, w: int, h: int, icd: float) -> NLFMeasure:
     l_len = dist(l_ala, l_mouth)
     r_len = dist(r_ala, r_mouth)
 
-    l_len_norm = l_len / icd if icd > 1e-9 else 0.0
-    r_len_norm = r_len / icd if icd > 1e-9 else 0.0
-    len_ratio = l_len / r_len if r_len > 1e-9 else 1.0
+    l_len_norm = l_len / icd if icd > Thresholds.EPSILON else 0.0
+    r_len_norm = r_len / icd if icd > Thresholds.EPSILON else 0.0
+    len_ratio = l_len / r_len if r_len > Thresholds.EPSILON else 1.0
 
     # 深度代理
     l_cheek = pts2d(landmarks, LM.CHEEK_L, w, h)
@@ -399,7 +330,7 @@ def measure_nlf(landmarks, w: int, h: int, icd: float) -> NLFMeasure:
 
     l_depth = np.mean(l_dists) if l_dists else 0.0
     r_depth = np.mean(r_dists) if r_dists else 0.0
-    depth_ratio = l_depth / r_depth if r_depth > 1e-9 else 1.0
+    depth_ratio = l_depth / r_depth if r_depth > Thresholds.EPSILON else 1.0
 
     return NLFMeasure(
         left_length=l_len, right_length=r_len,
@@ -444,12 +375,12 @@ def measure_brow(
     l_hgt = brow_eye_dist(True)
     r_hgt = brow_eye_dist(False)
 
-    l_hgt_norm = l_hgt / icd if icd > 1e-9 else 0.0
-    r_hgt_norm = r_hgt / icd if icd > 1e-9 else 0.0
-    hgt_ratio = l_hgt / r_hgt if r_hgt > 1e-9 else 1.0
+    l_hgt_norm = l_hgt / icd if icd > Thresholds.EPSILON else 0.0
+    r_hgt_norm = r_hgt / icd if icd > Thresholds.EPSILON else 0.0
+    hgt_ratio = l_hgt / r_hgt if r_hgt > Thresholds.EPSILON else 1.0
 
-    l_lift = (l_hgt - baseline_l_height) / icd if baseline_l_height is not None and icd > 1e-9 else 0.0
-    r_lift = (r_hgt - baseline_r_height) / icd if baseline_r_height is not None and icd > 1e-9 else 0.0
+    l_lift = (l_hgt - baseline_l_height) / icd if baseline_l_height is not None and icd > Thresholds.EPSILON else 0.0
+    r_lift = (r_hgt - baseline_r_height) / icd if baseline_r_height is not None and icd > Thresholds.EPSILON else 0.0
 
     return BrowMeasure(
         left_height=l_hgt, right_height=r_hgt,
@@ -462,6 +393,46 @@ def measure_brow(
 # =============================================================================
 # 关键帧查找
 # =============================================================================
+
+def _fill_nan_curve(arr: np.ndarray) -> np.ndarray:
+    """将曲线中的 NaN 用前向填充 + 后向填充补齐，避免后续 max/min 产生 NaN。"""
+    if arr.size == 0:
+        return arr
+    if np.isnan(arr).all():
+        return np.zeros_like(arr)
+    # 前向填充
+    for i in range(1, len(arr)):
+        if np.isnan(arr[i]):
+            arr[i] = arr[i - 1]
+    # 后向填充（补齐开头 NaN）
+    for i in range(len(arr) - 2, -1, -1):
+        if np.isnan(arr[i]):
+            arr[i] = arr[i + 1]
+    arr[np.isnan(arr)] = 0.0
+    return arr
+
+
+def compute_ear_curve(landmarks_seq, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    计算左右眼 EAR 曲线（用于眨眼事件检测/可视化）。
+
+    注意：
+    - landmarks_seq 中可能存在 None（该帧未检测到人脸），这里会用 NaN 占位，
+      再做前/后向填充，保证输出曲线全为有效数值，避免 max()/min() 变成 NaN。
+    """
+    n = len(landmarks_seq)
+    l_curve = np.full(n, np.nan, dtype=np.float32)
+    r_curve = np.full(n, np.nan, dtype=np.float32)
+
+    for i, lm in enumerate(landmarks_seq):
+        if lm is None:
+            continue
+        l_curve[i] = compute_ear(lm, w, h, True)
+        r_curve[i] = compute_ear(lm, w, h, False)
+
+    l_curve = _fill_nan_curve(l_curve)
+    r_curve = _fill_nan_curve(r_curve)
+    return l_curve, r_curve
 
 def find_max_ear_frame(landmarks_seq, w: int, h: int) -> Tuple[int, float, float]:
     """找EAR最大帧 (NeutralFace关键帧)"""

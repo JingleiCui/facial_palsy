@@ -15,12 +15,29 @@ import numpy as np
 from typing import Dict, List, Optional, Any
 import cv2
 
-from .base_action import BaseAction, ActionResult, NeutralBaseline
+# ========== 第1步：导入常量 ==========
+# 从constants模块导入所有需要的常量
+from ..core.constants import LM, Colors, Thresholds
+
+# ========== 第2步：导入几何工具 ==========
+# 根据动作需要选择性导入
 from ..core.geometry_utils import (
-    LM, compute_icd, compute_ear,
-    measure_eyes, find_min_ear_frame, compute_openness_curve,
-    pts2d, pt2d
+    compute_icd,           # ICD计算
+    compute_ear,           # EAR计算
+    measure_eyes,          # 眼部测量
+    measure_oral,          # 口角测量
+    measure_nlf,           # 鼻唇沟测量
+    measure_brow,          # 眉毛测量
+    find_max_ear_frame,    # 找最大EAR帧
+    find_min_ear_frame,    # 找最小EAR帧
+    compute_openness_curve,  # 计算睁眼度曲线
+    pts2d,                 # 批量获取2D坐标
+    pt2d,                  # 单点2D坐标
+    dist,                  # 距离计算
 )
+
+# ========== 第3步：导入基类 ==========
+from .base_action import BaseAction, ActionResult, NeutralBaseline
 from .close_eye_softly import CloseEyeSoftlyAction
 
 class CloseEyeHardlyAction(CloseEyeSoftlyAction):

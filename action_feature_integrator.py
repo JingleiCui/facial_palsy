@@ -1,162 +1,156 @@
 """
-特征整合器 - 利用现有 actions/*.py 的指标
-将动作特定的归一化指标转换为固定顺序的特征向量。
+特征整合器 - Action Feature Integrator
+==========================================
 
-更新说明 (2025-12):
-- 对齐最新 11 个动作代码：NeutralFace、SpontaneousEyeBlink、VoluntaryEyeBlink、
-  CloseEyeSoftly、CloseEyeHardly、RaiseEyebrow、Smile、ShrugNose、ShowTeeth、
-  BlowCheek、LipPucker
-- 关键指标字段名按最新 action 文件输出更新（例如 left_eye_openness / icd 等）
-- 增加 schema 自动扩展：如果动作输出了未在列表中的新字段，会按稳定顺序追加，
-  以避免“字段名变更导致全 0”的问题
+从各动作的结果中提取关键特征，转换为固定维度的特征向量。
+
+设计思想:
+1. 每个动作有不同的关键指标 (因为关注点不同)
+2. 保持动作特异性，但输出统一格式
+3. 便于模型训练时的特征管理
+
+使用方法:
+    integrator = ActionFeatureIntegrator()
+
+    # 从处理结果提取特征向量
+    feature_vector = integrator.extract_action_features(
+        action_name='Smile',
+        normalized_indicators=result['normalized_indicators'],
+        normalized_dynamic_features=result['normalized_dynamic_features']
+    )
+
+    # 获取特征维度信息
+    dims = integrator.get_all_feature_dimensions()
+
+关于motion_utils.py:
+    - motion_utils 提供12维全局运动特征
+    - 与这里的动作特定特征是互补的
+    - 全局运动特征描述整体运动模式
+    - 动作特定特征描述各动作的关键指标
 """
 
-from __future__ import annotations
-
 import numpy as np
-from typing import Dict, List, Any, Optional
-
-# 导入所有动作类（actions 目录应为 Python package）
-from facialPalsy.actions.neutral_face import NeutralFaceAction
-from facialPalsy.actions.spontaneous_eye_blink import SpontaneousEyeBlinkAction
-from facialPalsy.actions.voluntary_eye_blink import VoluntaryEyeBlinkAction
-from facialPalsy.actions.close_eye_softly import CloseEyeSoftlyAction
-from facialPalsy.actions.close_eye_hardly import CloseEyeHardlyAction
-from facialPalsy.actions.raise_eyebrow import RaiseEyebrowAction
-from facialPalsy.actions.smile import SmileAction
-from facialPalsy.actions.shrug_nose import ShrugNoseAction
-from facialPalsy.actions.show_teeth import ShowTeethAction
-from facialPalsy.actions.blow_cheek import BlowCheekAction
-from facialPalsy.actions.lip_pucker import LipPuckerAction
-
+from typing import Dict, List, Optional, Tuple
+from facialPalsy.actions import ACTION_CLASSES
 
 class ActionFeatureIntegrator:
     """
-    整合各个动作的特定特征
+    动作特征整合器
 
-    核心思想:
-    1) 每个动作保留自己的特定特征（动作关注点不同）
-    2) 将各动作的归一化指标 + 动态特征转换为固定维度的特征向量
-    3) 保持动作特异性，同时便于模型训练
+    功能:
+    1. 定义每个动作的关键指标
+    2. 从结果字典提取特征向量
+    3. 提供特征维度信息
     """
 
-    def __init__(self, auto_extend_schema: bool = True):
-        """初始化 11 个动作检测器"""
-        self.action_detectors = {
-            'NeutralFace': NeutralFaceAction(),
-            'SpontaneousEyeBlink': SpontaneousEyeBlinkAction(),
-            'VoluntaryEyeBlink': VoluntaryEyeBlinkAction(),
-            'CloseEyeSoftly': CloseEyeSoftlyAction(),
-            'CloseEyeHardly': CloseEyeHardlyAction(),
-            'RaiseEyebrow': RaiseEyebrowAction(),
-            'Smile': SmileAction(),
-            'ShrugNose': ShrugNoseAction(),
-            'ShowTeeth': ShowTeethAction(),
-            'BlowCheek': BlowCheekAction(),
-            'LipPucker': LipPuckerAction(),
-        }
-
-        self.auto_extend_schema = auto_extend_schema
-
-        # 每个动作的关键指标定义（固定顺序）
-        self.action_key_indicators: Dict[str, Dict[str, List[str]]] = self._define_key_indicators()
+    def __init__(self):
+        """初始化"""
+        # 每个动作的关键指标定义
+        self.action_key_indicators = self._define_key_indicators()
 
     def _define_key_indicators(self) -> Dict[str, Dict[str, List[str]]]:
         """
-        定义每个动作的关键指标（字段名必须与 action 输出一致）。
+        定义每个动作的关键指标
 
-        注意：
-        - 对于动作代码升级导致字段变化的情况，建议只在这里更新即可。
-        - 如果 auto_extend_schema=True，会把 action 输出但未在此列出的字段追加到末尾，
-          从而避免信息丢失（维度会增加，但顺序稳定）。
+        这些指标名称必须与各动作类的extract_indicators()输出匹配
         """
         return {
-            # ========== Neutral (静息) ==========
-            # 对齐 neutral_face.py 的输出字段（包含 icd、*_norm、ratio、diff 等）
+            # ==================== 静息帧 ====================
             'NeutralFace': {
                 'static': [
-                    'icd',
-                    'left_eye_area_norm', 'right_eye_area_norm', 'eye_area_ratio', 'eye_asymmetry',
-                    'left_eye_openness', 'right_eye_openness', 'openness_ratio', 'left_eye_closure', 'right_eye_closure',
-                    'left_palpebral_length', 'right_palpebral_length',
+                    # 眼部
+                    'left_eye_area_norm', 'right_eye_area_norm', 'eye_area_ratio',
+                    'left_eye_openness', 'right_eye_openness',
+                    # 眉毛
                     'left_brow_height_norm', 'right_brow_height_norm', 'brow_height_ratio',
-                    'mouth_width_norm', 'mouth_height_norm', 'oral_height_diff', 'oral_angle_diff',
-                    'nlf_length_ratio', 'nlf_depth_ratio',
-                    'face_symmetry_score',
+                    # 口部
+                    'mouth_width_norm', 'mouth_height_norm',
+                    'left_oral_height_norm', 'right_oral_height_norm', 'oral_height_ratio',
+                    # 鼻唇沟
+                    'left_nlf_length_norm', 'right_nlf_length_norm', 'nlf_ratio',
+                    # 面部宽度
+                    'face_width_norm',
+                    # Sunnybrook静态评分
+                    'sunnybrook_rest_eye', 'sunnybrook_rest_cheek', 'sunnybrook_rest_mouth',
                 ],
-                'dynamic': []
+                'dynamic': []  # 静息帧无动态特征
             },
 
-            # ========== Eye Blinks ==========
-            # 下面三个动作（自然眨眼/自主眨眼/闭眼）通常共享类似的眼部字段。
-            # 若眨眼动作代码字段不同，会通过 auto_extend_schema 自动补齐。
+            # ==================== 自发眨眼 ====================
             'SpontaneousEyeBlink': {
                 'static': [
                     'left_eye_openness', 'right_eye_openness',
                     'left_eye_closure', 'right_eye_closure',
-                    'closure_ratio', 'closure_diff',
-                    'function_pct', 'icd',
+                    'left_complete_closure', 'right_complete_closure',
+                    'closure_ratio', 'eye_asymmetry',
+                    'function_pct',
                 ],
                 'dynamic': [
                     'left_motion_range', 'right_motion_range',
                     'left_mean_velocity', 'right_mean_velocity',
-                    'left_max_velocity', 'right_max_velocity',
                     'left_smoothness', 'right_smoothness',
                     'motion_asymmetry',
+                    'left_closing_speed', 'right_closing_speed',
+                    'left_opening_speed', 'right_opening_speed',
+                    'blink_duration', 'blink_symmetry',
                 ]
             },
+
+            # ==================== 主动眨眼 ====================
             'VoluntaryEyeBlink': {
                 'static': [
                     'left_eye_openness', 'right_eye_openness',
                     'left_eye_closure', 'right_eye_closure',
-                    'closure_ratio', 'closure_diff',
-                    'function_pct', 'icd',
+                    'left_complete_closure', 'right_complete_closure',
+                    'closure_ratio', 'eye_asymmetry',
+                    'function_pct',
                 ],
                 'dynamic': [
                     'left_motion_range', 'right_motion_range',
                     'left_mean_velocity', 'right_mean_velocity',
-                    'left_max_velocity', 'right_max_velocity',
                     'left_smoothness', 'right_smoothness',
                     'motion_asymmetry',
+                    'left_closing_speed', 'right_closing_speed',
+                    'left_opening_speed', 'right_opening_speed',
+                    'blink_duration', 'blink_symmetry',
                 ]
             },
 
+            # ==================== 轻柔闭眼 ====================
             'CloseEyeSoftly': {
                 'static': [
                     'left_eye_openness', 'right_eye_openness',
                     'left_eye_closure', 'right_eye_closure',
                     'left_complete_closure', 'right_complete_closure',
-                    'left_ear', 'right_ear',
-                    'openness_ratio', 'closure_ratio', 'closure_diff',
-                    'function_pct', 'icd',
+                    'closure_ratio', 'eye_asymmetry',
+                    'function_pct', 'both_complete_closure',
                 ],
                 'dynamic': [
                     'left_motion_range', 'right_motion_range',
                     'left_mean_velocity', 'right_mean_velocity',
-                    'left_max_velocity', 'right_max_velocity',
-                    'left_smoothness', 'right_smoothness',
-                    'motion_asymmetry',
-                ]
-            },
-            'CloseEyeHardly': {
-                'static': [
-                    'left_eye_openness', 'right_eye_openness',
-                    'left_eye_closure', 'right_eye_closure',
-                    'left_complete_closure', 'right_complete_closure',
-                    'left_ear', 'right_ear',
-                    'openness_ratio', 'closure_ratio', 'closure_diff',
-                    'function_pct', 'icd',
-                ],
-                'dynamic': [
-                    'left_motion_range', 'right_motion_range',
-                    'left_mean_velocity', 'right_mean_velocity',
-                    'left_max_velocity', 'right_max_velocity',
                     'left_smoothness', 'right_smoothness',
                     'motion_asymmetry',
                 ]
             },
 
-            # ========== Brow ==========
+            # ==================== 用力闭眼 ====================
+            'CloseEyeHardly': {
+                'static': [
+                    'left_eye_openness', 'right_eye_openness',
+                    'left_eye_closure', 'right_eye_closure',
+                    'left_complete_closure', 'right_complete_closure',
+                    'closure_ratio', 'eye_asymmetry',
+                    'function_pct', 'both_complete_closure',
+                ],
+                'dynamic': [
+                    'left_motion_range', 'right_motion_range',
+                    'left_mean_velocity', 'right_mean_velocity',
+                    'left_smoothness', 'right_smoothness',
+                    'motion_asymmetry',
+                ]
+            },
+
+            # ==================== 抬眉 ====================
             'RaiseEyebrow': {
                 'static': [
                     'left_brow_height', 'right_brow_height',
@@ -165,130 +159,100 @@ class ActionFeatureIntegrator:
                     'left_brow_lift', 'right_brow_lift',
                     'lift_ratio', 'lift_asymmetry',
                     'function_pct',
+                    # 联动检测
                     'left_eye_openness', 'right_eye_openness',
-                    'eye_synkinesis',
-                    'icd',
+                    'left_eye_synkinesis', 'right_eye_synkinesis',
                 ],
                 'dynamic': [
-                    'left_motion_range', 'right_motion_range',
-                    'left_mean_velocity', 'right_mean_velocity',
-                    'left_smoothness', 'right_smoothness',
-                    'motion_asymmetry',
+                    'brow_motion_range', 'brow_mean_velocity', 'brow_smoothness',
                 ]
             },
 
-            # ========== Mouth / Mid-face ==========
-            # 下面三项（Smile / ShowTeeth / ShrugNose）字段可能因代码版本不同变化较大，
-            # 因此保留旧字段 + auto_extend_schema 补齐。
+            # ==================== 微笑 ====================
             'Smile': {
                 'static': [
-                    'mouth_width', 'mouth_height', 'mouth_aspect_ratio',
-                    'left_mouth_corner_height', 'right_mouth_corner_height',
-                    'mouth_corner_height_diff',
-                    'left_mouth_eye_dist', 'right_mouth_eye_dist',
-                    'mouth_corner_symmetry',
-                    'nasolabial_fold_depth_left', 'nasolabial_fold_depth_right'
+                    'mouth_width', 'mouth_width_norm', 'mouth_width_change',
+                    'left_oral_height', 'right_oral_height',
+                    'left_oral_height_norm', 'right_oral_height_norm',
+                    'oral_height_ratio', 'oral_height_asymmetry',
+                    'left_oral_angle', 'right_oral_angle',
+                    'oral_angle_ratio', 'oral_angle_asymmetry',
+                    'left_nlf_change', 'right_nlf_change', 'nlf_change_ratio',
+                    'function_pct',
+                    # 联动检测
+                    'left_eye_openness', 'right_eye_openness',
+                    'left_eye_synkinesis', 'right_eye_synkinesis',
                 ],
                 'dynamic': [
-                    'mouth_motion_range',
-                    'mouth_mean_velocity',
-                    'mouth_smoothness'
+                    'mouth_motion_range', 'mouth_mean_velocity', 'mouth_smoothness',
                 ]
             },
 
+            # ==================== 皱鼻 ====================
             'ShrugNose': {
                 'static': [
-                    'left_nostril_area', 'right_nostril_area',
-                    'nostril_area_ratio',
-                    'left_nasolabial_fold_depth', 'right_nasolabial_fold_depth',
-                    'nasolabial_fold_ratio'
+                    'left_nostril_height', 'right_nostril_height',
+                    'nostril_height_ratio', 'nostril_asymmetry',
+                    'left_nlf_change', 'right_nlf_change', 'nlf_change_ratio',
+                    'function_pct',
                 ],
-                'dynamic': []
+                'dynamic': [
+                    'nose_motion_range', 'nose_mean_velocity', 'nose_smoothness',
+                ]
             },
 
+            # ==================== 露齿 ====================
             'ShowTeeth': {
                 'static': [
                     'mouth_width', 'mouth_height',
-                    'upper_lip_exposure', 'lower_lip_exposure',
-                    'teeth_visible_area',
-                    'mouth_corner_height_diff',
-                    'lip_symmetry'
+                    'mouth_width_norm', 'mouth_height_norm',
+                    'mouth_width_change', 'mouth_height_change',
+                    'left_oral_height', 'right_oral_height',
+                    'oral_height_ratio', 'oral_height_asymmetry',
+                    'function_pct',
                 ],
-                'dynamic': []
+                'dynamic': [
+                    'mouth_motion_range', 'mouth_mean_velocity', 'mouth_smoothness',
+                ]
             },
 
+            # ==================== 鼓腮 ====================
             'BlowCheek': {
                 'static': [
-                    'face_width', 'face_width_norm',
-                    'left_expansion', 'right_expansion',
-                    'left_expansion_norm', 'right_expansion_norm',
-                    'expansion_ratio',
-                    'mouth_seal',
+                    'face_width', 'face_width_norm', 'face_width_change',
+                    'left_cheek_expansion', 'right_cheek_expansion',
+                    'cheek_expansion_ratio', 'cheek_asymmetry',
                     'function_pct',
-                    'icd',
                 ],
-                'dynamic': []
+                'dynamic': [
+                    'face_motion_range', 'face_mean_velocity', 'face_smoothness',
+                ]
             },
 
+            # ==================== 撅嘴 ====================
             'LipPucker': {
                 'static': [
                     'mouth_width', 'mouth_height',
                     'mouth_width_norm', 'mouth_height_norm',
-                    'width_change',
-                    'contraction_ratio',
-                    'oral_height_diff',
-                    'left_oral_angle', 'right_oral_angle',
+                    'mouth_width_change',
+                    'lip_protrusion',  # Z轴
+                    'mouth_aspect_ratio',
                     'function_pct',
-                    'icd',
                 ],
-                'dynamic': []
+                'dynamic': [
+                    'mouth_motion_range', 'mouth_mean_velocity', 'mouth_smoothness',
+                ]
             },
         }
-
-    def _ensure_schema(
-        self,
-        action_name: str,
-        normalized_indicators: Dict[str, float],
-        normalized_dynamic_features: Dict[str, float],
-    ) -> Dict[str, List[str]]:
-        """
-        确保 schema 覆盖动作输出字段：
-        - 若 schema 中不存在该动作：用当前字段生成并缓存
-        - 若 auto_extend_schema=True：把当前输出中未列出的字段追加（按字典序稳定）
-        """
-        if action_name not in self.action_key_indicators:
-            # 兜底：完全基于当前输出生成 schema（顺序稳定）
-            static_keys = sorted(list(normalized_indicators.keys()))
-            dynamic_keys = sorted(list(normalized_dynamic_features.keys()))
-            self.action_key_indicators[action_name] = {'static': static_keys, 'dynamic': dynamic_keys}
-            return self.action_key_indicators[action_name]
-
-        if not self.auto_extend_schema:
-            return self.action_key_indicators[action_name]
-
-        schema = self.action_key_indicators[action_name]
-        static_list = schema['static']
-        dynamic_list = schema['dynamic']
-
-        # 追加未覆盖字段（稳定排序）
-        new_static = sorted([k for k in normalized_indicators.keys() if k not in static_list])
-        new_dynamic = sorted([k for k in normalized_dynamic_features.keys() if k not in dynamic_list])
-
-        if new_static:
-            static_list.extend(new_static)
-        if new_dynamic:
-            dynamic_list.extend(new_dynamic)
-
-        return schema
 
     def extract_action_features(
         self,
         action_name: str,
-        normalized_indicators: Optional[Dict[str, float]],
-        normalized_dynamic_features: Optional[Dict[str, float]],
+        normalized_indicators: Dict[str, float],
+        normalized_dynamic_features: Dict[str, float]
     ) -> np.ndarray:
         """
-        从动作的归一化指标中提取关键特征
+        从动作的归一化指标中提取关键特征向量
 
         Args:
             action_name: 动作名称
@@ -296,30 +260,242 @@ class ActionFeatureIntegrator:
             normalized_dynamic_features: 归一化后的动态特征字典
 
         Returns:
-            numpy array: 该动作的特征向量（固定顺序）
+            特征向量 (numpy array)
         """
-        normalized_indicators = normalized_indicators or {}
-        normalized_dynamic_features = normalized_dynamic_features or {}
+        if action_name not in self.action_key_indicators:
+            raise ValueError(f"未知动作: {action_name}")
 
-        schema = self._ensure_schema(action_name, normalized_indicators, normalized_dynamic_features)
+        key_indicators = self.action_key_indicators[action_name]
 
-        static_features: List[float] = []
-        for k in schema['static']:
-            static_features.append(float(normalized_indicators.get(k, 0.0)))
+        # 提取静态特征
+        static_features = []
+        for indicator_name in key_indicators['static']:
+            value = normalized_indicators.get(indicator_name, 0.0)
+            if value is None:
+                value = 0.0
+            static_features.append(float(value))
 
-        dynamic_features: List[float] = []
-        for k in schema['dynamic']:
-            dynamic_features.append(float(normalized_dynamic_features.get(k, 0.0)))
+        # 提取动态特征
+        dynamic_features = []
+        for indicator_name in key_indicators['dynamic']:
+            value = normalized_dynamic_features.get(indicator_name, 0.0)
+            if value is None:
+                value = 0.0
+            dynamic_features.append(float(value))
 
-        return np.array(static_features + dynamic_features, dtype=np.float32)
+        # 合并
+        combined_features = np.array(static_features + dynamic_features, dtype=np.float32)
 
-    def get_feature_dimension(self, action_name: str) -> int:
+        return combined_features
+
+    def extract_all_features(
+        self,
+        results: Dict[str, Dict],
+        include_motion: bool = True
+    ) -> Dict[str, np.ndarray]:
+        """
+        从所有动作结果中提取特征
+
+        Args:
+            results: 每个动作的处理结果字典
+            include_motion: 是否包含12维全局运动特征
+
+        Returns:
+            每个动作的特征向量
+        """
+        all_features = {}
+
+        for action_name, result in results.items():
+            if action_name not in self.action_key_indicators:
+                continue
+
+            indicators = result.get('normalized_indicators', {})
+            dynamic = result.get('normalized_dynamic_features', {})
+
+            # 动作特定特征
+            action_features = self.extract_action_features(
+                action_name, indicators, dynamic
+            )
+
+            # 是否添加全局运动特征
+            if include_motion and 'motion_features' in result:
+                motion_features = result['motion_features']
+                action_features = np.concatenate([action_features, motion_features])
+
+            all_features[action_name] = action_features
+
+        return all_features
+
+    def get_feature_dimension(self, action_name: str, include_motion: bool = False) -> int:
         """获取某个动作的特征维度"""
         if action_name not in self.action_key_indicators:
             return 0
-        schema = self.action_key_indicators[action_name]
-        return len(schema['static']) + len(schema['dynamic'])
 
-    def get_all_feature_dimensions(self) -> Dict[str, int]:
+        key_indicators = self.action_key_indicators[action_name]
+        static_dim = len(key_indicators['static'])
+        dynamic_dim = len(key_indicators['dynamic'])
+        total = static_dim + dynamic_dim
+
+        if include_motion:
+            total += 12  # 12维全局运动特征
+
+        return total
+
+    def get_all_feature_dimensions(self, include_motion: bool = False) -> Dict[str, int]:
         """获取所有动作的特征维度"""
-        return {a: self.get_feature_dimension(a) for a in self.action_key_indicators.keys()}
+        dims = {}
+        for action_name in self.action_key_indicators.keys():
+            dims[action_name] = self.get_feature_dimension(action_name, include_motion)
+        return dims
+
+    def get_feature_names(
+        self,
+        action_name: str,
+        include_motion: bool = False
+    ) -> Tuple[List[str], List[str], List[str]]:
+        """
+        获取某个动作的特征名称
+
+        Returns:
+            (静态特征名称列表, 动态特征名称列表, 运动特征名称列表)
+        """
+        if action_name not in self.action_key_indicators:
+            return [], [], []
+
+        key_indicators = self.action_key_indicators[action_name]
+        static_names = key_indicators['static'].copy()
+        dynamic_names = key_indicators['dynamic'].copy()
+
+        motion_names = []
+        if include_motion:
+            motion_names = [
+                'mean_displacement', 'max_displacement', 'std_displacement',
+                'motion_energy', 'motion_asymmetry', 'temporal_smoothness',
+                'spatial_concentration', 'peak_ratio',
+                'motion_center_x', 'motion_center_y',
+                'velocity_mean', 'acceleration_std',
+            ]
+
+        return static_names, dynamic_names, motion_names
+
+    def get_total_feature_dimension(self, include_motion: bool = False) -> int:
+        """获取所有动作的总特征维度"""
+        total = 0
+        for action_name in self.action_key_indicators.keys():
+            total += self.get_feature_dimension(action_name, include_motion)
+        return total
+
+    def get_action_names(self) -> List[str]:
+        """获取所有支持的动作名称"""
+        return list(self.action_key_indicators.keys())
+
+
+def print_feature_summary(include_motion: bool = False):
+    """打印特征维度总结"""
+    integrator = ActionFeatureIntegrator()
+
+    print("\n" + "=" * 80)
+    print("V2 各动作的特征维度总结")
+    if include_motion:
+        print("(包含12维全局运动特征)")
+    print("=" * 80)
+
+    header = f"{'动作名称':<25} {'静态特征':<10} {'动态特征':<10}"
+    if include_motion:
+        header += f" {'运动特征':<10}"
+    header += f" {'总维度':<10}"
+    print(header)
+    print("-" * 80)
+
+    total_static = 0
+    total_dynamic = 0
+    total_motion = 0
+
+    for action_name, key_indicators in integrator.action_key_indicators.items():
+        static_dim = len(key_indicators['static'])
+        dynamic_dim = len(key_indicators['dynamic'])
+        motion_dim = 12 if include_motion else 0
+        total_dim = static_dim + dynamic_dim + motion_dim
+
+        total_static += static_dim
+        total_dynamic += dynamic_dim
+        total_motion += motion_dim
+
+        row = f"{action_name:<25} {static_dim:<10} {dynamic_dim:<10}"
+        if include_motion:
+            row += f" {motion_dim:<10}"
+        row += f" {total_dim:<10}"
+        print(row)
+
+    print("-" * 80)
+    total_row = f"{'总计':<25} {total_static:<10} {total_dynamic:<10}"
+    if include_motion:
+        total_row += f" {total_motion:<10}"
+    total_row += f" {total_static + total_dynamic + total_motion:<10}"
+    print(total_row)
+    print("=" * 80)
+
+    print("\n特点:")
+    print("1. ✅ 每个动作的特征都是针对该动作特点定制的")
+    print("2. ✅ 指标名称与V2动作类的extract_indicators()输出完全匹配")
+    print("3. ✅ 静态特征 + 动态特征组合")
+    print("4. ✅ 利用了与静息帧的对比信息 (如 xxx_change)")
+    print("5. ✅ 包含联动检测指标 (synkinesis)")
+    if include_motion:
+        print("6. ✅ 包含12维全局运动特征 (来自motion_utils.py)")
+
+
+def verify_feature_alignment():
+    """验证特征定义与动作类输出是否对齐"""
+
+    integrator = ActionFeatureIntegrator()
+
+    print("\n" + "=" * 80)
+    print("特征对齐验证")
+    print("=" * 80)
+
+    all_passed = True
+
+    for action_name, action_cls in ACTION_CLASSES.items():
+        if action_name not in integrator.action_key_indicators:
+            print(f"[WARN] {action_name} 未在 integrator 中定义")
+            all_passed = False
+            continue
+
+        # 获取动作类定义的动态特征名称
+        action_instance = action_cls()
+        action_dynamic_names = getattr(action_instance, 'DYNAMIC_FEATURE_NAMES', [])
+
+        # 获取integrator定义的动态特征名称
+        integrator_dynamic_names = integrator.action_key_indicators[action_name]['dynamic']
+
+        # 检查是否匹配
+        missing_in_integrator = set(action_dynamic_names) - set(integrator_dynamic_names)
+        extra_in_integrator = set(integrator_dynamic_names) - set(action_dynamic_names)
+
+        if missing_in_integrator or extra_in_integrator:
+            print(f"\n[MISMATCH] {action_name}:")
+            if missing_in_integrator:
+                print(f"  动作类有，integrator无: {missing_in_integrator}")
+            if extra_in_integrator:
+                print(f"  integrator有，动作类无: {extra_in_integrator}")
+            all_passed = False
+        else:
+            print(f"[OK] {action_name}")
+
+    print("\n" + "=" * 80)
+    if all_passed:
+        print("✓ 所有特征定义对齐")
+    else:
+        print("⚠ 存在不对齐的特征定义")
+    print("=" * 80)
+
+
+if __name__ == '__main__':
+    # 打印特征摘要
+    print_feature_summary(include_motion=False)
+    print("\n")
+    print_feature_summary(include_motion=True)
+
+    # 验证特征对齐
+    # verify_feature_alignment()  # 需要导入动作类

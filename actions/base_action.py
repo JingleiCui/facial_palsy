@@ -13,8 +13,12 @@
 import numpy as np
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 import cv2
+
+# 从constants模块导入常量
+from ..core.constants import LM, Colors
+from ..core.geometry_utils import compute_icd
 
 
 @dataclass
@@ -205,7 +209,6 @@ class BaseAction(ABC):
         )
 
         # 5. 获取单位长度
-        from .geometry import compute_icd
         icd = compute_icd(peak_landmarks, w, h)
 
         # 6. 归一化指标 (已经是归一化的，直接复制)
@@ -265,6 +268,6 @@ class BaseAction(ABC):
 
         # 绘制动作名称
         cv2.putText(img, f"{self.ACTION_NAME}", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, Colors.NORMAL_COLOR, 2)
 
         return img

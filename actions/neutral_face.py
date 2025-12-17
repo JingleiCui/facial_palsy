@@ -15,13 +15,18 @@ import numpy as np
 from typing import Dict, List, Optional, Any
 import cv2
 
-from .base_action import BaseAction, ActionResult, NeutralBaseline
+# 从constants导入常量
+from ..core.constants import LM, Colors, Thresholds
+
+# 从geometry_utils导入测量函数
 from ..core.geometry_utils import (
-    LM, compute_icd, compute_ear,
+    compute_icd, compute_ear,
     measure_eyes, measure_oral, measure_nlf, measure_brow,
-    find_max_ear_frame, pts2d, pt2d, LM
+    find_max_ear_frame, pts2d, pt2d
 )
 
+# 从base_action导入基类
+from .base_action import BaseAction, ActionResult, NeutralBaseline
 
 
 class NeutralFaceAction(BaseAction):
@@ -176,9 +181,9 @@ class NeutralFaceAction(BaseAction):
 
             # Sunnybrook表A静态评分 (0=正常)
             'sunnybrook_static': {
-                'eye_score': 1 if indicators['eye_asymmetry'] > 0.15 else 0,
+                'eye_score': 1 if indicators['eye_asymmetry'] > Thresholds.EYE_ASYMMETRY_THRESHOLD else 0,
                 'cheek_score': self._compute_cheek_score(indicators),
-                'mouth_score': 1 if abs(indicators['oral_height_diff']) > 0.02 else 0,
+                'mouth_score': 1 if abs(indicators['oral_height_diff']) > Thresholds.ORAL_HEIGHT_DIFF_THRESHOLD else 0,
             },
         }
 
@@ -205,41 +210,41 @@ class NeutralFaceAction(BaseAction):
         # 绘制眼部轮廓
         l_eye_pts = pts2d(landmarks, LM.EYE_CONTOUR_L, w, h).astype(np.int32)
         r_eye_pts = pts2d(landmarks, LM.EYE_CONTOUR_R, w, h).astype(np.int32)
-        cv2.polylines(img, [l_eye_pts], True, (255, 0, 0), 2)  # 蓝=左
-        cv2.polylines(img, [r_eye_pts], True, (0, 165, 255), 2)  # 橙=右
+        cv2.polylines(img, [l_eye_pts], True, Colors.LEFT_COLOR, 2)
+        cv2.polylines(img, [r_eye_pts], True, Colors.RIGHT_COLOR, 2)
 
         # 绘制鼻唇沟线
         l_ala = tuple(map(int, pt2d(landmarks[LM.NOSE_ALA_L], w, h)))
         r_ala = tuple(map(int, pt2d(landmarks[LM.NOSE_ALA_R], w, h)))
         l_mouth = tuple(map(int, pt2d(landmarks[LM.MOUTH_L], w, h)))
         r_mouth = tuple(map(int, pt2d(landmarks[LM.MOUTH_R], w, h)))
-        cv2.line(img, l_ala, l_mouth, (255, 0, 0), 2)
-        cv2.line(img, r_ala, r_mouth, (0, 165, 255), 2)
+        cv2.line(img, l_ala, l_mouth, Colors.LEFT_COLOR, 2)
+        cv2.line(img, r_ala, r_mouth, Colors.RIGHT_COLOR, 2)
 
         # 绘制嘴角
-        cv2.circle(img, l_mouth, 5, (255, 0, 0), -1)
-        cv2.circle(img, r_mouth, 5, (0, 165, 255), -1)
+        cv2.circle(img, l_mouth, 5, Colors.LEFT_COLOR, -1)
+        cv2.circle(img, r_mouth, 5, Colors.RIGHT_COLOR, -1)
 
         # 绘制ICD线
         l_inner = tuple(map(int, pt2d(landmarks[LM.EYE_INNER_L], w, h)))
         r_inner = tuple(map(int, pt2d(landmarks[LM.EYE_INNER_R], w, h)))
-        cv2.line(img, l_inner, r_inner, (128, 128, 128), 1)
+        cv2.line(img, l_inner, r_inner, Colors.GRAY_COLOR, 1)
 
         # 文字标注
         y = 30
-        cv2.putText(img, f"NeutralFace", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(img, "NeutralFace", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, Colors.NORMAL_COLOR, 2)
         y += 30
-        cv2.putText(img, f"ICD: {indicators['icd']:.1f}px", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(img, f"ICD: {indicators['icd']:.1f}px", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, Colors.NEUTRAL_COLOR, 1)
         y += 25
-        cv2.putText(img, f"Eye Ratio: {indicators['eye_area_ratio']:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(img, f"Eye Ratio: {indicators['eye_area_ratio']:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, Colors.NEUTRAL_COLOR, 1)
         y += 25
-        cv2.putText(img, f"Symmetry: {indicators['face_symmetry_score']:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(img, f"Symmetry: {indicators['face_symmetry_score']:.3f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, Colors.NEUTRAL_COLOR, 1)
         y += 25
 
         # 眼裂面积
-        cv2.putText(img, f"L Eye Area: {indicators['left_eye_area']:.0f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        cv2.putText(img, f"L Eye Area: {indicators['left_eye_area']:.0f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, Colors.LEFT_COLOR, 1)
         y += 20
-        cv2.putText(img, f"R Eye Area: {indicators['right_eye_area']:.0f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        cv2.putText(img, f"R Eye Area: {indicators['right_eye_area']:.0f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, Colors.RIGHT_COLOR, 1)
 
         return img
 
