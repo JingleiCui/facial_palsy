@@ -5,8 +5,8 @@ facial_symmetry_analysis_phone_videos.py
 你这版需求：
 - 递归扫描 VIDEO_ROOT（phone_videos）下面所有子目录里的 mp4（不读取数据库）
 - 不使用任何动作别名映射（视频文件名已全部规范）
-- 输出固定保存到：/Users/cuijinglei/Documents/facialPalsy/HGFA/phone_symmetry_analysis
-- 每个“直接包含 mp4 的目录”视为一个 case（例如 by_oneplus、wzq_iphone 等）
+- 输出固定保存到：phone_symmetry_analysis
+- 每个“直接包含 mp4 的目录”视为一个 case
 - 对该目录下每个 mp4 调用 facial_symmetry_analysis.py 的 FacialSymmetryAnalyzer.analyze_single_video()
 - 生成：
   - <case>/<action>/...（每个视频一个动作目录）
@@ -25,7 +25,6 @@ import csv
 from pathlib import Path
 from datetime import datetime
 
-# 确保本文件与 facial_symmetry_analysis.py 在同一工程下可 import
 from facial_symmetry_analysis import FacialSymmetryAnalyzer
 
 
