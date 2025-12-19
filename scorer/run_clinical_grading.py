@@ -43,17 +43,11 @@ from sunnybrook_scorer import (
 import neutral_face
 import eye_blink
 import smile
-
-# 尝试导入其他动作模块（如果存在）
-try:
-    import action_close_eye
-except ImportError:
-    action_close_eye = None
-
-try:
-    import action_raise_eyebrow
-except ImportError:
-    action_raise_eyebrow = None
+import raise_eyebrow
+import close_eye
+import lip_pucker
+import blow_cheek
+import shrug_nose
 
 # =============================================================================
 # 配置参数

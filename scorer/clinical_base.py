@@ -10,6 +10,7 @@
 - 数据类定义
 - 数据库操作函数
 - 可视化基础函数
+
 """
 
 import os
@@ -65,10 +66,10 @@ class LM:
     # ========== 嘴部 ==========
     MOUTH_L = 291  # 左嘴角
     MOUTH_R = 61  # 右嘴角
-    LIP_TOP = 13  # 上唇中心
-    LIP_BOT = 14  # 下唇中心
-    LIP_TOP_CENTER = 0
-    LIP_BOT_CENTER = 17
+    LIP_TOP = 13  # 上唇中心 (上唇下边界)
+    LIP_BOT = 14  # 下唇中心 (下唇上边界)
+    LIP_TOP_CENTER = 0  # 上唇上边界中心
+    LIP_BOT_CENTER = 17  # 下唇下边界中心
 
     # 嘴唇轮廓
     OUTER_LIP = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291,
@@ -76,7 +77,7 @@ class LM:
     INNER_LIP = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308,
                  415, 310, 311, 312, 13, 82, 81, 80, 191]
 
-    # ========== 口角角度计算专用 (Oral Commissure Lift论文) ==========
+    # ========== 口角角度 ==========
     ORAL_CORNER_R = 78  # A点: 右嘴角
     ORAL_CORNER_L = 308  # B点: 左嘴角
     LIP_PEAK_R = 37  # C点: 右上唇峰
@@ -93,6 +94,7 @@ class LM:
     NOSE_ALA_L = 129  # 左鼻翼
     NOSE_ALA_R = 358  # 右鼻翼
     NOSE_TIP_TOP = 6
+    NOSE_BRIDGE = 168  # 鼻梁
 
     # ========== 面颊 ==========
     CHEEK_L = [425, 426, 427, 411, 280]
@@ -173,6 +175,11 @@ def angle_between_vectors(v1: Tuple[float, float], v2: Tuple[float, float]) -> f
     return math.degrees(math.acos(cos_angle))
 
 
+def compute_centroid(points: np.ndarray) -> Tuple[float, float]:
+    """计算点集的质心"""
+    return (float(np.mean(points[:, 0])), float(np.mean(points[:, 1])))
+
+
 # =============================================================================
 # 通用指标计算函数
 # =============================================================================
@@ -226,7 +233,7 @@ def compute_palpebral_width(landmarks, w: int, h: int, left: bool = True) -> flo
 
 
 def compute_brow_height(landmarks, w: int, h: int, left: bool = True) -> float:
-    """计算眉毛高度 (眉毛到眼睛内眦的距离)"""
+    """计算眉毛高度 (眉毛中心到眼睛内眦的Y轴距离)"""
     if left:
         brow = pt2d(landmarks[LM.BROW_CENTER_L], w, h)
         eye = pt2d(landmarks[LM.EYE_INNER_L], w, h)
@@ -260,7 +267,170 @@ def compute_brow_position(landmarks, w: int, h: int, left: bool = True) -> Dict[
     }
 
 
-def compute_mouth_metrics(landmarks, w: int, h: int) -> Dict[str, float]:
+# =============================================================================
+# 眉眼距相关指标
+# =============================================================================
+
+def compute_brow_centroid(landmarks, w: int, h: int, left: bool = True) -> Tuple[float, float]:
+    """
+    计算眉毛质心
+
+    使用眉毛所有关键点计算质心
+    """
+    brow_indices = LM.BROW_L if left else LM.BROW_R
+    brow_points = pts2d(landmarks, brow_indices, w, h)
+    return compute_centroid(brow_points)
+
+
+def compute_brow_eye_distance(landmarks, w: int, h: int, left: bool = True) -> Dict[str, Any]:
+    """
+    计算眉眼距
+
+    眼内眦点到眉毛质心的距离
+
+    Returns:
+        Dict包含:
+        - distance: 眉眼距 (像素)
+        - eye_inner: 眼内眦点坐标
+        - brow_centroid: 眉毛质心坐标
+    """
+    # 眼内眦点
+    if left:
+        eye_inner = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    else:
+        eye_inner = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+
+    # 眉毛质心
+    brow_centroid = compute_brow_centroid(landmarks, w, h, left)
+
+    # 眉眼距
+    distance = dist(eye_inner, brow_centroid)
+
+    return {
+        "distance": distance,
+        "eye_inner": eye_inner,
+        "brow_centroid": brow_centroid
+    }
+
+
+def compute_brow_eye_distance_ratio(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    C049: 计算双侧眉眼距比
+
+    左侧眉眼距 / 右侧眉眼距
+
+    Returns:
+        Dict包含:
+        - ratio: 眉眼距比值
+        - left_distance: 左侧眉眼距
+        - right_distance: 右侧眉眼距
+        - left_eye_inner: 左眼内眦坐标
+        - right_eye_inner: 右眼内眦坐标
+        - left_brow_centroid: 左眉毛质心坐标
+        - right_brow_centroid: 右眉毛质心坐标
+    """
+    left_result = compute_brow_eye_distance(landmarks, w, h, left=True)
+    right_result = compute_brow_eye_distance(landmarks, w, h, left=False)
+
+    left_dist = left_result["distance"]
+    right_dist = right_result["distance"]
+
+    ratio = left_dist / right_dist if right_dist > 1e-9 else 1.0
+
+    return {
+        "ratio": ratio,
+        "left_distance": left_dist,
+        "right_distance": right_dist,
+        "left_eye_inner": left_result["eye_inner"],
+        "right_eye_inner": right_result["eye_inner"],
+        "left_brow_centroid": left_result["brow_centroid"],
+        "right_brow_centroid": right_result["brow_centroid"]
+    }
+
+
+def compute_brow_eye_distance_change(current_landmarks, baseline_landmarks,
+                                     w: int, h: int, left: bool = True) -> Dict[str, Any]:
+    """
+    C050L/C050R: 计算眉眼距变化度
+
+    当前帧眉眼距 - 基线帧眉眼距
+
+    Args:
+        current_landmarks: 当前帧landmarks
+        baseline_landmarks: 基线帧landmarks (通常是NeutralFace)
+        w, h: 图像尺寸
+        left: 是否左侧
+
+    Returns:
+        Dict包含:
+        - change: 变化度 (像素), 正值表示眉眼距增大(眉毛上抬)
+        - current_distance: 当前眉眼距
+        - baseline_distance: 基线眉眼距
+    """
+    current_result = compute_brow_eye_distance(current_landmarks, w, h, left)
+    baseline_result = compute_brow_eye_distance(baseline_landmarks, w, h, left)
+
+    change = current_result["distance"] - baseline_result["distance"]
+
+    return {
+        "change": change,
+        "current_distance": current_result["distance"],
+        "baseline_distance": baseline_result["distance"],
+        "current_eye_inner": current_result["eye_inner"],
+        "current_brow_centroid": current_result["brow_centroid"],
+        "baseline_eye_inner": baseline_result["eye_inner"],
+        "baseline_brow_centroid": baseline_result["brow_centroid"]
+    }
+
+
+def compute_brow_eye_distance_change_ratio(current_landmarks, baseline_landmarks,
+                                           w: int, h: int) -> Dict[str, Any]:
+    """
+    C051: 计算双侧眉眼距变化度比
+
+    左侧眉眼距变化度 / 右侧眉眼距变化度
+
+    Args:
+        current_landmarks: 当前帧landmarks
+        baseline_landmarks: 基线帧landmarks
+        w, h: 图像尺寸
+
+    Returns:
+        Dict包含:
+        - ratio: 变化度比值
+        - left_change: 左侧变化度
+        - right_change: 右侧变化度
+    """
+    left_result = compute_brow_eye_distance_change(current_landmarks, baseline_landmarks, w, h, left=True)
+    right_result = compute_brow_eye_distance_change(current_landmarks, baseline_landmarks, w, h, left=False)
+
+    left_change = left_result["change"]
+    right_change = right_result["change"]
+
+    # 比值计算：需要处理分母为0或接近0的情况
+    if abs(right_change) > 1e-9:
+        ratio = left_change / right_change
+    elif abs(left_change) < 1e-9:
+        ratio = 1.0  # 两边都没变化
+    else:
+        ratio = float('inf') if left_change > 0 else float('-inf')  # 一边变化一边不变
+
+    return {
+        "ratio": ratio,
+        "left_change": left_change,
+        "right_change": right_change,
+        "left_current_distance": left_result["current_distance"],
+        "left_baseline_distance": left_result["baseline_distance"],
+        "right_current_distance": right_result["current_distance"],
+        "right_baseline_distance": right_result["baseline_distance"]
+    }
+
+
+# =============================================================================
+# 嘴部指标
+# =============================================================================
+
+def compute_mouth_metrics(landmarks, w: int, h: int) -> Dict[str, Any]:
     """计算嘴部度量"""
     l_corner = pt2d(landmarks[LM.MOUTH_L], w, h)
     r_corner = pt2d(landmarks[LM.MOUTH_R], w, h)
@@ -277,6 +447,37 @@ def compute_mouth_metrics(landmarks, w: int, h: int) -> Dict[str, float]:
     }
 
 
+def compute_lip_seal_distance(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    计算唇密封距离 (用于BlowCheek关键帧检测)
+
+    计算方法:
+    - 上唇: LIP_TOP_CENTER (0) 到 LIP_TOP (13) 的距离
+    - 下唇: LIP_BOT (14) 到 LIP_BOT_CENTER (17) 的距离
+    - 总距离: 上唇距离 + 下唇距离
+
+    鼓腮时嘴唇紧闭，此距离最小
+    """
+    upper_outer = pt2d(landmarks[LM.LIP_TOP_CENTER], w, h)  # 0
+    upper_inner = pt2d(landmarks[LM.LIP_TOP], w, h)  # 13
+    lower_inner = pt2d(landmarks[LM.LIP_BOT], w, h)  # 14
+    lower_outer = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)  # 17
+
+    upper_dist = dist(upper_outer, upper_inner)
+    lower_dist = dist(lower_inner, lower_outer)
+    total_dist = upper_dist + lower_dist
+
+    return {
+        "upper_distance": upper_dist,
+        "lower_distance": lower_dist,
+        "total_distance": total_dist,
+        "upper_outer": upper_outer,
+        "upper_inner": upper_inner,
+        "lower_inner": lower_inner,
+        "lower_outer": lower_outer
+    }
+
+
 def compute_nlf_length(landmarks, w: int, h: int, left: bool = True) -> float:
     """计算鼻唇沟长度"""
     if left:
@@ -286,6 +487,36 @@ def compute_nlf_length(landmarks, w: int, h: int, left: bool = True) -> float:
         ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
         corner = pt2d(landmarks[LM.MOUTH_R], w, h)
     return dist(ala, corner)
+
+
+def compute_nose_wrinkle_metrics(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    计算鼻皱纹相关指标 (用于ShrugNose)
+
+    主要测量鼻翼与鼻梁的相对位置变化
+    """
+    nose_tip = pt2d(landmarks[LM.NOSE_TIP], w, h)
+    nose_bridge = pt2d(landmarks[LM.NOSE_BRIDGE], w, h)
+    left_ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
+    right_ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
+
+    # 鼻翼间距
+    ala_width = dist(left_ala, right_ala)
+
+    # 鼻翼到鼻梁的距离
+    left_ala_to_bridge = dist(left_ala, nose_bridge)
+    right_ala_to_bridge = dist(right_ala, nose_bridge)
+
+    return {
+        "ala_width": ala_width,
+        "left_ala_to_bridge": left_ala_to_bridge,
+        "right_ala_to_bridge": right_ala_to_bridge,
+        "ala_ratio": left_ala_to_bridge / right_ala_to_bridge if right_ala_to_bridge > 1e-9 else 1.0,
+        "nose_tip": nose_tip,
+        "nose_bridge": nose_bridge,
+        "left_ala": left_ala,
+        "right_ala": right_ala
+    }
 
 
 # =============================================================================
@@ -582,6 +813,14 @@ class ActionResult:
     left_brow_position: Optional[Dict] = None
     right_brow_position: Optional[Dict] = None
 
+    # 眉眼距指标
+    left_brow_eye_distance: float = 0.0
+    right_brow_eye_distance: float = 0.0
+    brow_eye_distance_ratio: float = 1.0
+    left_brow_eye_distance_change: float = 0.0
+    right_brow_eye_distance_change: float = 0.0
+    brow_eye_distance_change_ratio: float = 1.0
+
     # 嘴部指标
     mouth_width: float = 0.0
     mouth_height: float = 0.0
@@ -628,6 +867,13 @@ class ActionResult:
                 "height_ratio": self.brow_height_ratio,
                 "left_position": self.left_brow_position,
                 "right_position": self.right_brow_position,
+                # C048-C051
+                "left_brow_eye_distance": self.left_brow_eye_distance,
+                "right_brow_eye_distance": self.right_brow_eye_distance,
+                "brow_eye_distance_ratio": self.brow_eye_distance_ratio,
+                "left_brow_eye_distance_change": self.left_brow_eye_distance_change,
+                "right_brow_eye_distance_change": self.right_brow_eye_distance_change,
+                "brow_eye_distance_change_ratio": self.brow_eye_distance_change_ratio,
             },
             "mouth": {
                 "width": self.mouth_width,
@@ -663,8 +909,17 @@ class ActionResult:
         return result
 
 
-def extract_common_indicators(landmarks, w: int, h: int, result: ActionResult) -> None:
-    """提取通用指标到ActionResult"""
+def extract_common_indicators(landmarks, w: int, h: int, result: ActionResult,
+                              baseline_landmarks=None) -> None:
+    """
+    提取通用指标到ActionResult
+
+    Args:
+        landmarks: 当前帧landmarks
+        w, h: 图像尺寸
+        result: ActionResult对象
+        baseline_landmarks: 基线帧landmarks (用于计算变化度)
+    """
     result.icd = compute_icd(landmarks, w, h)
 
     result.left_eye_area, _ = compute_eye_area(landmarks, w, h, left=True)
@@ -687,6 +942,19 @@ def extract_common_indicators(landmarks, w: int, h: int, result: ActionResult) -
 
     result.left_brow_position = compute_brow_position(landmarks, w, h, left=True)
     result.right_brow_position = compute_brow_position(landmarks, w, h, left=False)
+
+    # 眉眼距
+    bed_result = compute_brow_eye_distance_ratio(landmarks, w, h)
+    result.left_brow_eye_distance = bed_result["left_distance"]
+    result.right_brow_eye_distance = bed_result["right_distance"]
+    result.brow_eye_distance_ratio = bed_result["ratio"]
+
+    # 眉眼距变化度 (需要基线)
+    if baseline_landmarks is not None:
+        bedc_result = compute_brow_eye_distance_change_ratio(landmarks, baseline_landmarks, w, h)
+        result.left_brow_eye_distance_change = bedc_result["left_change"]
+        result.right_brow_eye_distance_change = bedc_result["right_change"]
+        result.brow_eye_distance_change_ratio = bedc_result["ratio"]
 
     mouth = compute_mouth_metrics(landmarks, w, h)
     result.mouth_width = mouth["width"]
