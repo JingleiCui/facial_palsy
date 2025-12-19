@@ -315,7 +315,7 @@ def compute_brow_eye_distance(landmarks, w: int, h: int, left: bool = True) -> D
 
 def compute_brow_eye_distance_ratio(landmarks, w: int, h: int) -> Dict[str, Any]:
     """
-    C049: 计算双侧眉眼距比
+    计算双侧眉眼距比
 
     左侧眉眼距 / 右侧眉眼距
 
@@ -351,7 +351,7 @@ def compute_brow_eye_distance_ratio(landmarks, w: int, h: int) -> Dict[str, Any]
 def compute_brow_eye_distance_change(current_landmarks, baseline_landmarks,
                                      w: int, h: int, left: bool = True) -> Dict[str, Any]:
     """
-    C050L/C050R: 计算眉眼距变化度
+    计算眉眼距变化度
 
     当前帧眉眼距 - 基线帧眉眼距
 
@@ -386,7 +386,7 @@ def compute_brow_eye_distance_change(current_landmarks, baseline_landmarks,
 def compute_brow_eye_distance_change_ratio(current_landmarks, baseline_landmarks,
                                            w: int, h: int) -> Dict[str, Any]:
     """
-    C051: 计算双侧眉眼距变化度比
+    计算双侧眉眼距变化度比
 
     左侧眉眼距变化度 / 右侧眉眼距变化度
 
@@ -867,7 +867,6 @@ class ActionResult:
                 "height_ratio": self.brow_height_ratio,
                 "left_position": self.left_brow_position,
                 "right_position": self.right_brow_position,
-                # C048-C051
                 "left_brow_eye_distance": self.left_brow_eye_distance,
                 "right_brow_eye_distance": self.right_brow_eye_distance,
                 "brow_eye_distance_ratio": self.brow_eye_distance_ratio,

@@ -236,7 +236,7 @@ def visualize_blow_cheek(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.rectangle(img, (5, 5), (380, panel_h), (255, 255, 255), 1)
 
     y = 28
-    cv2.putText(img, f"{ACTION_NAME} - {ACTION_NAME_CN}", (15, y),
+    cv2.putText(img, f"{ACTION_NAME}", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     y += 28
 

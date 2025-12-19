@@ -78,43 +78,30 @@ ALL_ACTIONS = [
     "ShrugNose"
 ]
 
+def find_peak_frame_generic(landmarks_seq, frames_seq, w, h, action_name, baseline_landmarks=None):
+    """通用峰值帧查找
 
-def find_peak_frame_generic(landmarks_seq, frames_seq, w, h, action_name):
-    """通用峰值帧查找"""
+    说明：
+    - 优先调用各动作模块自带的峰值检测逻辑（与最新版动作代码保持一致）
+    - eye_blink：自然眨眼/自主眨眼仍沿用旧逻辑
+    """
     if action_name == "NeutralFace":
         return neutral_face.find_peak_frame(landmarks_seq, frames_seq, w, h)
     elif action_name in ["Smile", "ShowTeeth"]:
         return smile.find_peak_frame_smile(landmarks_seq, frames_seq, w, h)
-    elif action_name in ["VoluntaryEyeBlink", "SpontaneousEyeBlink", "CloseEyeSoftly", "CloseEyeHardly"]:
+    elif action_name in ["VoluntaryEyeBlink", "SpontaneousEyeBlink"]:
         return eye_blink.find_peak_frame_blink(landmarks_seq, frames_seq, w, h)
+    elif action_name in ["CloseEyeSoftly", "CloseEyeHardly"]:
+        # 闭眼峰值：EAR最小
+        return close_eye.find_peak_frame_close_eye(landmarks_seq, frames_seq, w, h)
     elif action_name == "RaiseEyebrow":
-        # 找眉毛最高的帧
-        from clinical_base import compute_brow_height
-        max_brow = -1.0
-        max_idx = 0
-        for i, lm in enumerate(landmarks_seq):
-            if lm is None:
-                continue
-            l_brow = compute_brow_height(lm, w, h, True)
-            r_brow = compute_brow_height(lm, w, h, False)
-            avg = (l_brow + r_brow) / 2
-            if avg > max_brow:
-                max_brow = avg
-                max_idx = i
-        return max_idx
+        return raise_eyebrow.find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     elif action_name == "LipPucker":
-        # 找嘴最窄的帧
-        from clinical_base import compute_mouth_metrics
-        min_width = float('inf')
-        min_idx = 0
-        for i, lm in enumerate(landmarks_seq):
-            if lm is None:
-                continue
-            mouth = compute_mouth_metrics(lm, w, h)
-            if mouth["width"] < min_width:
-                min_width = mouth["width"]
-                min_idx = i
-        return min_idx
+        return lip_pucker.find_peak_frame(landmarks_seq, frames_seq, w, h)
+    elif action_name == "BlowCheek":
+        return blow_cheek.find_peak_frame(landmarks_seq, frames_seq, w, h)
+    elif action_name == "ShrugNose":
+        return shrug_nose.find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     else:
         # 默认: 使用NeutralFace的方法
         return neutral_face.find_peak_frame(landmarks_seq, frames_seq, w, h)
@@ -122,35 +109,94 @@ def find_peak_frame_generic(landmarks_seq, frames_seq, w, h, action_name):
 
 def process_action_generic(landmarks_seq, frames_seq, w, h, video_info, output_dir,
                            action_name, baseline_result=None, baseline_landmarks=None):
-    """通用动作处理"""
+    """动作处理入口（与最新版动作代码对齐）
+
+    注意：
+    - eye_blink.py 未上传：VoluntaryEyeBlink / SpontaneousEyeBlink 仍沿用旧逻辑
+    - 其余动作全部调用各自模块的 process / process_xxx 函数
+    """
     if action_name == "NeutralFace":
         return neutral_face.process(landmarks_seq, frames_seq, w, h, video_info, output_dir)
+
+    # --- Smile / ShowTeeth ---
     elif action_name == "Smile":
-        return smile.process_smile(landmarks_seq, frames_seq, w, h, video_info, output_dir,
-                                          baseline_result, baseline_landmarks)
+        return smile.process_smile(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result, baseline_landmarks
+        )
     elif action_name == "ShowTeeth":
-        return smile.process_show_teeth(landmarks_seq, frames_seq, w, h, video_info, output_dir,
-                                               baseline_result, baseline_landmarks)
+        return smile.process_show_teeth(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result, baseline_landmarks
+        )
+
+    # --- Eye Blink ---
     elif action_name == "VoluntaryEyeBlink":
-        return eye_blink.process_voluntary_blink(landmarks_seq, frames_seq, w, h, video_info, output_dir,
-                                                        baseline_result)
+        return eye_blink.process_voluntary_blink(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result
+        )
     elif action_name == "SpontaneousEyeBlink":
-        return eye_blink.process_spontaneous_blink(landmarks_seq, frames_seq, w, h, video_info, output_dir,
-                                                          baseline_result)
-    else:
-        # 其他动作使用通用处理
-        return process_generic_action(landmarks_seq, frames_seq, w, h, video_info, output_dir,
-                                      action_name, baseline_result)
+        return eye_blink.process_spontaneous_blink(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result
+        )
+
+    # --- Close Eye ---
+    elif action_name == "CloseEyeSoftly":
+        return close_eye.process_close_eye_softly(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result=baseline_result,
+            baseline_landmarks=baseline_landmarks
+        )
+    elif action_name == "CloseEyeHardly":
+        return close_eye.process_close_eye_hardly(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result=baseline_result,
+            baseline_landmarks=baseline_landmarks
+        )
+
+    # --- Other Voluntary Movements ---
+    elif action_name == "RaiseEyebrow":
+        return raise_eyebrow.process(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result=baseline_result,
+            baseline_landmarks=baseline_landmarks
+        )
+    elif action_name == "LipPucker":
+        return lip_pucker.process(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result=baseline_result,
+            baseline_landmarks=baseline_landmarks
+        )
+    elif action_name == "BlowCheek":
+        return blow_cheek.process(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result=baseline_result,
+            baseline_landmarks=baseline_landmarks
+        )
+    elif action_name == "ShrugNose":
+        return shrug_nose.process(
+            landmarks_seq, frames_seq, w, h, video_info, output_dir,
+            baseline_result=baseline_result,
+            baseline_landmarks=baseline_landmarks
+        )
+
+    # fallback
+    return process_generic_action(
+        landmarks_seq, frames_seq, w, h, video_info, output_dir,
+        action_name, baseline_result, baseline_landmarks
+    )
 
 
 def process_generic_action(landmarks_seq, frames_seq, w, h, video_info, output_dir,
-                           action_name, baseline_result=None):
+                           action_name, baseline_result=None, baseline_landmarks=None):
     """通用动作处理（用于没有专门模块的动作）"""
     if not landmarks_seq or not frames_seq:
         return None
 
     # 找峰值帧
-    peak_idx = find_peak_frame_generic(landmarks_seq, frames_seq, w, h, action_name)
+    peak_idx = find_peak_frame_generic(landmarks_seq, frames_seq, w, h, action_name, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
@@ -178,7 +224,7 @@ def process_generic_action(landmarks_seq, frames_seq, w, h, video_info, output_d
     )
 
     # 提取通用指标
-    extract_common_indicators(peak_landmarks, w, h, result)
+    extract_common_indicators(peak_landmarks, w, h, result, baseline_landmarks)
 
     # 计算Voluntary Movement评分
     if baseline_result:

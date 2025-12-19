@@ -247,48 +247,48 @@ def visualize_brow_eye_distance(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.rectangle(img, (5, 5), (380, panel_h), (255, 255, 255), 1)
 
     y = 28
-    cv2.putText(img, f"{ACTION_NAME} - {ACTION_NAME_CN}", (15, y),
+    cv2.putText(img, f"{ACTION_NAME}", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     y += 28
 
-    cv2.putText(img, "=== Brow-Eye Distance (C048) ===", (15, y),
+    cv2.putText(img, "=== Brow-Eye Distance ===", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
     y += 20
 
-    cv2.putText(img, f"Left (C048L): {metrics['left_brow_eye_distance']:.1f}px", (15, y),
+    cv2.putText(img, f"Left: {metrics['left_brow_eye_distance']:.1f}px", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
     y += 18
 
-    cv2.putText(img, f"Right (C048R): {metrics['right_brow_eye_distance']:.1f}px", (15, y),
+    cv2.putText(img, f"Right: {metrics['right_brow_eye_distance']:.1f}px", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
     y += 18
 
     ratio = metrics['brow_eye_distance_ratio']
     ratio_color = (0, 255, 0) if 0.9 <= ratio <= 1.1 else (0, 165, 255) if 0.8 <= ratio <= 1.2 else (0, 0, 255)
-    cv2.putText(img, f"Ratio (C049): {ratio:.3f}", (15, y),
+    cv2.putText(img, f"Ratio: {ratio:.3f}", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, ratio_color, 1)
     y += 25
 
     if "left_change" in metrics:
-        cv2.putText(img, "=== Distance Change (C050) ===", (15, y),
+        cv2.putText(img, "=== Distance Change ===", (15, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
         y += 20
 
         left_change = metrics["left_change"]
         right_change = metrics["right_change"]
 
-        cv2.putText(img, f"Left (C050L): {left_change:+.1f}px ({metrics.get('left_change_percent', 0):+.1f}%)", (15, y),
+        cv2.putText(img, f"Left: {left_change:+.1f}px ({metrics.get('left_change_percent', 0):+.1f}%)", (15, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         y += 18
 
-        cv2.putText(img, f"Right (C050R): {right_change:+.1f}px ({metrics.get('right_change_percent', 0):+.1f}%)",
+        cv2.putText(img, f"Right: {right_change:+.1f}px ({metrics.get('right_change_percent', 0):+.1f}%)",
                     (15, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         y += 18
 
         change_ratio = metrics.get("change_ratio", 1.0)
         if not np.isinf(change_ratio):
-            cv2.putText(img, f"Change Ratio (C051): {change_ratio:.3f}", (15, y),
+            cv2.putText(img, f"Change Ratio: {change_ratio:.3f}", (15, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         y += 25
 
@@ -366,9 +366,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 存储动作特有指标
     result.action_specific = {
         "brow_eye_metrics": {
-            "C048L_left_brow_eye_distance": metrics["left_brow_eye_distance"],
-            "C048R_right_brow_eye_distance": metrics["right_brow_eye_distance"],
-            "C049_brow_eye_distance_ratio": metrics["brow_eye_distance_ratio"],
+            "left_brow_eye_distance": metrics["left_brow_eye_distance"],
+            "right_brow_eye_distance": metrics["right_brow_eye_distance"],
+            "brow_eye_distance_ratio": metrics["brow_eye_distance_ratio"],
         },
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
@@ -376,9 +376,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     if "left_change" in metrics:
         result.action_specific["brow_eye_metrics"].update({
-            "C050L_left_change": metrics["left_change"],
-            "C050R_right_change": metrics["right_change"],
-            "C051_change_ratio": metrics.get("change_ratio", 1.0),
+            "left_change": metrics["left_change"],
+            "right_change": metrics["right_change"],
+            "change_ratio": metrics.get("change_ratio", 1.0),
             "left_change_percent": metrics.get("left_change_percent", 0),
             "right_change_percent": metrics.get("right_change_percent", 0),
         })

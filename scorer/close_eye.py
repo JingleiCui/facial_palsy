@@ -286,7 +286,7 @@ def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.rectangle(img, (5, 5), (380, panel_h), (255, 255, 255), 1)
 
     y = 28
-    cv2.putText(img, f"{result.action_name} - {result.action_name_cn}", (15, y),
+    cv2.putText(img, f"{result.action_name}", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     y += 28
 

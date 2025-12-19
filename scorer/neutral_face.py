@@ -128,7 +128,7 @@ def visualize_indicators(frame: np.ndarray, landmarks, w: int, h: int,
 
     # 信息面板
     y = 25
-    cv2.putText(img, f"{ACTION_NAME} - {ACTION_NAME_CN}", (10, y),
+    cv2.putText(img, f"{ACTION_NAME}", (10, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     y += 30
 

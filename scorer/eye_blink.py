@@ -202,7 +202,7 @@ def visualize_blink_indicators(frame: np.ndarray, landmarks, w: int, h: int,
 
     # 信息面板
     y = 25
-    cv2.putText(img, f"{result.action_name} - {result.action_name_cn}", (10, y),
+    cv2.putText(img, f"{result.action_name}", (10, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     y += 30
 
