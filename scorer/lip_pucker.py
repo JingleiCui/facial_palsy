@@ -2,13 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 LipPucker 动作处理模块
-======================
+================================
 
 分析撅嘴动作:
 1. 嘴唇宽度变化
 2. 嘴唇高度变化
 3. 嘴角位置对称性
-4. 联动运动检测
+4. 口角角度变化
+5. 面瘫侧别检测
+6. 联动运动检测
+
+修复内容:
+- 移除错误的NLF分析
+- 使用口角角度和嘴部收缩作为主要指标
 
 对应Sunnybrook: Lip pucker (OOS/OOI)
 """
@@ -21,7 +27,7 @@ import json
 
 from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
-    compute_mouth_metrics, compute_oral_angle, compute_nlf_length,
+    compute_mouth_metrics, compute_oral_angle,
     compute_icd, extract_common_indicators,
     ActionResult, draw_polygon
 )
@@ -82,6 +88,9 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
     # 如果有基线，计算变化
     if baseline_landmarks is not None:
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
+        baseline_oral = compute_oral_angle(baseline_landmarks, w, h)
+        baseline_left = baseline_mouth["left_corner"]
+        baseline_right = baseline_mouth["right_corner"]
 
         metrics["baseline"] = {
             "mouth_width": baseline_mouth["width"],
@@ -101,7 +110,82 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
         # 收缩比例 (撅嘴时应该<1)
         metrics["width_ratio"] = mouth["width"] / baseline_mouth["width"] if baseline_mouth["width"] > 1e-9 else 1.0
 
+        # 嘴角位移
+        left_excursion = dist(left_corner, baseline_left)
+        right_excursion = dist(right_corner, baseline_right)
+        metrics["left_excursion"] = left_excursion
+        metrics["right_excursion"] = right_excursion
+        metrics["excursion_ratio"] = left_excursion / right_excursion if right_excursion > 1e-9 else 1.0
+
     return metrics
+
+
+def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    从撅嘴动作检测面瘫侧别
+
+    原理:
+    1. 面瘫侧嘴角运动幅度小
+    2. 口角角度不对称
+
+    Returns:
+        Dict包含:
+        - palsy_side: 0=无/对称, 1=左, 2=右
+        - confidence: 置信度
+        - interpretation: 解释
+    """
+    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+
+    # 使用运动幅度作为主要指标
+    if "left_excursion" in metrics and "right_excursion" in metrics:
+        left_exc = metrics["left_excursion"]
+        right_exc = metrics["right_excursion"]
+
+        if max(left_exc, right_exc) < 2:  # 运动幅度太小
+            # 检查口角角度
+            oral = metrics.get("oral_angle", {})
+            asym = oral.get("asymmetry", 0)
+            if asym < 3:
+                result["interpretation"] = "双侧对称"
+            else:
+                result["interpretation"] = "运动幅度过小，难以判断"
+            return result
+
+        exc_ratio = metrics["excursion_ratio"]
+
+        if abs(exc_ratio - 1.0) < 0.15:
+            result["palsy_side"] = 0
+            result["confidence"] = 1.0 - abs(exc_ratio - 1.0)
+            result["interpretation"] = f"双侧运动对称 (比值={exc_ratio:.2f})"
+        elif left_exc < right_exc:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
+            result["interpretation"] = f"左侧运动较弱 (L={left_exc:.1f}px < R={right_exc:.1f}px)"
+        else:
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
+            result["interpretation"] = f"右侧运动较弱 (R={right_exc:.1f}px < L={left_exc:.1f}px)"
+    else:
+        # 没有基线，使用口角对称性
+        oral = metrics.get("oral_angle", {})
+        asym = oral.get("asymmetry", 0)
+        aoe = oral.get("AOE", 0)
+        bof = oral.get("BOF", 0)
+
+        if asym < 3:
+            result["palsy_side"] = 0
+            result["confidence"] = 1.0 - asym / 10
+            result["interpretation"] = f"口角对称 (不对称度={asym:.1f}°)"
+        elif aoe < bof:
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, asym / 15)
+            result["interpretation"] = f"右口角位置较低 (AOE={aoe:+.1f}°)"
+        else:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, asym / 15)
+            result["interpretation"] = f"左口角位置较低 (BOF={bof:+.1f}°)"
+
+    return result
 
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
@@ -109,6 +193,13 @@ def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) ->
     计算Voluntary Movement评分
 
     基于嘴唇收缩程度和对称性
+
+    评分标准:
+    - 5=完整: 双侧对称且收缩明显
+    - 4=几乎完整: 轻度不对称或收缩略有不足
+    - 3=启动但不对称: 明显不对称但有运动
+    - 2=轻微启动: 运动幅度很小
+    - 1=无法启动: 几乎没有运动
     """
     # 检查口角对称性
     corner_diff = metrics.get("corner_height_diff", 0)
@@ -187,7 +278,8 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
 
 def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
                          result: ActionResult,
-                         metrics: Dict[str, Any]) -> np.ndarray:
+                         metrics: Dict[str, Any],
+                         palsy_detection: Dict[str, Any]) -> np.ndarray:
     """可视化撅嘴指标"""
     img = frame.copy()
 
@@ -212,9 +304,9 @@ def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
                  (int(oral.F[0]), int(oral.F[1])), (0, 255, 0), 1)
 
     # 信息面板
-    panel_h = 240
-    cv2.rectangle(img, (5, 5), (350, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (350, panel_h), (255, 255, 255), 1)
+    panel_h = 300
+    cv2.rectangle(img, (5, 5), (380, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, 5), (380, panel_h), (255, 255, 255), 1)
 
     y = 28
     cv2.putText(img, f"{ACTION_NAME}", (15, y),
@@ -257,6 +349,14 @@ def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
     asym_color = (0, 255, 0) if oral_asym < 5 else (0, 165, 255) if oral_asym < 10 else (0, 0, 255)
     cv2.putText(img, f"Oral Asymmetry: {oral_asym:.1f} deg", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, asym_color, 1)
+    y += 22
+
+    # 面瘫侧别检测结果
+    palsy_side = palsy_detection.get("palsy_side", 0)
+    palsy_text = {0: "无/对称", 1: "左侧", 2: "右侧"}.get(palsy_side, "未知")
+    palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
+    cv2.putText(img, f"Palsy Side: {palsy_text}", (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)
     y += 25
 
     # Voluntary Score
@@ -299,6 +399,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 计算撅嘴特有指标
     metrics = compute_lip_pucker_metrics(peak_landmarks, w, h, baseline_landmarks)
 
+    # 检测面瘫侧别
+    palsy_detection = detect_palsy_side(metrics)
+
     # 计算Voluntary Movement评分
     score, interpretation = compute_voluntary_score(metrics, baseline_landmarks)
     result.voluntary_movement_score = score
@@ -309,10 +412,24 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     # 存储动作特有指标
     result.action_specific = {
-        "lip_pucker_metrics": metrics,
+        "lip_pucker_metrics": {
+            "mouth_width": metrics["mouth_width"],
+            "mouth_height": metrics["mouth_height"],
+            "width_height_ratio": metrics["width_height_ratio"],
+            "oral_angle": metrics["oral_angle"],
+        },
+        "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
     }
+
+    if "baseline" in metrics:
+        result.action_specific["baseline"] = metrics["baseline"]
+        result.action_specific["changes"] = {
+            "width_change": metrics.get("width_change", 0),
+            "width_change_percent": metrics.get("width_change_percent", 0),
+            "width_ratio": metrics.get("width_ratio", 1),
+        }
 
     # 创建输出目录
     action_dir = output_dir / ACTION_NAME
@@ -322,7 +439,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
     # 保存可视化
-    vis = visualize_lip_pucker(peak_frame, peak_landmarks, w, h, result, metrics)
+    vis = visualize_lip_pucker(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 保存JSON
@@ -332,6 +449,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     print(f"    [OK] {ACTION_NAME}: Width={metrics['mouth_width']:.1f}px")
     if "width_change_percent" in metrics:
         print(f"         Width Change: {metrics['width_change_percent']:+.1f}%")
+    print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
     print(f"         Voluntary Score: {result.voluntary_movement_score}/5 ({interpretation})")
 
     return result

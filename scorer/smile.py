@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微笑动作处理模块 (Smile / ShowTeeth)
-====================================
+微笑动作处理模块
+==========================
 
 分析:
 1. 嘴角位移和对称性
 2. 口角角度变化
-3. 鼻唇沟变化
-4. 联动运动检测 (眼部联动)
+3. 运动幅度对比
+4. 面瘫侧别检测
+5. 联动运动检测 (眼部联动)
+
+修复内容:
+- 移除错误的NLF分析
+- 使用口角角度和运动幅度作为主要指标
+- 添加面瘫侧别检测
 
 对应Sunnybrook: Open mouth smile (ZYG/RIS)
 """
@@ -18,11 +24,12 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import math
+import json
 
 from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
-    compute_mouth_metrics, compute_oral_angle, compute_nlf_length,
-    compute_icd, extract_common_indicators,
+    compute_mouth_metrics, compute_oral_angle, compute_icd,
+    extract_common_indicators,
     ActionResult, OralAngleMeasure, draw_polygon
 )
 
@@ -83,6 +90,7 @@ def compute_smile_metrics(landmarks, w: int, h: int,
     # 如果有基线，计算运动幅度
     if baseline_landmarks is not None:
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
+        baseline_oral = compute_oral_angle(baseline_landmarks, w, h)
         baseline_left = baseline_mouth["left_corner"]
         baseline_right = baseline_mouth["right_corner"]
 
@@ -108,7 +116,76 @@ def compute_smile_metrics(landmarks, w: int, h: int,
             "width_change": mouth["width"] - baseline_mouth["width"],
         }
 
+        # 口角角度变化
+        metrics["oral_angle_change"] = {
+            "AOE_change": oral.AOE_angle - baseline_oral.AOE_angle,
+            "BOF_change": oral.BOF_angle - baseline_oral.BOF_angle,
+        }
+
     return metrics
+
+
+def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    从微笑动作检测面瘫侧别
+
+    原理:
+    1. 面瘫侧口角运动幅度小
+    2. 面瘫侧口角角度低(下垂)
+
+    Returns:
+        Dict包含:
+        - palsy_side: 0=无/对称, 1=左, 2=右
+        - confidence: 置信度
+        - interpretation: 解释
+    """
+    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+
+    oral = metrics.get("oral_angle", {})
+    aoe = oral.get("AOE", 0)  # 右侧口角角度
+    bof = oral.get("BOF", 0)  # 左侧口角角度
+    asymmetry = oral.get("asymmetry", 0)
+
+    # 使用运动幅度作为主要指标
+    if "excursion" in metrics:
+        exc = metrics["excursion"]
+        left_exc = exc["left_total"]
+        right_exc = exc["right_total"]
+
+        if max(left_exc, right_exc) < 3:  # 运动幅度太小
+            result["interpretation"] = "微笑运动幅度过小"
+            return result
+
+        exc_ratio = exc["excursion_ratio"]
+
+        if abs(exc_ratio - 1.0) < 0.15:
+            result["palsy_side"] = 0
+            result["confidence"] = 1.0 - abs(exc_ratio - 1.0)
+            result["interpretation"] = f"双侧运动对称 (比值={exc_ratio:.2f})"
+        elif left_exc < right_exc:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
+            result["interpretation"] = f"左侧运动较弱 (L={left_exc:.1f}px < R={right_exc:.1f}px)"
+        else:
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
+            result["interpretation"] = f"右侧运动较弱 (R={right_exc:.1f}px < L={left_exc:.1f}px)"
+    else:
+        # 没有基线，使用口角角度
+        if asymmetry < 3:
+            result["palsy_side"] = 0
+            result["confidence"] = 1.0 - asymmetry / 10
+            result["interpretation"] = f"口角对称 (不对称度={asymmetry:.1f}°)"
+        elif aoe < bof:
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, asymmetry / 15)
+            result["interpretation"] = f"右口角位置较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
+        else:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, asymmetry / 15)
+            result["interpretation"] = f"左口角位置较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
+
+    return result
 
 
 def detect_synkinesis_from_smile(baseline_result: Optional[ActionResult],
@@ -148,7 +225,8 @@ def detect_synkinesis_from_smile(baseline_result: Optional[ActionResult],
 
 def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
                                result: ActionResult,
-                               smile_metrics: Dict[str, Any]) -> np.ndarray:
+                               smile_metrics: Dict[str, Any],
+                               palsy_detection: Dict[str, Any]) -> np.ndarray:
     """可视化微笑指标"""
     img = frame.copy()
 
@@ -172,15 +250,11 @@ def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
         cv2.line(img, (int(oral.O[0]), int(oral.O[1])),
                  (int(oral.B[0]), int(oral.B[1])), (255, 0, 0), 2)
 
-    # 绘制鼻唇沟
-    l_ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
-    r_ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
-    l_mouth = pt2d(landmarks[LM.MOUTH_L], w, h)
-    r_mouth = pt2d(landmarks[LM.MOUTH_R], w, h)
-    cv2.line(img, (int(l_ala[0]), int(l_ala[1])), (int(l_mouth[0]), int(l_mouth[1])), (255, 100, 100), 2)
-    cv2.line(img, (int(r_ala[0]), int(r_ala[1])), (int(r_mouth[0]), int(r_mouth[1])), (100, 165, 255), 2)
-
     # 信息面板
+    panel_h = 300
+    cv2.rectangle(img, (5, 5), (400, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, 5), (400, panel_h), (255, 255, 255), 1)
+
     y = 25
     cv2.putText(img, f"{result.action_name}", (10, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -199,10 +273,6 @@ def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
     asym_color = (0, 255, 0) if asym < 5 else ((0, 165, 255) if asym < 10 else (0, 0, 255))
     cv2.putText(img, f"Asymmetry: {asym:.1f} deg", (10, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, asym_color, 1)
-    y += 22
-
-    cv2.putText(img, f"NLF Ratio: {result.nlf_ratio:.3f}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     y += 25
 
     # 运动幅度
@@ -219,6 +289,19 @@ def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
         y += 18
         cv2.putText(img, f"Width Change: {exc['width_change']:+.1f}px", (10, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        y += 22
+
+    # 面瘫侧别检测结果
+    palsy_side = palsy_detection.get("palsy_side", 0)
+    palsy_text = {0: "无/对称", 1: "左侧", 2: "右侧"}.get(palsy_side, "未知")
+    palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
+    cv2.putText(img, f"Palsy Side: {palsy_text}", (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)
+    y += 25
+
+    # Voluntary Score
+    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
     return img
 
@@ -285,6 +368,9 @@ def _process_smile_action(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 计算微笑特有指标
     smile_metrics = compute_smile_metrics(peak_landmarks, w, h, baseline_landmarks)
 
+    # 检测面瘫侧别
+    palsy_detection = detect_palsy_side(smile_metrics)
+
     # 检测联动
     synkinesis = detect_synkinesis_from_smile(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
@@ -298,7 +384,6 @@ def _process_smile_action(landmarks_seq: List, frames_seq: List, w: int, h: int,
         # 没有基线时使用口角对称性
         oral = smile_metrics.get("oral_angle", {})
         asym = oral.get("asymmetry", 0)
-        # 将不对称度转换为比例
         if asym < 3:
             result.voluntary_movement_score = 5
         elif asym < 6:
@@ -312,10 +397,18 @@ def _process_smile_action(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     # 存储动作特有指标
     result.action_specific = {
-        "smile_metrics": smile_metrics,
+        "smile_metrics": {
+            "mouth_width": smile_metrics["mouth_width"],
+            "mouth_height": smile_metrics["mouth_height"],
+            "oral_angle": smile_metrics["oral_angle"],
+        },
+        "palsy_detection": palsy_detection,
         "synkinesis": synkinesis,
         "voluntary_score": result.voluntary_movement_score,
     }
+
+    if "excursion" in smile_metrics:
+        result.action_specific["excursion"] = smile_metrics["excursion"]
 
     # 创建输出目录
     action_dir = output_dir / action_name
@@ -325,16 +418,17 @@ def _process_smile_action(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
     # 保存可视化
-    vis = visualize_smile_indicators(peak_frame, peak_landmarks, w, h, result, smile_metrics)
+    vis = visualize_smile_indicators(peak_frame, peak_landmarks, w, h, result,
+                                     smile_metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 保存JSON
-    import json
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
     oral = smile_metrics.get("oral_angle", {})
     print(f"    [OK] {action_name}: Width={smile_metrics['mouth_width']:.1f}px, Asym={oral.get('asymmetry', 0):.1f}°")
+    print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
     print(f"         Voluntary Score: {result.voluntary_movement_score}/5")
 
     return result

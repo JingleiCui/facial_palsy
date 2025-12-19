@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CloseEye 动作处理模块 (CloseEyeSoftly / CloseEyeHardly)
-======================================================
+CloseEye 动作处理模块
+==============================
 
 分析闭眼动作:
 1. 眼睛闭合程度 (EAR)
 2. 眼睛面积变化
 3. 左右眼对称性
-4. 联动运动检测
+4. 面瘫侧别检测 - 检测两只眼是否都闭上
+5. 联动运动检测
+
+修复内容:
+- 添加面瘫侧别检测：基于两只眼是否都能完全闭合
+- 面瘫侧的眼睛无法完全闭合(EAR较大)
+
+面瘫侧别编码: 0=无/对称, 1=左, 2=右
 
 对应Sunnybrook: Gentle Eye closure (OCS)
 """
@@ -88,6 +95,104 @@ def extract_eye_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, Dict[
     }
 
 
+def detect_palsy_side_from_closure(left_ear: float, right_ear: float,
+                                   baseline_left_ear: float = None,
+                                   baseline_right_ear: float = None,
+                                   closure_threshold: float = 0.15) -> Dict[str, Any]:
+    """
+    从闭眼动作检测面瘫侧别
+
+    原理: 面瘫侧的眼睛无法完全闭合，EAR值较大
+
+    Args:
+        left_ear: 左眼EAR值 (闭眼时)
+        right_ear: 右眼EAR值 (闭眼时)
+        baseline_left_ear: 基线左眼EAR值 (可选)
+        baseline_right_ear: 基线右眼EAR值 (可选)
+        closure_threshold: 闭合阈值，EAR低于此值认为完全闭合
+
+    Returns:
+        Dict包含:
+        - palsy_side: 面瘫侧别 (0=无/对称, 1=左, 2=右)
+        - confidence: 置信度 (0-1)
+        - left_closed: 左眼是否闭合
+        - right_closed: 右眼是否闭合
+        - interpretation: 解释文字
+    """
+    left_closed = left_ear < closure_threshold
+    right_closed = right_ear < closure_threshold
+
+    result = {
+        "left_ear": left_ear,
+        "right_ear": right_ear,
+        "left_closed": left_closed,
+        "right_closed": right_closed,
+        "closure_threshold": closure_threshold,
+    }
+
+    # 如果有基线，计算闭合比例
+    if baseline_left_ear is not None and baseline_right_ear is not None:
+        left_closure_ratio = left_ear / baseline_left_ear if baseline_left_ear > 1e-9 else 1.0
+        right_closure_ratio = right_ear / baseline_right_ear if baseline_right_ear > 1e-9 else 1.0
+        result["left_closure_ratio"] = left_closure_ratio
+        result["right_closure_ratio"] = right_closure_ratio
+
+        # 闭合百分比 (1 - ratio) * 100%
+        result["left_closure_percent"] = (1 - left_closure_ratio) * 100
+        result["right_closure_percent"] = (1 - right_closure_ratio) * 100
+
+    # 判断面瘫侧别
+    if left_closed and right_closed:
+        # 两眼都能闭合 - 比较哪只眼闭合更不完全
+        ear_diff = abs(left_ear - right_ear)
+        max_ear = max(left_ear, right_ear)
+
+        relative_diff = ear_diff / max_ear if max_ear > 1e-9 else 0
+
+        if relative_diff < 0.15:
+            result["palsy_side"] = 0
+            result["confidence"] = 1.0 - relative_diff
+            result["interpretation"] = "双眼对称闭合"
+        elif left_ear > right_ear:
+            result["palsy_side"] = 1  # 左眼EAR更大 -> 左侧面瘫
+            result["confidence"] = min(1.0, relative_diff * 2)
+            result["interpretation"] = f"左眼闭合较弱 (EAR L={left_ear:.3f} > R={right_ear:.3f})"
+        else:
+            result["palsy_side"] = 2  # 右眼EAR更大 -> 右侧面瘫
+            result["confidence"] = min(1.0, relative_diff * 2)
+            result["interpretation"] = f"右眼闭合较弱 (EAR R={right_ear:.3f} > L={left_ear:.3f})"
+
+    elif left_closed and not right_closed:
+        # 只有左眼能闭合 -> 右侧面瘫
+        result["palsy_side"] = 2
+        result["confidence"] = min(1.0, (right_ear - closure_threshold) / closure_threshold)
+        result["interpretation"] = f"右眼无法闭合 (EAR={right_ear:.3f} > 阈值{closure_threshold})"
+
+    elif right_closed and not left_closed:
+        # 只有右眼能闭合 -> 左侧面瘫
+        result["palsy_side"] = 1
+        result["confidence"] = min(1.0, (left_ear - closure_threshold) / closure_threshold)
+        result["interpretation"] = f"左眼无法闭合 (EAR={left_ear:.3f} > 阈值{closure_threshold})"
+
+    else:
+        # 两眼都无法完全闭合
+        ear_diff = abs(left_ear - right_ear)
+        if ear_diff < 0.03:
+            result["palsy_side"] = 0
+            result["confidence"] = 0.5
+            result["interpretation"] = "双眼均无法完全闭合，可能为双侧面瘫或其他原因"
+        elif left_ear > right_ear:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, ear_diff / max(left_ear, right_ear))
+            result["interpretation"] = f"双眼均无法完全闭合，左眼更差 (L={left_ear:.3f} > R={right_ear:.3f})"
+        else:
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, ear_diff / max(left_ear, right_ear))
+            result["interpretation"] = f"双眼均无法完全闭合，右眼更差 (R={right_ear:.3f} > L={left_ear:.3f})"
+
+    return result
+
+
 def compute_close_eye_metrics(landmarks, w: int, h: int,
                               baseline_landmarks=None) -> Dict[str, Any]:
     """计算闭眼特有指标"""
@@ -112,6 +217,9 @@ def compute_close_eye_metrics(landmarks, w: int, h: int,
     }
 
     # 如果有基线，计算闭合程度
+    baseline_l_ear = None
+    baseline_r_ear = None
+
     if baseline_landmarks is not None:
         baseline_l_ear = compute_ear(baseline_landmarks, w, h, True)
         baseline_r_ear = compute_ear(baseline_landmarks, w, h, False)
@@ -151,6 +259,12 @@ def compute_close_eye_metrics(landmarks, w: int, h: int,
         else:
             metrics["right_area_change_percent"] = 0
 
+    # 添加面瘫侧别检测
+    palsy_detection = detect_palsy_side_from_closure(
+        l_ear, r_ear, baseline_l_ear, baseline_r_ear
+    )
+    metrics["palsy_detection"] = palsy_detection
+
     return metrics
 
 
@@ -159,6 +273,13 @@ def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) ->
     计算Voluntary Movement评分
 
     基于闭眼程度的对称性
+
+    评分标准:
+    - 5=完整: 双眼完全闭合且对称
+    - 4=几乎完整: 闭合良好，轻度不对称
+    - 3=启动但不对称: 有闭眼动作但明显不对称
+    - 2=轻微启动: 闭眼动作很弱
+    - 1=无法启动: 几乎无闭眼动作
     """
     if baseline_landmarks is not None and "left_closure_percent" in metrics:
         left_closure = metrics["left_closure_percent"]
@@ -248,6 +369,7 @@ def plot_eye_curve(eye_seq: Dict, fps: float, peak_idx: int,
     ax1.plot(time_sec, eye_seq["ear"]["right"], 'r-', label='Right Eye EAR', linewidth=2)
     ax1.plot(time_sec, eye_seq["ear"]["average"], 'g--', label='Average EAR', linewidth=1.5, alpha=0.7)
     ax1.axvline(x=time_sec[peak_idx], color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
+    ax1.axhline(y=0.15, color='orange', linestyle=':', alpha=0.7, label='Closure Threshold')
     ax1.set_xlabel('Time (seconds)' if fps > 0 else 'Frame', fontsize=11)
     ax1.set_ylabel('Eye Aspect Ratio (EAR)', fontsize=11)
     ax1.set_title(f'{action_name} - Eye Aspect Ratio Over Time', fontsize=13)
@@ -281,9 +403,9 @@ def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
     draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_R, (0, 165, 255), 2)
 
     # 信息面板
-    panel_h = 280
-    cv2.rectangle(img, (5, 5), (380, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (380, panel_h), (255, 255, 255), 1)
+    panel_h = 340
+    cv2.rectangle(img, (5, 5), (420, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, 5), (420, panel_h), (255, 255, 255), 1)
 
     y = 28
     cv2.putText(img, f"{result.action_name}", (15, y),
@@ -327,6 +449,27 @@ def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
 
         cv2.putText(img, f"Right Closure: {metrics['right_closure_percent']:.1f}%", (15, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        y += 22
+
+    # 面瘫侧别检测结果
+    palsy_detection = metrics.get("palsy_detection", {})
+    if palsy_detection:
+        cv2.putText(img, "=== Palsy Detection ===", (15, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        y += 20
+
+        left_closed = palsy_detection.get("left_closed", False)
+        right_closed = palsy_detection.get("right_closed", False)
+        cv2.putText(img,
+                    f"Left Closed: {'Yes' if left_closed else 'No'}  Right Closed: {'Yes' if right_closed else 'No'}",
+                    (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        y += 18
+
+        palsy_side = palsy_detection.get("palsy_side", 0)
+        palsy_text = {0: "无/对称", 1: "左侧", 2: "右侧"}.get(palsy_side, "未知")
+        palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
+        cv2.putText(img, f"Palsy Side: {palsy_text}", (15, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)
         y += 25
 
     # Voluntary Score
@@ -411,18 +554,37 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
+    # 获取面瘫侧别检测结果
+    palsy_detection = metrics.get("palsy_detection", {})
+
     # 存储动作特有指标
     result.action_specific = {
-        "close_eye_metrics": metrics,
+        "close_eye_metrics": {
+            "left_ear": metrics["left_ear"],
+            "right_ear": metrics["right_ear"],
+            "ear_ratio": metrics["ear_ratio"],
+            "left_area": metrics["left_area"],
+            "right_area": metrics["right_area"],
+            "area_ratio": metrics["area_ratio"],
+        },
         "eye_sequence": {
             "ear_left": [float(x) if not np.isnan(x) else None for x in eye_seq["ear"]["left"]],
             "ear_right": [float(x) if not np.isnan(x) else None for x in eye_seq["ear"]["right"]],
             "area_left": [float(x) if not np.isnan(x) else None for x in eye_seq["area"]["left"]],
             "area_right": [float(x) if not np.isnan(x) else None for x in eye_seq["area"]["right"]],
         },
+        "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
     }
+
+    if "left_closure_percent" in metrics:
+        result.action_specific["closure_metrics"] = {
+            "left_closure_percent": metrics["left_closure_percent"],
+            "right_closure_percent": metrics["right_closure_percent"],
+            "left_closure_ratio": metrics["left_closure_ratio"],
+            "right_closure_ratio": metrics["right_closure_ratio"],
+        }
 
     # 创建输出目录
     action_dir = output_dir / action_name
@@ -445,6 +607,7 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     print(f"    [OK] {action_name}: EAR L={metrics['left_ear']:.4f} R={metrics['right_ear']:.4f}")
     if "left_closure_percent" in metrics:
         print(f"         Closure L={metrics['left_closure_percent']:.1f}% R={metrics['right_closure_percent']:.1f}%")
+    print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
     print(f"         Voluntary Score: {result.voluntary_movement_score}/5 ({interpretation})")
 
     return result

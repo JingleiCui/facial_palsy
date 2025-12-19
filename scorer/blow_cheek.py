@@ -2,13 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 BlowCheek 动作处理模块
-======================
+================================
 
 分析鼓腮动作:
 1. 唇密封距离 (关键帧检测)
-2. 面颊膨胀度
-3. 嘴部闭合程度
-4. 联动运动检测
+2. 嘴部闭合程度
+3. 口角对称性
+4. 面瘫侧别检测
+5. 联动运动检测
+
+修复内容:
+- 移除错误的NLF分析
+- 使用唇密封距离和口角对称性作为主要指标
 
 关键帧检测方法:
 - upper_lip: 0 (上唇上边界) 到 13 (上唇下边界)
@@ -24,7 +29,7 @@ import json
 
 from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
-    compute_mouth_metrics, compute_oral_angle, compute_nlf_length,
+    compute_mouth_metrics, compute_oral_angle,
     compute_icd, extract_common_indicators, compute_lip_seal_distance,
     ActionResult, draw_polygon, draw_landmarks
 )
@@ -66,9 +71,8 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int,
     # 嘴部指标
     mouth = compute_mouth_metrics(landmarks, w, h)
 
-    # 面颊区域分析 (使用鼻唇沟长度作为间接指标)
-    left_nlf = compute_nlf_length(landmarks, w, h, left=True)
-    right_nlf = compute_nlf_length(landmarks, w, h, left=False)
+    # 口角角度
+    oral = compute_oral_angle(landmarks, w, h)
 
     metrics = {
         "lip_seal": {
@@ -82,80 +86,165 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int,
         },
         "mouth_width": mouth["width"],
         "mouth_height": mouth["height"],
-        "left_nlf": left_nlf,
-        "right_nlf": right_nlf,
-        "nlf_ratio": left_nlf / right_nlf if right_nlf > 1e-9 else 1.0,
+        "left_corner": mouth["left_corner"],
+        "right_corner": mouth["right_corner"],
+        "oral_angle": {
+            "AOE": oral.AOE_angle,
+            "BOF": oral.BOF_angle,
+            "asymmetry": oral.angle_asymmetry,
+        }
     }
 
     # 如果有基线，计算变化
     if baseline_landmarks is not None:
         baseline_seal = compute_lip_seal_distance(baseline_landmarks, w, h)
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
-        baseline_left_nlf = compute_nlf_length(baseline_landmarks, w, h, left=True)
-        baseline_right_nlf = compute_nlf_length(baseline_landmarks, w, h, left=False)
+        baseline_oral = compute_oral_angle(baseline_landmarks, w, h)
 
         metrics["baseline"] = {
             "lip_seal_total": baseline_seal["total_distance"],
             "mouth_width": baseline_mouth["width"],
-            "left_nlf": baseline_left_nlf,
-            "right_nlf": baseline_right_nlf,
         }
 
         # 变化量
         metrics["seal_change"] = seal_result["total_distance"] - baseline_seal["total_distance"]
         metrics["mouth_width_change"] = mouth["width"] - baseline_mouth["width"]
-        metrics["left_nlf_change"] = left_nlf - baseline_left_nlf
-        metrics["right_nlf_change"] = right_nlf - baseline_right_nlf
+
+        # 嘴角位移
+        left_corner = mouth["left_corner"]
+        right_corner = mouth["right_corner"]
+        baseline_left = baseline_mouth["left_corner"]
+        baseline_right = baseline_mouth["right_corner"]
+
+        left_excursion = dist(left_corner, baseline_left)
+        right_excursion = dist(right_corner, baseline_right)
+        metrics["left_excursion"] = left_excursion
+        metrics["right_excursion"] = right_excursion
+        metrics["excursion_ratio"] = left_excursion / right_excursion if right_excursion > 1e-9 else 1.0
 
     return metrics
+
+
+def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    从鼓腮动作检测面瘫侧别
+
+    原理:
+    1. 面瘫侧嘴角运动幅度小
+    2. 口角角度不对称
+
+    Returns:
+        Dict包含:
+        - palsy_side: 0=无/对称, 1=左, 2=右
+        - confidence: 置信度
+        - interpretation: 解释
+    """
+    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+
+    # 使用运动幅度作为主要指标
+    if "left_excursion" in metrics and "right_excursion" in metrics:
+        left_exc = metrics["left_excursion"]
+        right_exc = metrics["right_excursion"]
+
+        if max(left_exc, right_exc) < 2:  # 运动幅度太小
+            # 检查口角角度
+            oral = metrics.get("oral_angle", {})
+            asym = oral.get("asymmetry", 0)
+            if asym < 3:
+                result["interpretation"] = "双侧对称"
+            else:
+                result["interpretation"] = "运动幅度过小，难以判断"
+            return result
+
+        exc_ratio = metrics["excursion_ratio"]
+
+        if abs(exc_ratio - 1.0) < 0.15:
+            result["palsy_side"] = 0
+            result["confidence"] = 1.0 - abs(exc_ratio - 1.0)
+            result["interpretation"] = f"双侧运动对称 (比值={exc_ratio:.2f})"
+        elif left_exc < right_exc:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
+            result["interpretation"] = f"左侧运动较弱 (L={left_exc:.1f}px < R={right_exc:.1f}px)"
+        else:
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
+            result["interpretation"] = f"右侧运动较弱 (R={right_exc:.1f}px < L={left_exc:.1f}px)"
+    else:
+        # 没有基线，使用口角对称性
+        oral = metrics.get("oral_angle", {})
+        asym = oral.get("asymmetry", 0)
+        aoe = oral.get("AOE", 0)
+        bof = oral.get("BOF", 0)
+
+        if asym < 3:
+            result["palsy_side"] = 0
+            result["confidence"] = 1.0 - asym / 10
+            result["interpretation"] = f"口角对称 (不对称度={asym:.1f}°)"
+        elif aoe < bof:
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, asym / 15)
+            result["interpretation"] = f"右口角位置较低 (AOE={aoe:+.1f}°)"
+        else:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, asym / 15)
+            result["interpretation"] = f"左口角位置较低 (BOF={bof:+.1f}°)"
+
+    return result
 
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
     """
     计算Voluntary Movement评分
 
-    基于嘴部闭合程度和面颊膨胀的对称性
+    基于嘴部闭合程度和对称性
+
+    评分标准:
+    - 5=完整: 双侧对称且运动充分
+    - 4=几乎完整: 轻度不对称或运动略有不足
+    - 3=启动但不对称: 明显不对称但有运动
+    - 2=轻微启动: 运动幅度很小
+    - 1=无法启动: 几乎没有运动
     """
-    if baseline_landmarks is not None and "baseline" in metrics:
-        # 使用NLF变化的对称性评估
-        left_change = abs(metrics.get("left_nlf_change", 0))
-        right_change = abs(metrics.get("right_nlf_change", 0))
+    oral = metrics.get("oral_angle", {})
+    oral_asym = oral.get("asymmetry", 0)
+
+    if baseline_landmarks is not None and "excursion_ratio" in metrics:
+        # 使用运动幅度评估
+        exc_ratio = metrics["excursion_ratio"]
+        left_exc = metrics.get("left_excursion", 0)
+        right_exc = metrics.get("right_excursion", 0)
 
         # 检查是否有运动
-        if left_change < 2 and right_change < 2:
-            return 1, "无法启动运动 (NLF变化过小)"
+        max_exc = max(left_exc, right_exc)
+        if max_exc < 2:
+            return 1, "无法启动运动 (运动幅度过小)"
 
         # 计算对称性
-        max_change = max(left_change, right_change)
-        min_change = min(left_change, right_change)
+        asymmetry = abs(exc_ratio - 1.0)
 
-        if max_change < 1e-9:
-            symmetry_ratio = 1.0
-        else:
-            symmetry_ratio = min_change / max_change
-
-        if symmetry_ratio >= 0.85:
-            return 5, "运动完整 (对称性>85%)"
-        elif symmetry_ratio >= 0.70:
-            return 4, "几乎完整 (对称性70-85%)"
-        elif symmetry_ratio >= 0.50:
-            return 3, "启动但不对称 (对称性50-70%)"
-        elif symmetry_ratio >= 0.25:
-            return 2, "轻微启动 (对称性25-50%)"
-        else:
-            return 1, "无法启动 (对称性<25%)"
-    else:
-        # 没有基线，使用静态比值
-        ratio = metrics.get("nlf_ratio", 1.0)
-        deviation = abs(ratio - 1.0)
-
-        if deviation <= 0.05:
-            return 5, "运动完整"
-        elif deviation <= 0.10:
-            return 4, "几乎完整"
-        elif deviation <= 0.20:
+        if asymmetry < 0.15:
+            if max_exc > 8:
+                return 5, "运动完整 (对称性>85%)"
+            elif max_exc > 5:
+                return 4, "几乎完整"
+            else:
+                return 3, "启动但幅度不足"
+        elif asymmetry < 0.30:
             return 3, "启动但不对称"
-        elif deviation <= 0.35:
+        elif asymmetry < 0.50:
+            return 2, "轻微启动"
+        else:
+            return 1, "无法启动"
+    else:
+        # 没有基线，使用静态口角对称性
+        if oral_asym < 3:
+            return 5, "运动完整"
+        elif oral_asym < 6:
+            return 4, "几乎完整"
+        elif oral_asym < 10:
+            return 3, "启动但不对称"
+        elif oral_asym < 15:
             return 2, "轻微启动"
         else:
             return 1, "无法启动"
@@ -196,7 +285,8 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
 
 def visualize_blow_cheek(frame: np.ndarray, landmarks, w: int, h: int,
                          result: ActionResult,
-                         metrics: Dict[str, Any]) -> np.ndarray:
+                         metrics: Dict[str, Any],
+                         palsy_detection: Dict[str, Any]) -> np.ndarray:
     """可视化鼓腮指标"""
     img = frame.copy()
 
@@ -222,18 +312,16 @@ def visualize_blow_cheek(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.circle(img, (int(lower_inner[0]), int(lower_inner[1])), 5, (0, 255, 255), -1)
     cv2.circle(img, (int(lower_outer[0]), int(lower_outer[1])), 5, (0, 255, 255), -1)
 
-    # 绘制鼻唇沟
-    l_ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
-    r_ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
-    l_mouth = pt2d(landmarks[LM.MOUTH_L], w, h)
-    r_mouth = pt2d(landmarks[LM.MOUTH_R], w, h)
-    cv2.line(img, (int(l_ala[0]), int(l_ala[1])), (int(l_mouth[0]), int(l_mouth[1])), (255, 100, 100), 2)
-    cv2.line(img, (int(r_ala[0]), int(r_ala[1])), (int(r_mouth[0]), int(r_mouth[1])), (100, 165, 255), 2)
+    # 绘制嘴角点
+    left_corner = metrics["left_corner"]
+    right_corner = metrics["right_corner"]
+    cv2.circle(img, (int(left_corner[0]), int(left_corner[1])), 5, (255, 0, 0), -1)
+    cv2.circle(img, (int(right_corner[0]), int(right_corner[1])), 5, (0, 0, 255), -1)
 
     # 信息面板
-    panel_h = 260
-    cv2.rectangle(img, (5, 5), (380, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (380, panel_h), (255, 255, 255), 1)
+    panel_h = 300
+    cv2.rectangle(img, (5, 5), (400, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, 5), (400, panel_h), (255, 255, 255), 1)
 
     y = 28
     cv2.putText(img, f"{ACTION_NAME}", (15, y),
@@ -256,22 +344,28 @@ def visualize_blow_cheek(frame: np.ndarray, landmarks, w: int, h: int,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
     y += 25
 
-    cv2.putText(img, "=== Mouth & NLF ===", (15, y),
+    cv2.putText(img, "=== Mouth Metrics ===", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
     y += 20
 
     cv2.putText(img, f"Mouth W: {metrics['mouth_width']:.1f}px  H: {metrics['mouth_height']:.1f}px", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 18
+    y += 22
 
-    cv2.putText(img, f"NLF L: {metrics['left_nlf']:.1f}px  R: {metrics['right_nlf']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 18
+    # 口角对称性
+    oral = metrics.get("oral_angle", {})
+    oral_asym = oral.get("asymmetry", 0)
+    asym_color = (0, 255, 0) if oral_asym < 5 else (0, 165, 255) if oral_asym < 10 else (0, 0, 255)
+    cv2.putText(img, f"Oral Asymmetry: {oral_asym:.1f} deg", (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, asym_color, 1)
+    y += 22
 
-    ratio = metrics['nlf_ratio']
-    ratio_color = (0, 255, 0) if 0.9 <= ratio <= 1.1 else (0, 0, 255)
-    cv2.putText(img, f"NLF Ratio: {ratio:.3f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, ratio_color, 1)
+    # 面瘫侧别检测结果
+    palsy_side = palsy_detection.get("palsy_side", 0)
+    palsy_text = {0: "无/对称", 1: "左侧", 2: "右侧"}.get(palsy_side, "未知")
+    palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
+    cv2.putText(img, f"Palsy Side: {palsy_text}", (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)
     y += 25
 
     # Voluntary Score
@@ -282,8 +376,8 @@ def visualize_blow_cheek(frame: np.ndarray, landmarks, w: int, h: int,
     legend_y = panel_h + 15
     cv2.line(img, (15, legend_y), (45, legend_y), (0, 255, 0), 3)
     cv2.putText(img, "Upper lip (0-13)", (50, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-    cv2.line(img, (180, legend_y), (210, legend_y), (0, 255, 255), 3)
-    cv2.putText(img, "Lower lip (14-17)", (215, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    cv2.line(img, (200, legend_y), (230, legend_y), (0, 255, 255), 3)
+    cv2.putText(img, "Lower lip (14-17)", (235, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
     return img
 
@@ -321,6 +415,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 计算鼓腮特有指标
     metrics = compute_blow_cheek_metrics(peak_landmarks, w, h, baseline_landmarks)
 
+    # 检测面瘫侧别
+    palsy_detection = detect_palsy_side(metrics)
+
     # 计算Voluntary Movement评分
     score, interpretation = compute_voluntary_score(metrics, baseline_landmarks)
     result.voluntary_movement_score = score
@@ -334,9 +431,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "lip_seal": metrics["lip_seal"],
         "mouth_width": metrics["mouth_width"],
         "mouth_height": metrics["mouth_height"],
-        "left_nlf": metrics["left_nlf"],
-        "right_nlf": metrics["right_nlf"],
-        "nlf_ratio": metrics["nlf_ratio"],
+        "oral_angle": metrics["oral_angle"],
+        "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
     }
@@ -346,8 +442,6 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         result.action_specific["changes"] = {
             "seal_change": metrics.get("seal_change", 0),
             "mouth_width_change": metrics.get("mouth_width_change", 0),
-            "left_nlf_change": metrics.get("left_nlf_change", 0),
-            "right_nlf_change": metrics.get("right_nlf_change", 0),
         }
 
     # 创建输出目录
@@ -358,7 +452,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
     # 保存可视化
-    vis = visualize_blow_cheek(peak_frame, peak_landmarks, w, h, result, metrics)
+    vis = visualize_blow_cheek(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 保存JSON
@@ -366,7 +460,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
     print(f"    [OK] {ACTION_NAME}: Lip Seal={metrics['lip_seal']['total_distance']:.1f}px")
-    print(f"         NLF L={metrics['left_nlf']:.1f} R={metrics['right_nlf']:.1f} Ratio={metrics['nlf_ratio']:.3f}")
+    print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
     print(f"         Voluntary Score: {result.voluntary_movement_score}/5 ({interpretation})")
 
     return result

@@ -42,9 +42,10 @@ from sunnybrook_scorer import (
 # 导入动作模块
 import neutral_face
 import eye_blink
-import smile
-import raise_eyebrow
 import close_eye
+import smile
+import show_teeth  # 独立的ShowTeeth模块
+import raise_eyebrow
 import lip_pucker
 import blow_cheek
 import shrug_nose
@@ -78,21 +79,22 @@ ALL_ACTIONS = [
     "ShrugNose"
 ]
 
+
 def find_peak_frame_generic(landmarks_seq, frames_seq, w, h, action_name, baseline_landmarks=None):
     """通用峰值帧查找
 
     说明：
     - 优先调用各动作模块自带的峰值检测逻辑（与最新版动作代码保持一致）
-    - eye_blink：自然眨眼/自主眨眼仍沿用旧逻辑
     """
     if action_name == "NeutralFace":
         return neutral_face.find_peak_frame(landmarks_seq, frames_seq, w, h)
-    elif action_name in ["Smile", "ShowTeeth"]:
+    elif action_name == "Smile":
         return smile.find_peak_frame_smile(landmarks_seq, frames_seq, w, h)
+    elif action_name == "ShowTeeth":
+        return show_teeth.find_peak_frame(landmarks_seq, frames_seq, w, h)
     elif action_name in ["VoluntaryEyeBlink", "SpontaneousEyeBlink"]:
         return eye_blink.find_peak_frame_blink(landmarks_seq, frames_seq, w, h)
     elif action_name in ["CloseEyeSoftly", "CloseEyeHardly"]:
-        # 闭眼峰值：EAR最小
         return close_eye.find_peak_frame_close_eye(landmarks_seq, frames_seq, w, h)
     elif action_name == "RaiseEyebrow":
         return raise_eyebrow.find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
@@ -111,21 +113,21 @@ def process_action_generic(landmarks_seq, frames_seq, w, h, video_info, output_d
                            action_name, baseline_result=None, baseline_landmarks=None):
     """动作处理入口（与最新版动作代码对齐）
 
-    注意：
-    - eye_blink.py 未上传：VoluntaryEyeBlink / SpontaneousEyeBlink 仍沿用旧逻辑
-    - 其余动作全部调用各自模块的 process / process_xxx 函数
+    所有动作全部调用各自模块的 process / process_xxx 函数
     """
     if action_name == "NeutralFace":
         return neutral_face.process(landmarks_seq, frames_seq, w, h, video_info, output_dir)
 
-    # --- Smile / ShowTeeth ---
+    # --- Smile ---
     elif action_name == "Smile":
         return smile.process_smile(
             landmarks_seq, frames_seq, w, h, video_info, output_dir,
             baseline_result, baseline_landmarks
         )
+
+    # --- ShowTeeth (独立模块) ---
     elif action_name == "ShowTeeth":
-        return smile.process_show_teeth(
+        return show_teeth.process(
             landmarks_seq, frames_seq, w, h, video_info, output_dir,
             baseline_result, baseline_landmarks
         )
@@ -356,181 +358,541 @@ def visualize_generic_action(frame, landmarks, w, h, result):
 # =============================================================================
 
 def calculate_sunnybrook_from_results(action_results: Dict[str, ActionResult]) -> Optional[SunnybrookScore]:
-    """从动作结果计算完整Sunnybrook评分"""
+    """
+    基于各动作的ActionResult，计算Sunnybrook评分（严格按Sunnybrook 5个主动运动项 + 5个联动项）。
 
-    # 1. Resting Symmetry (从NeutralFace)
-    if "NeutralFace" not in action_results:
+    说明：
+    - Resting Symmetry：仅使用 NeutralFace
+    - Voluntary Movement：Brow、GentleEyeClosure、OpenMouthSmile、Snarl、LipPucker（5项，Sum×4）
+    - Synkinesis：同上5项（每项0-3，总分0-15）
+    """
+    if not action_results or "NeutralFace" not in action_results:
         return None
 
+    # =========================
+    # 1) Resting Symmetry
+    # =========================
     neutral = action_results["NeutralFace"]
-    resting_data = neutral.action_specific.get("resting_symmetry", {})
 
-    if not resting_data:
-        # 重新计算
-        oral = neutral.oral_angle
-        resting = compute_resting_symmetry(
-            palpebral_height_ratio=neutral.palpebral_height_ratio,
-            nlf_ratio=neutral.nlf_ratio,
-            oral_angle_diff=oral.angle_diff if oral else 0,
-            aoe_angle=oral.AOE_angle if oral else 0,
-            bof_angle=oral.BOF_angle if oral else 0
-        )
-    else:
-        # 从存储的数据重建
-        from sunnybrook_scorer import RestingSymmetryItem
-        resting = RestingSymmetry(
-            eye=RestingSymmetryItem(
-                region="Eye", region_cn=resting_data["eye"]["region_cn"],
-                status=resting_data["eye"]["status"], status_cn=resting_data["eye"]["status_cn"],
-                score=resting_data["eye"]["score"], measurement=resting_data["eye"]["measurement"],
-                threshold_info=resting_data["eye"]["threshold_info"]
-            ),
-            cheek=RestingSymmetryItem(
-                region="Cheek", region_cn=resting_data["cheek"]["region_cn"],
-                status=resting_data["cheek"]["status"], status_cn=resting_data["cheek"]["status_cn"],
-                score=resting_data["cheek"]["score"], measurement=resting_data["cheek"]["measurement"],
-                threshold_info=resting_data["cheek"]["threshold_info"]
-            ),
-            mouth=RestingSymmetryItem(
-                region="Mouth", region_cn=resting_data["mouth"]["region_cn"],
-                status=resting_data["mouth"]["status"], status_cn=resting_data["mouth"]["status_cn"],
-                score=resting_data["mouth"]["score"], measurement=resting_data["mouth"]["measurement"],
-                threshold_info=resting_data["mouth"]["threshold_info"]
-            ),
-            raw_score=resting_data["raw_score"],
-            total_score=resting_data["total_score"],
-            affected_side=resting_data["affected_side"]
-        )
+    # oral_angle_diff：用 oral_angle 的 AOE/BOF 计算
+    oral = getattr(neutral, "oral_angle", None)
+    aoe = float(getattr(oral, "AOE_angle", 0.0) or 0.0) if oral else 0.0
+    bof = float(getattr(oral, "BOF_angle", 0.0) or 0.0) if oral else 0.0
+    oral_angle_diff = abs(aoe - bof)
 
-    # 2. Voluntary Movement (从5个标准表情)
-    vol_items = []
+    resting = compute_resting_symmetry(
+        palpebral_height_ratio=float(getattr(neutral, "palpebral_height_ratio", 1.0) or 1.0),
+        nlf_ratio=float(getattr(neutral, "nlf_ratio", 1.0) or 1.0),
+        oral_angle_diff=float(oral_angle_diff),
+        aoe_angle=float(aoe),
+        bof_angle=float(bof),
+    )
+
+    # =========================
+    # 2) Voluntary Movement (5 items)
+    # =========================
+    vol_items: List[VoluntaryMovementItem] = []
 
     # Brow -> RaiseEyebrow
-    if "RaiseEyebrow" in action_results:
-        r = action_results["RaiseEyebrow"]
+    brow_result = action_results.get("RaiseEyebrow")
+    if brow_result:
+        # 优先用"变化量"做对称性（更符合"运动幅度"）
+        l = getattr(brow_result, "left_brow_eye_distance_change", None)
+        r = getattr(brow_result, "right_brow_eye_distance_change", None)
+
+        if l is not None and r is not None and (abs(l) > 1e-9 or abs(r) > 1e-9):
+            ratio = (float(l) / float(r)) if abs(float(r)) > 1e-9 else (float("inf") if float(l) > 0 else 1.0)
+        else:
+            ratio = float(brow_result.brow_height_ratio or 1.0)
+
+        score, interp = compute_voluntary_score_from_ratio(ratio)
         vol_items.append(VoluntaryMovementItem(
             expression="Brow", expression_cn="皱额/抬眉",
-            left_value=r.left_brow_height, right_value=r.right_brow_height,
-            ratio=r.brow_height_ratio,
-            score=r.voluntary_movement_score,
-            interpretation=""
+            left_value=float(getattr(brow_result, "left_brow_height", 0.0) or 0.0),
+            right_value=float(getattr(brow_result, "right_brow_height", 0.0) or 0.0),
+            ratio=float(ratio) if np.isfinite(ratio) else 999.0,
+            score=int(brow_result.voluntary_movement_score or score),
+            interpretation=str(interp or "")
         ))
     else:
         vol_items.append(VoluntaryMovementItem(
             expression="Brow", expression_cn="皱额/抬眉",
-            left_value=0, right_value=0, ratio=1.0, score=5, interpretation="未评估"
+            left_value=0.0, right_value=0.0, ratio=1.0, score=5, interpretation="未评估"
         ))
 
-    # Gentle Eye closure -> CloseEyeSoftly
-    if "CloseEyeSoftly" in action_results:
-        r = action_results["CloseEyeSoftly"]
+    # Gentle eye closure -> CloseEyeSoftly
+    gentle = action_results.get("CloseEyeSoftly")
+    if gentle:
+        ratio = float(gentle.eye_area_ratio or 1.0)
+        score, interp = compute_voluntary_score_from_ratio(ratio)
         vol_items.append(VoluntaryMovementItem(
             expression="GentleEyeClosure", expression_cn="轻闭眼",
-            left_value=r.left_ear, right_value=r.right_ear,
-            ratio=r.left_ear / r.right_ear if r.right_ear > 1e-9 else 1.0,
-            score=r.voluntary_movement_score,
-            interpretation=""
+            left_value=float(gentle.left_eye_area or 0.0),
+            right_value=float(gentle.right_eye_area or 0.0),
+            ratio=float(ratio),
+            score=int(gentle.voluntary_movement_score or score),
+            interpretation=str(interp or "")
         ))
     else:
         vol_items.append(VoluntaryMovementItem(
             expression="GentleEyeClosure", expression_cn="轻闭眼",
-            left_value=0, right_value=0, ratio=1.0, score=5, interpretation="未评估"
+            left_value=0.0, right_value=0.0, ratio=1.0, score=5, interpretation="未评估"
         ))
 
-    # Open mouth smile -> Smile or ShowTeeth
-    smile_result = action_results.get("Smile") or action_results.get("ShowTeeth")
+    # Open mouth smile -> 优先 ShowTeeth，其次 Smile
+    smile_result = action_results.get("ShowTeeth") or action_results.get("Smile")
     if smile_result:
         oral = smile_result.oral_angle
         vol_items.append(VoluntaryMovementItem(
             expression="OpenMouthSmile", expression_cn="露齿微笑",
-            left_value=oral.BOF_angle if oral else 0,
-            right_value=oral.AOE_angle if oral else 0,
-            ratio=1.0,  # 使用评分直接
-            score=smile_result.voluntary_movement_score,
+            left_value=float(oral.BOF_angle if oral else 0.0),
+            right_value=float(oral.AOE_angle if oral else 0.0),
+            ratio=1.0,  # 该项直接用动作评分（避免角度符号导致比值误导）
+            score=int(smile_result.voluntary_movement_score or 5),
             interpretation=""
         ))
     else:
         vol_items.append(VoluntaryMovementItem(
             expression="OpenMouthSmile", expression_cn="露齿微笑",
-            left_value=0, right_value=0, ratio=1.0, score=5, interpretation="未评估"
+            left_value=0.0, right_value=0.0, ratio=1.0, score=5, interpretation="未评估"
         ))
 
     # Snarl -> ShrugNose
-    if "ShrugNose" in action_results:
-        r = action_results["ShrugNose"]
+    snarl = action_results.get("ShrugNose")
+    if snarl:
+        ratio = float(snarl.nlf_ratio or 1.0)
+        score, interp = compute_voluntary_score_from_ratio(ratio)
         vol_items.append(VoluntaryMovementItem(
             expression="Snarl", expression_cn="皱鼻",
-            left_value=r.nlf_ratio, right_value=1.0,
-            ratio=r.nlf_ratio,
-            score=r.voluntary_movement_score,
-            interpretation=""
+            left_value=float(snarl.left_nlf_length or 0.0),
+            right_value=float(snarl.right_nlf_length or 0.0),
+            ratio=float(ratio),
+            score=int(snarl.voluntary_movement_score or score),
+            interpretation=str(interp or "")
         ))
     else:
         vol_items.append(VoluntaryMovementItem(
             expression="Snarl", expression_cn="皱鼻",
-            left_value=0, right_value=0, ratio=1.0, score=5, interpretation="未评估"
+            left_value=0.0, right_value=0.0, ratio=1.0, score=5, interpretation="未评估"
         ))
 
     # Lip pucker -> LipPucker
-    if "LipPucker" in action_results:
-        r = action_results["LipPucker"]
+    pucker = action_results.get("LipPucker")
+    if pucker:
         vol_items.append(VoluntaryMovementItem(
             expression="LipPucker", expression_cn="撅嘴",
-            left_value=r.mouth_width, right_value=r.mouth_width,
+            left_value=float(pucker.mouth_width or 0.0),
+            right_value=float(pucker.mouth_width or 0.0),
             ratio=1.0,
-            score=r.voluntary_movement_score,
+            score=int(pucker.voluntary_movement_score or 5),
             interpretation=""
         ))
     else:
         vol_items.append(VoluntaryMovementItem(
             expression="LipPucker", expression_cn="撅嘴",
-            left_value=0, right_value=0, ratio=1.0, score=5, interpretation="未评估"
+            left_value=0.0, right_value=0.0, ratio=1.0, score=5, interpretation="未评估"
         ))
 
-    raw_sum = sum(item.score for item in vol_items)
-    voluntary = VoluntaryMovement(
-        items=vol_items,
-        raw_sum=raw_sum,
-        total_score=raw_sum * 4  # 满分 5×5×4 = 100
-    )
+    # VoluntaryMovement 需要 raw_sum 和 total_score
+    vol_raw_sum = int(sum(int(it.score) for it in vol_items))
+    vol_total_score = int(vol_raw_sum * 4)
+    voluntary = VoluntaryMovement(items=vol_items, raw_sum=vol_raw_sum, total_score=vol_total_score)
 
-    # 3. Synkinesis (从所有有联动检测的动作)
-    syn_items = []
+    # =========================
+    # 3) Synkinesis (严格5项，0-15)
+    # =========================
+    def _get_syn(action_name: str) -> Tuple[int, int, int, str]:
+        r = action_results.get(action_name)
+        if not r or not getattr(r, "synkinesis_scores", None):
+            return 0, 0, 0, "未检测"
+        eye = int(r.synkinesis_scores.get("eye_synkinesis", 0) or 0)
+        mouth = int(r.synkinesis_scores.get("mouth_synkinesis", 0) or 0)
+        # 单项总分按0-3：取更严重的联动（避免eye+mouth叠加>3）
+        total = max(eye, mouth)
+        interp = str(getattr(r, "synkinesis_interpretation", "") or f"eye={eye}, mouth={mouth}")
+        return eye, mouth, total, interp
 
-    for action_name, result in action_results.items():
-        if action_name == "NeutralFace":
+    syn_items: List[SynkinesisItem] = []
+    syn_map = [
+        ("Brow", "RaiseEyebrow"),
+        ("GentleEyeClosure", "CloseEyeSoftly"),
+        ("OpenMouthSmile", "ShowTeeth" if "ShowTeeth" in action_results else "Smile"),
+        ("Snarl", "ShrugNose"),
+        ("LipPucker", "LipPucker"),
+    ]
+
+    for expr, act in syn_map:
+        cn = SUNNYBROOK_EXPRESSION_MAPPING.get(expr, {}).get("cn", expr)
+        eye, mouth, total, interp = _get_syn(act)
+        syn_items.append(SynkinesisItem(
+            expression=expr,
+            expression_cn=str(cn),
+            eye_synkinesis=int(eye),
+            mouth_synkinesis=int(mouth),
+            total_score=int(total),
+            interpretation=str(interp)
+        ))
+
+    syn_total_score = int(sum(int(it.total_score) for it in syn_items))
+    synkinesis = Synkinesis(items=syn_items, total_score=syn_total_score)
+
+    # =========================
+    # 4) Composite
+    # =========================
+    score = compute_sunnybrook_composite(resting, voluntary, synkinesis)
+    return score
+
+
+def _palsy_side_to_text(side_code: Any) -> str:
+    """0/1/2 -> 无/左/右（兼容None/空字符串）"""
+    try:
+        side_int = int(side_code)
+    except Exception:
+        side_int = 0
+    return {0: "无", 1: "左", 2: "右"}.get(side_int, "无")
+
+
+def infer_palsy_and_side(action_results: Dict[str, ActionResult]) -> Dict[str, Any]:
+    """
+    综合 11 个动作的"是否面瘫 + 患侧投票"（以运动证据为主，静息仅作辅证）。
+
+    返回结构直接给HTML使用：
+    - has_palsy / palsy_side / confidence
+    - left_score / right_score / votes / top_evidence
+    """
+    weights = {
+        "SpontaneousEyeBlink": 1.0,
+        "VoluntaryEyeBlink": 1.1,
+        "CloseEyeSoftly": 1.4,
+        "CloseEyeHardly": 1.6,
+        "RaiseEyebrow": 1.0,
+        "Smile": 1.3,
+        "ShowTeeth": 1.3,
+        "LipPucker": 1.0,
+        "ShrugNose": 1.0,
+        "BlowCheek": 1.1,
+        "NeutralFace": 0.4,  # 静息只提示异常，不定向
+    }
+
+    def _clip01(x: float) -> float:
+        return float(max(0.0, min(1.0, x)))
+
+    def _vote_record(action: str, side: int, strength: float, region: str, reason: str, metric: Dict[str, Any] = None):
+        return {
+            "action": action,
+            "side": int(side),  # 0=中立,1=左弱,2=右弱
+            "side_text": _palsy_side_to_text(side) if side != 0 else "中立",
+            "strength": float(strength),
+            "weight": float(weights.get(action, 1.0)),
+            "region": str(region),
+            "reason": str(reason),
+            "metric": metric or {}
+        }
+
+    def _decide_side_from_pair(left_val: float, right_val: float, weaker_if_smaller: bool):
+        l = float(left_val)
+        r = float(right_val)
+        denom = max(abs(l), abs(r), 1e-9)
+        strength = _clip01(abs(l - r) / denom)
+
+        if strength < 0.08:
+            return 0, 0.0
+
+        if weaker_if_smaller:
+            return (1, strength) if l < r else (2, strength)
+        else:
+            return (1, strength) if l > r else (2, strength)
+
+    votes: List[Dict[str, Any]] = []
+
+    # ========== 眼部动作 ==========
+    for act in ["SpontaneousEyeBlink", "VoluntaryEyeBlink", "CloseEyeSoftly", "CloseEyeHardly"]:
+        res = action_results.get(act)
+        if not res:
             continue
-
-        if result.synkinesis_scores:
-            total_syn = sum(result.synkinesis_scores.values())
-            syn_items.append(SynkinesisItem(
-                expression=action_name,
-                expression_cn=result.action_name_cn,
-                eye_synkinesis=result.synkinesis_scores.get("eye_synkinesis", 0),
-                mouth_synkinesis=result.synkinesis_scores.get("mouth_synkinesis", 0),
-                total_score=total_syn,
-                interpretation=""
+        l_ear = float(res.left_ear or 0.0)
+        r_ear = float(res.right_ear or 0.0)
+        side, strength = _decide_side_from_pair(l_ear, r_ear, weaker_if_smaller=True)
+        if side != 0:
+            votes.append(_vote_record(
+                act, side, strength, "眼",
+                f"EAR L={l_ear:.3f}, R={r_ear:.3f}",
+                {"left_ear": l_ear, "right_ear": r_ear}
             ))
 
-    synkinesis = Synkinesis(
-        items=syn_items,
-        total_score=sum(item.total_score for item in syn_items)
-    )
+    # ========== 眉部 ==========
+    res = action_results.get("RaiseEyebrow")
+    if res:
+        l = float(res.left_brow_eye_distance_change or res.left_brow_height or 0.0)
+        r = float(res.right_brow_eye_distance_change or res.right_brow_height or 0.0)
+        side, strength = _decide_side_from_pair(l, r, weaker_if_smaller=True)
+        if side != 0:
+            votes.append(_vote_record(
+                "RaiseEyebrow", side, strength, "额",
+                f"Brow L={l:.2f}, R={r:.2f}",
+                {"left": l, "right": r}
+            ))
 
-    # 4. 计算Composite Score
-    return compute_sunnybrook_composite(resting, voluntary, synkinesis)
+    # ========== 微笑/露齿 ==========
+    for act in ["Smile", "ShowTeeth"]:
+        res = action_results.get(act)
+        if not res:
+            continue
+        oral = res.oral_angle
+        if not oral:
+            continue
+        aoe = float(oral.AOE_angle or 0.0)
+        bof = float(oral.BOF_angle or 0.0)
+        # AOE是右侧角度，BOF是左侧角度
+        side, strength = _decide_side_from_pair(bof, aoe, weaker_if_smaller=True)
+        if side != 0:
+            votes.append(_vote_record(
+                act, side, strength, "口",
+                f"AOE(R)={aoe:+.1f}°, BOF(L)={bof:+.1f}°",
+                {"aoe": aoe, "bof": bof}
+            ))
+
+    # ========== 皱鼻/鼓腮/撅嘴 ==========
+    for act in ["ShrugNose", "BlowCheek", "LipPucker"]:
+        res = action_results.get(act)
+        if not res:
+            continue
+        l_nlf = float(res.left_nlf_length or 0.0)
+        r_nlf = float(res.right_nlf_length or 0.0)
+        # NLF 短的一侧更弱
+        side, strength = _decide_side_from_pair(l_nlf, r_nlf, weaker_if_smaller=True)
+        if side != 0:
+            votes.append(_vote_record(
+                act, side, strength, "中面",
+                f"NLF L={l_nlf:.1f}, R={r_nlf:.1f}",
+                {"left_nlf": l_nlf, "right_nlf": r_nlf}
+            ))
+
+    # ========== 静息面 ==========
+    res = action_results.get("NeutralFace")
+    if res:
+        palp_ratio = float(res.palpebral_height_ratio or 1.0)
+        nlf_ratio = float(res.nlf_ratio or 1.0)
+        oral = res.oral_angle
+        aoe = float(oral.AOE_angle if oral else 0.0)
+        bof = float(oral.BOF_angle if oral else 0.0)
+
+        # 睑裂高度比
+        if abs(palp_ratio - 1.0) > 0.08:
+            side = 1 if palp_ratio < 1.0 else 2
+            strength = _clip01(abs(palp_ratio - 1.0))
+            votes.append(_vote_record(
+                "NeutralFace", side, strength * 0.5, "眼(静息)",
+                f"Palpebral ratio={palp_ratio:.3f}",
+                {"palpebral_height_ratio": palp_ratio}
+            ))
+
+        # NLF比值
+        if abs(nlf_ratio - 1.0) > 0.08:
+            side = 1 if nlf_ratio < 1.0 else 2
+            strength = _clip01(abs(nlf_ratio - 1.0))
+            votes.append(_vote_record(
+                "NeutralFace", side, strength * 0.5, "中面(静息)",
+                f"NLF ratio={nlf_ratio:.3f}",
+                {"nlf_ratio": nlf_ratio}
+            ))
+
+        # 口角
+        if abs(aoe - bof) > 3:
+            side = 1 if bof < aoe else 2
+            strength = _clip01(abs(aoe - bof) / 20.0)
+            votes.append(_vote_record(
+                "NeutralFace", side, strength * 0.5, "口(静息)",
+                f"AOE={aoe:+.1f}°, BOF={bof:+.1f}°",
+                {"aoe": aoe, "bof": bof}
+            ))
+
+    # ========== 汇总 ==========
+    left_score = 0.0
+    right_score = 0.0
+    for v in votes:
+        w = float(v["weight"])
+        s = float(v["strength"])
+        if v["side"] == 1:
+            left_score += w * s
+        elif v["side"] == 2:
+            right_score += w * s
+
+    total = left_score + right_score
+    if total < 0.3:
+        has_palsy = False
+        palsy_side = 0
+        palsy_side_text = "无"
+        confidence = 1.0 - total
+    else:
+        has_palsy = True
+        if left_score > right_score * 1.2:
+            palsy_side = 1
+            palsy_side_text = "左"
+        elif right_score > left_score * 1.2:
+            palsy_side = 2
+            palsy_side_text = "右"
+        else:
+            palsy_side = 0
+            palsy_side_text = "不确定"
+        confidence = _clip01(abs(left_score - right_score) / max(total, 1e-9))
+
+    # 排序证据
+    votes_sorted = sorted(votes, key=lambda x: float(x["weight"]) * float(x["strength"]), reverse=True)
+    top_evidence = votes_sorted[:5]
+
+    return {
+        "has_palsy": has_palsy,
+        "palsy_side": palsy_side,
+        "palsy_side_text": palsy_side_text,
+        "confidence": confidence,
+        "left_score": left_score,
+        "right_score": right_score,
+        "votes": votes,
+        "top_evidence": top_evidence,
+    }
 
 
-# =============================================================================
-# HTML报告生成
-# =============================================================================
+def generate_evidence_overlay_images(output_dir: Path, action_results: Dict[str, ActionResult],
+                                     prediction: Dict[str, Any]) -> None:
+    """为每个动作生成证据叠加图（在peak_indicators.jpg上叠加投票信息）"""
+    if not prediction:
+        return
+
+    votes = prediction.get("votes", [])
+    vote_by_action = {}
+    for v in votes:
+        act = v.get("action")
+        if act:
+            if act not in vote_by_action:
+                vote_by_action[act] = []
+            vote_by_action[act].append(v)
+
+    for action_name, result in action_results.items():
+        action_dir = output_dir / action_name
+        indicator_path = action_dir / "peak_indicators.jpg"
+        if not indicator_path.exists():
+            continue
+
+        img = cv2.imread(str(indicator_path))
+        if img is None:
+            continue
+
+        h, w = img.shape[:2]
+
+        # 绘制投票信息
+        act_votes = vote_by_action.get(action_name, [])
+        if act_votes:
+            y = h - 20 - len(act_votes) * 22
+            for v in act_votes:
+                side_text = v.get("side_text", "中立")
+                region = v.get("region", "")
+                strength = float(v.get("strength", 0))
+                reason = v.get("reason", "")
+
+                color = (0, 255, 0) if side_text == "中立" else ((255, 0, 0) if v.get("side") == 1 else (0, 0, 255))
+                text = f"Vote: {side_text} ({region}) str={strength:.2f}"
+                cv2.putText(img, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+                y += 22
+
+        cv2.imwrite(str(action_dir / "peak_evidence.jpg"), img)
+
 
 def generate_html_report(exam_id: str, patient_id: str,
                          action_results: Dict[str, ActionResult],
                          sunnybrook: Optional[SunnybrookScore],
                          ground_truth: Dict[str, Any],
+                         prediction: Optional[Dict[str, Any]],
                          output_dir: Path) -> None:
-    """生成详细HTML报告"""
+    """生成详细HTML报告（含：Sunnybrook + 11动作综合投票与证据叠加图）"""
+
+    action_name_map = {
+        "NeutralFace": "静息面",
+        "SpontaneousEyeBlink": "自然眨眼",
+        "VoluntaryEyeBlink": "自主眨眼",
+        "CloseEyeSoftly": "轻闭眼",
+        "CloseEyeHardly": "用力闭眼",
+        "RaiseEyebrow": "皱额/抬眉",
+        "Smile": "微笑",
+        "ShrugNose": "皱鼻",
+        "ShowTeeth": "露齿",
+        "BlowCheek": "鼓腮",
+        "LipPucker": "撅嘴",
+    }
+
+    open_mouth_used = "ShowTeeth" if "ShowTeeth" in action_results else "Smile"
+    voluntary_used_effective = {"RaiseEyebrow", "CloseEyeSoftly", open_mouth_used, "ShrugNose", "LipPucker"}
+    syn_used_effective = voluntary_used_effective.copy()
+
+    action_focus = {
+        "NeutralFace": "静息对称性与基线：睑裂、鼻唇沟、口角下垂/偏斜等。",
+        "SpontaneousEyeBlink": "自然眨眼是否完整/对称；是否伴随口部联动。",
+        "VoluntaryEyeBlink": "自主眨眼启动能力与闭合幅度对称性；联动表现。",
+        "CloseEyeSoftly": "轻闭眼闭合不全（滞睑/轻度无力）最敏感。",
+        "CloseEyeHardly": "用力闭眼反映眼轮匝肌力量，常用于区分中重度。",
+        "RaiseEyebrow": "额肌功能：抬眉幅度左右差异，反映上面部运动。",
+        "Smile": "口角牵拉/上抬幅度左右差异，反映下/中面部运动。",
+        "ShrugNose": "鼻翼/鼻唇沟牵拉幅度左右差异，反映中面部运动与联动。",
+        "ShowTeeth": "露齿微笑（Sunnybrook的OpenMouthSmile）：口角牵拉与上唇提升。",
+        "BlowCheek": "闭唇与鼓腮充气能力（漏气/一侧塌陷）；辅助下脸评估。",
+        "LipPucker": "口轮匝肌收缩（撅嘴）对称性；口角偏斜/下垂可作为弱证据。",
+    }
+
+    vote_by_action: Dict[str, Dict[str, Any]] = {}
+    if prediction and isinstance(prediction.get("votes"), list):
+        for v in prediction["votes"]:
+            act = v.get("action")
+            if not act:
+                continue
+            score = float(v.get("weight", 1.0)) * float(v.get("strength", 0.0))
+            if act not in vote_by_action or score > float(vote_by_action[act].get("_score", -1.0)):
+                v2 = dict(v)
+                v2["_score"] = score
+                vote_by_action[act] = v2
+
+    gt_has = "是" if int(ground_truth.get("has_palsy", 0) or 0) == 1 else "否"
+    gt_side_code = ground_truth.get("palsy_side", 0)
+    gt_side_text = _palsy_side_to_text(gt_side_code)
+
+    pred_has = "—"
+    pred_side_text = "—"
+    pred_conf = "—"
+    pred_left = 0.0
+    pred_right = 0.0
+    pred_top = []
+    if prediction:
+        pred_has = "是" if prediction.get("has_palsy") else "否"
+        pred_side_text = prediction.get("palsy_side_text", "无")
+        pred_conf = f"{float(prediction.get('confidence', 0.0)):.2f}"
+        pred_left = float(prediction.get("left_score", 0.0))
+        pred_right = float(prediction.get("right_score", 0.0))
+        pred_top = prediction.get("top_evidence", []) or []
+
+    def _collect_extra_synkinesis():
+        extras = []
+        for act, r in action_results.items():
+            if act == "NeutralFace":
+                continue
+            if act in syn_used_effective:
+                continue
+            if not getattr(r, "synkinesis_scores", None):
+                continue
+            eye = int(r.synkinesis_scores.get("eye_synkinesis", 0) or 0)
+            mouth = int(r.synkinesis_scores.get("mouth_synkinesis", 0) or 0)
+            total = max(eye, mouth)
+            if total <= 0:
+                continue
+            extras.append((act, eye, mouth, total))
+        extras.sort(key=lambda x: x[3], reverse=True)
+        return extras
+
+    extra_syn = _collect_extra_synkinesis()
+
+    def _bar(value: float, max_value: float) -> str:
+        v = max(0.0, float(value))
+        mv = max(1e-9, float(max_value))
+        pct = max(0.0, min(100.0, 100.0 * v / mv))
+        return f'<div class="bar"><div class="barfill" style="width:{pct:.1f}%"></div></div>'
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -540,304 +902,229 @@ def generate_html_report(exam_id: str, patient_id: str,
     <style>
         body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
         .container {{ max-width: 1600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }}
-        h1 {{ color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }}
-        h2 {{ color: #666; margin-top: 30px; border-left: 4px solid #2196F3; padding-left: 10px; }}
-        h3 {{ color: #888; margin-top: 20px; }}
-        .info-box {{ background: #e8f5e9; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
-        .ground-truth {{ background: #fff3e0; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
-        .sunnybrook-summary {{ background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); padding: 20px; border-radius: 10px; margin-bottom: 20px; }}
-        .score-box {{ display: inline-block; padding: 15px 25px; margin: 10px; border-radius: 8px; text-align: center; }}
-        .score-label {{ font-size: 0.9em; color: #666; margin-bottom: 5px; }}
-        .score-value {{ font-size: 1.8em; font-weight: bold; }}
-        table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
-        th, td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
-        th {{ background: #1976d2; color: white; }}
-        tr:nth-child(even) {{ background: #f9f9f9; }}
-        .score-0 {{ color: #4CAF50; font-weight: bold; }}
-        .score-1 {{ color: #FF9800; font-weight: bold; }}
-        .score-2, .score-3 {{ color: #f44336; font-weight: bold; }}
-        .action-card {{ border: 1px solid #ddd; margin: 15px 0; padding: 20px; border-radius: 8px; background: #fafafa; }}
-        .action-title {{ font-weight: bold; font-size: 1.3em; color: #1976d2; margin-bottom: 15px; }}
-        .metrics-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 15px; }}
-        .metric-card {{ background: white; padding: 12px; border-radius: 5px; border: 1px solid #e0e0e0; }}
-        .metric-label {{ color: #666; font-size: 0.85em; margin-bottom: 3px; }}
-        .metric-value {{ font-size: 1.1em; font-weight: bold; color: #333; }}
-        .images {{ display: flex; gap: 15px; margin-top: 15px; flex-wrap: wrap; }}
-        .images img {{ max-width: 350px; border: 1px solid #ddd; border-radius: 5px; }}
-        .formula {{ background: #f5f5f5; padding: 10px; border-radius: 5px; font-family: monospace; margin-top: 10px; }}
-        .grade-box {{ background: #4CAF50; color: white; padding: 20px; border-radius: 10px; text-align: center; margin-top: 15px; }}
-        .grade-box.warning {{ background: #FF9800; }}
-        .grade-box.danger {{ background: #f44336; }}
+        h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
+        h2 {{ color: #34495e; margin-top: 30px; }}
+        .summary {{ background: #ecf0f1; padding: 15px; border-radius: 8px; margin: 15px 0; }}
+        .metric-box {{ display: inline-block; background: #3498db; color: white; padding: 10px 15px; border-radius: 6px; margin: 5px; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
+        th {{ background: #3498db; color: white; }}
+        .action-section {{ background: #fafafa; border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; margin: 15px 0; }}
+        .images {{ display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-start; }}
+        .images img {{ max-width: 480px; border-radius: 6px; border: 1px solid #ddd; }}
+        .tip {{ background: #fff8e1; border-left: 5px solid #f1c40f; padding: 10px; margin: 10px 0; }}
+        .bar {{ width: 260px; height: 12px; background: #e5e7eb; border-radius: 10px; overflow: hidden; display: inline-block; vertical-align: middle; }}
+        .barfill {{ height: 100%; background: #e74c3c; }}
+        .small {{ font-size: 12px; color: #555; }}
+        .tag {{ display:inline-block; padding:2px 8px; border-radius: 10px; background:#eef2ff; margin-left:6px; font-size: 12px; }}
     </style>
 </head>
 <body>
 <div class="container">
     <h1>🏥 面部指标分析报告</h1>
 
-    <div class="info-box">
-        <strong>检查ID:</strong> {exam_id}<br>
-        <strong>患者ID:</strong> {patient_id}<br>
-        <strong>分析时间:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
-        <strong>处理动作数:</strong> {len(action_results)}
+    <div class="summary">
+        <div><b>检查ID:</b> {exam_id}</div>
+        <div><b>患者ID:</b> {patient_id}</div>
+        <div><b>分析时间:</b> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
+        <div><b>处理动作数:</b> {len(action_results)}</div>
     </div>
 
-    <div class="ground-truth">
-        <h3>📋 医生标注 (Ground Truth)</h3>
-        <strong>面瘫:</strong> {'是' if ground_truth.get('has_palsy') else '否'}<br>
-        <strong>患侧:</strong> {ground_truth.get('palsy_side', 'N/A')}<br>
-        <strong>HB分级:</strong> {ground_truth.get('hb_grade', 'N/A')}<br>
-        <strong>Sunnybrook评分:</strong> {ground_truth.get('sunnybrook_score', 'N/A')}
+    <h2>📋 医生标注 (Ground Truth)</h2>
+    <div class="summary">
+        <div class="metric-box">面瘫: {gt_has}</div>
+        <div class="metric-box">患侧: {gt_side_code} ({gt_side_text})</div>
+        <div class="metric-box">HB分级: {ground_truth.get('hb_grade', '—')}</div>
+        <div class="metric-box">Sunnybrook评分: {ground_truth.get('sunnybrook_score', '—')}</div>
     </div>
+
+    <h2>🧠 综合判定（11动作投票 + 证据叠加图）</h2>
+    <div class="summary">
+        <div class="metric-box">预测面瘫: {pred_has}</div>
+        <div class="metric-box">预测患侧: {pred_side_text}</div>
+        <div class="metric-box">置信度: {pred_conf}</div>
+        <div style="margin-top:10px;">
+            <div><b>左侧累计证据:</b> {pred_left:.2f} {_bar(pred_left, max(pred_left, pred_right, 1.0))}</div>
+            <div><b>右侧累计证据:</b> {pred_right:.2f} {_bar(pred_right, max(pred_left, pred_right, 1.0))}</div>
+            <div class="small">说明：证据来自10个运动动作的"方向+强度+权重"投票；静息仅用于异常提示，不强行定向。</div>
+        </div>
+    </div>
+
+    <div class="tip">
+        <b>Top 证据（按权重×强度排序）</b><br/>
+        {"".join([f"• {action_name_map.get(e.get('action', ''), e.get('action', ''))}：{e.get('side_text', '')}（{e.get('region', '')}）— {e.get('reason', '')}<br/>" for e in pred_top]) if pred_top else "暂无（未提供综合投票结果）"}
+    </div>
+
+    <h2>🧾 动作清单与用途</h2>
+    <table>
+        <tr><th>动作</th><th>中文</th><th>参与Resting</th><th>参与Voluntary(5项)</th><th>参与Synkinesis(5项)</th><th>关注点</th></tr>
+        {"".join([
+        f"<tr>"
+        f"<td>{a}</td>"
+        f"<td>{action_name_map.get(a, a)}</td>"
+        f"<td>{'✓' if a == 'NeutralFace' else ''}</td>"
+        f"<td>{'✓' if a in voluntary_used_effective else ''}</td>"
+        f"<td>{'✓' if a in syn_used_effective else ''}</td>"
+        f"<td style='text-align:left'>{action_focus.get(a, '')}</td>"
+        f"</tr>"
+        for a in action_name_map.keys()
+    ])}
+    </table>
+
+    <div class="tip small">
+        Sunnybrook正式统计只使用：Resting(静息1项) + Voluntary(5项) + Synkinesis(5项)。
+        本报告会把其余录制动作（眨眼/用力闭眼/鼓腮等）全部展示出来，但会明确标注"未参与Sunnybrook计分"。
+    </div>
+
+    <h2>📊 Sunnybrook 面神经分级评分</h2>
 """
 
-    # Sunnybrook评分汇总
     if sunnybrook:
-        grade_class = ""
-        if sunnybrook.composite_score < 50:
-            grade_class = "danger"
-        elif sunnybrook.composite_score < 70:
-            grade_class = "warning"
-
         html += f"""
-    <div class="sunnybrook-summary">
-        <h2>📊 Sunnybrook 面神经分级评分</h2>
-
-        <div style="display: flex; flex-wrap: wrap; justify-content: center;">
-            <div class="score-box" style="background: #ffcdd2;">
-                <div class="score-label">Resting Symmetry</div>
-                <div class="score-value">{sunnybrook.resting_score}</div>
-                <div style="font-size: 0.8em; color: #666;">(0-20)</div>
-            </div>
-            <div class="score-box" style="background: #c8e6c9;">
-                <div class="score-label">Voluntary Movement</div>
-                <div class="score-value">{sunnybrook.voluntary_score}</div>
-                <div style="font-size: 0.8em; color: #666;">(20-100)</div>
-            </div>
-            <div class="score-box" style="background: #ffe0b2;">
-                <div class="score-label">Synkinesis</div>
-                <div class="score-value">{sunnybrook.synkinesis_score}</div>
-                <div style="font-size: 0.8em; color: #666;">(0-15)</div>
-            </div>
-        </div>
-
-        <div class="grade-box {grade_class}">
-            <div style="font-size: 2.5em; font-weight: bold;">Composite: {sunnybrook.composite_score}</div>
-            <div style="font-size: 1.2em; margin-top: 10px;">Grade {sunnybrook.grade}: {sunnybrook.grade_description}</div>
-        </div>
-
-        <div class="formula">
-            公式: Composite = Voluntary({sunnybrook.voluntary_score}) - Resting({sunnybrook.resting_score}) - Synkinesis({sunnybrook.synkinesis_score}) = {sunnybrook.composite_score}
-        </div>
+    <div class="summary">
+        <div class="metric-box">Resting Symmetry: {sunnybrook.resting_score}</div>
+        <div class="metric-box">Voluntary Movement: {sunnybrook.voluntary_score}</div>
+        <div class="metric-box">Synkinesis: {sunnybrook.synkinesis_score}</div>
+        <div class="metric-box">Composite: {sunnybrook.composite_score}</div>
+        <div class="metric-box">Grade {sunnybrook.grade}: {sunnybrook.grade_description}</div>
+        <div class="small">公式: Composite = Voluntary({sunnybrook.voluntary_score}) - Resting({sunnybrook.resting_score}) - Synkinesis({sunnybrook.synkinesis_score}) = {sunnybrook.composite_score}</div>
     </div>
-"""
 
-        # Resting Symmetry 详细表格
-        rs = sunnybrook.resting_symmetry
-        html += f"""
     <h2>1️⃣ Resting Symmetry (静息对称性)</h2>
     <table>
+        <tr><th>部位</th><th>状态</th><th>测量值</th><th>评分</th><th>说明</th></tr>
+        {"".join([
+            f"<tr>"
+            f"<td>{it.region_cn}</td>"
+            f"<td>{it.status_cn}</td>"
+            f"<td>{(f'{it.measurement:.1f}°' if it.region == 'Mouth' else f'{it.measurement:.3f}')}</td>"
+            f"<td class='score-{it.score}'>{it.score}</td>"
+            f"<td>{it.threshold_info}</td>"
+            f"</tr>"
+            for it in (
+                sunnybrook.resting_symmetry.eye,
+                sunnybrook.resting_symmetry.cheek,
+                sunnybrook.resting_symmetry.mouth
+            )
+        ])}
         <tr>
-            <th>部位</th>
-            <th>状态</th>
-            <th>测量值</th>
-            <th>评分</th>
-            <th>说明</th>
-        </tr>
-        <tr>
-            <td>👁️ Eye (眼/睑裂)</td>
-            <td>{rs.eye.status_cn}</td>
-            <td>{rs.eye.measurement:.3f}</td>
-            <td class="score-{rs.eye.score}">{rs.eye.score}</td>
-            <td>{rs.eye.threshold_info}</td>
-        </tr>
-        <tr>
-            <td>😊 Cheek (颊/鼻唇沟)</td>
-            <td>{rs.cheek.status_cn}</td>
-            <td>{rs.cheek.measurement:.3f}</td>
-            <td class="score-{rs.cheek.score}">{rs.cheek.score}</td>
-            <td>{rs.cheek.threshold_info}</td>
-        </tr>
-        <tr>
-            <td>👄 Mouth (嘴)</td>
-            <td>{rs.mouth.status_cn}</td>
-            <td>{rs.mouth.measurement:.1f}°</td>
-            <td class="score-{rs.mouth.score}">{rs.mouth.score}</td>
-            <td>{rs.mouth.threshold_info}</td>
-        </tr>
-        <tr style="background: #e3f2fd; font-weight: bold;">
-            <td colspan="3">Total (Raw Score × 5)</td>
-            <td>{rs.raw_score} × 5 = {rs.total_score}</td>
-            <td>判断患侧: {rs.affected_side}</td>
+          <td colspan="5">
+            <b>Total (Raw Score × 5):</b>
+            {sunnybrook.resting_symmetry.raw_score} × 5 = {sunnybrook.resting_symmetry.total_score}
+            （判断患侧: {sunnybrook.resting_symmetry.affected_side}）
+          </td>
         </tr>
     </table>
-"""
 
-        # Voluntary Movement 详细表格
-        vm = sunnybrook.voluntary_movement
-        html += f"""
     <h2>2️⃣ Symmetry of Voluntary Movement (主动运动对称性)</h2>
-    <p>评分标准: 1=无法启动, 2=轻微启动, 3=启动但不对称, 4=几乎完整, 5=完整</p>
+    <div class="tip small">
+        计分只使用5个动作：抬眉、轻闭眼、露齿微笑（ShowTeeth优先）、皱鼻、撅嘴。其余运动动作（眨眼、用力闭眼、鼓腮等）仅展示，不参与Sunnybrook分数。
+    </div>
     <table>
-        <tr>
-            <th>表情</th>
-            <th>对应动作</th>
-            <th>左侧测量</th>
-            <th>右侧测量</th>
-            <th>比值</th>
-            <th>评分 (1-5)</th>
-        </tr>
-"""
-        for item in vm.items:
-            html += f"""
-        <tr>
-            <td>{item.expression_cn}</td>
-            <td>{item.expression}</td>
-            <td>{item.left_value:.3f}</td>
-            <td>{item.right_value:.3f}</td>
-            <td>{item.ratio:.3f}</td>
-            <td class="score-{5 - item.score if item.score < 4 else 0}">{item.score}</td>
-        </tr>
-"""
-        html += f"""
-        <tr style="background: #e3f2fd; font-weight: bold;">
-            <td colspan="5">Total (Sum × 4)</td>
-            <td>{vm.raw_sum} × 4 = {vm.total_score}</td>
-        </tr>
+        <tr><th>表情</th><th>对应动作</th><th>左侧测量</th><th>右侧测量</th><th>比值</th><th>评分 (1-5)</th></tr>
+        {"".join([f"<tr><td>{it.expression_cn}</td><td>{it.expression}</td><td>{it.left_value:.3f}</td><td>{it.right_value:.3f}</td><td>{it.ratio:.3f}</td><td>{it.score}</td></tr>" for it in sunnybrook.voluntary_movement.items])}
+        <tr><td colspan="6"><b>Total (Sum × 4):</b> {sunnybrook.voluntary_movement.raw_sum} × 4 = {sunnybrook.voluntary_movement.total_score}</td></tr>
     </table>
-"""
 
-        # Synkinesis 详细表格
-        syn = sunnybrook.synkinesis
-        html += f"""
     <h2>3️⃣ Synkinesis (联动运动)</h2>
-    <p>评分标准: 0=无联动, 1=轻度, 2=中度, 3=重度</p>
+    <div class="tip small">
+        Sunnybrook正式联动分数只统计5项（与Voluntary相同）。下面会额外展示其它动作的联动检测结果，但不计入0-15总分。
+    </div>
     <table>
-        <tr>
-            <th>表情</th>
-            <th>眼部联动</th>
-            <th>嘴部联动</th>
-            <th>总分</th>
-        </tr>
-"""
-        if syn.items:
-            for item in syn.items:
-                html += f"""
-        <tr>
-            <td>{item.expression_cn}</td>
-            <td class="score-{item.eye_synkinesis}">{item.eye_synkinesis}</td>
-            <td class="score-{item.mouth_synkinesis}">{item.mouth_synkinesis}</td>
-            <td>{item.total_score}</td>
-        </tr>
-"""
-        else:
-            html += """
-        <tr>
-            <td colspan="4" style="text-align: center; color: #666;">未检测到联动运动</td>
-        </tr>
-"""
-        html += f"""
-        <tr style="background: #e3f2fd; font-weight: bold;">
-            <td colspan="3">Total</td>
-            <td>{syn.total_score}</td>
-        </tr>
+        <tr><th>表情</th><th>眼部联动</th><th>嘴部联动</th><th>单项总分(0-3)</th></tr>
+        {"".join([f"<tr><td>{it.expression_cn}</td><td>{it.eye_synkinesis}</td><td>{it.mouth_synkinesis}</td><td>{it.total_score}</td></tr>" for it in sunnybrook.synkinesis.items])}
+        <tr><td colspan="4"><b>Total:</b> {sunnybrook.synkinesis_score} (0-15)</td></tr>
     </table>
 """
-
-    # 各动作详细结果
-    html += """
-    <h2>📹 各动作详细分析</h2>
+        if extra_syn:
+            html += """
+    <h3>扩展联动结果（不计入Sunnybrook）</h3>
+    <table>
+        <tr><th>动作</th><th>眼部联动</th><th>嘴部联动</th><th>单项总分(0-3)</th></tr>
 """
+            for act, eye, mouth, total in extra_syn:
+                html += f"<tr><td>{action_name_map.get(act, act)}</td><td>{eye}</td><td>{mouth}</td><td>{total}</td></tr>"
+            html += "</table>"
+    else:
+        html += '<div class="tip">未能计算Sunnybrook评分（缺少NeutralFace或关键动作结果）。</div>'
 
-    for action_name, result in action_results.items():
-        oral = result.oral_angle
+    html += "<h2>📹 各动作详细分析</h2>"
+
+    action_order = [
+        "NeutralFace",
+        "SpontaneousEyeBlink",
+        "VoluntaryEyeBlink",
+        "CloseEyeSoftly",
+        "CloseEyeHardly",
+        "RaiseEyebrow",
+        "Smile",
+        "ShrugNose",
+        "ShowTeeth",
+        "BlowCheek",
+        "LipPucker",
+    ]
+    for action_name in action_order:
+        if action_name not in action_results:
+            continue
+        result = action_results[action_name]
+        cn = action_name_map.get(action_name, action_name)
+        action_dir = output_dir / action_name
+
+        v = vote_by_action.get(action_name)
+        if v:
+            vote_line = (
+                f"本动作投票：{v.get('side_text', '中立')} <span class='tag'>{v.get('region', '')}</span> "
+                f"强度={float(v.get('strength', 0.0)):.2f} 权重={float(v.get('weight', 1.0)):.2f}<br/>"
+                f"<span class='small'>{v.get('reason', '')}</span>"
+            )
+        else:
+            vote_line = "本动作投票：—（无/中立）"
+
+        def _img_tag(rel_path: str, alt: str) -> str:
+            p = action_dir / rel_path
+            if p.exists():
+                return f'<img src="{action_name}/{rel_path}" alt="{alt}"/>'
+            return ""
+
+        raw_img = _img_tag("peak_raw.jpg", "原始帧")
+        ind_img = _img_tag("peak_indicators.jpg", "指标可视化")
+        rest_img = _img_tag("resting_symmetry.jpg", "Resting Symmetry")
+        ear_curve = _img_tag("ear_curve.png", "EAR曲线")
+        eye_curve = _img_tag("eye_curve.png", "眼睛曲线")
+        ev_img = _img_tag("peak_evidence.jpg", "证据叠加图")
+
+        # 修复: 使用 result.icd 而不是 result.icd_px
+        # 修复: 使用 result.oral_angle.angle_asymmetry 而不是 result.oral_asymmetry
+        oral_asym = result.oral_angle.angle_asymmetry if result.oral_angle else 0.0
 
         html += f"""
-    <div class="action-card">
-        <div class="action-title">{action_name} - {result.action_name_cn}</div>
-
-        <div class="metrics-grid">
-            <div class="metric-card">
-                <div class="metric-label">峰值帧</div>
-                <div class="metric-value">{result.peak_frame_idx} / {result.total_frames}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">ICD</div>
-                <div class="metric-value">{result.icd:.1f}px</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">EAR Left</div>
-                <div class="metric-value">{result.left_ear:.4f}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">EAR Right</div>
-                <div class="metric-value">{result.right_ear:.4f}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Eye Area Left</div>
-                <div class="metric-value">{result.left_eye_area:.1f}px²</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Eye Area Right</div>
-                <div class="metric-value">{result.right_eye_area:.1f}px²</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Eye Area Ratio</div>
-                <div class="metric-value">{result.eye_area_ratio:.3f}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Palpebral H Ratio</div>
-                <div class="metric-value">{result.palpebral_height_ratio:.3f}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Brow H Ratio</div>
-                <div class="metric-value">{result.brow_height_ratio:.3f}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Mouth Width</div>
-                <div class="metric-value">{result.mouth_width:.1f}px</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">NLF Ratio</div>
-                <div class="metric-value">{result.nlf_ratio:.3f}</div>
-            </div>
-"""
-        if oral:
-            html += f"""
-            <div class="metric-card">
-                <div class="metric-label">AOE (Right)</div>
-                <div class="metric-value">{oral.AOE_angle:+.2f}°</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">BOF (Left)</div>
-                <div class="metric-value">{oral.BOF_angle:+.2f}°</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Oral Asymmetry</div>
-                <div class="metric-value">{oral.angle_asymmetry:.2f}°</div>
-            </div>
-"""
-
-        html += f"""
-            <div class="metric-card">
-                <div class="metric-label">Voluntary Score</div>
-                <div class="metric-value">{result.voluntary_movement_score}/5</div>
-            </div>
-        </div>
+    <div class="action-section">
+        <h3>{action_name} - {cn}</h3>
+        <div class="tip">{vote_line}</div>
+        <table>
+            <tr><th>指标</th><th>数值</th></tr>
+            <tr><td>峰值帧</td><td>{result.peak_frame_idx} / {result.total_frames}</td></tr>
+            <tr><td>ICD</td><td>{(result.icd or 0.0):.1f}px</td></tr>
+            <tr><td>EAR Left / Right</td><td>{(result.left_ear or 0.0):.4f} / {(result.right_ear or 0.0):.4f}</td></tr>
+            <tr><td>Eye Area Left / Right</td><td>{(result.left_eye_area or 0.0):.1f}px² / {(result.right_eye_area or 0.0):.1f}px²</td></tr>
+            <tr><td>Eye Area Ratio</td><td>{(result.eye_area_ratio or 0.0):.3f}</td></tr>
+            <tr><td>Palpebral H Ratio</td><td>{(result.palpebral_height_ratio or 0.0):.3f}</td></tr>
+            <tr><td>Brow H Ratio</td><td>{(result.brow_height_ratio or 0.0):.3f}</td></tr>
+            <tr><td>Mouth Width</td><td>{(result.mouth_width or 0.0):.1f}px</td></tr>
+            <tr><td>NLF Ratio</td><td>{(result.nlf_ratio or 0.0):.3f}</td></tr>
+            <tr><td>AOE/BOF (Right/Left)</td><td>{(result.oral_angle.AOE_angle if result.oral_angle else 0.0):+.2f}° / {(result.oral_angle.BOF_angle if result.oral_angle else 0.0):+.2f}°</td></tr>
+            <tr><td>Oral Asymmetry</td><td>{oral_asym:.2f}°</td></tr>
+            <tr><td>Voluntary Score</td><td>{result.voluntary_movement_score or 0}/5 {"<span class='tag'>计分动作</span>" if action_name in voluntary_used_effective else "<span class='tag'>展示</span>"}</td></tr>
+        </table>
 
         <div class="images">
-            <img src="{action_name}/peak_raw.jpg" alt="原始帧">
-            <img src="{action_name}/peak_indicators.jpg" alt="指标可视化">
-"""
-
-        # 如果有EAR曲线
-        if action_name in ["VoluntaryEyeBlink", "SpontaneousEyeBlink"]:
-            html += f'            <img src="{action_name}/ear_curve.png" alt="EAR曲线">\n'
-
-        # 如果有Resting Symmetry可视化
-        if action_name == "NeutralFace":
-            html += f'            <img src="{action_name}/resting_symmetry.jpg" alt="Resting Symmetry">\n'
-
-        html += """        </div>
+            {raw_img}
+            {ind_img}
+            {ev_img}
+            {ear_curve}
+            {eye_curve}
+            {rest_img}
+        </div>
     </div>
 """
 
@@ -847,10 +1134,9 @@ def generate_html_report(exam_id: str, patient_id: str,
 </html>
 """
 
-    with open(output_dir / "report.html", 'w', encoding='utf-8') as f:
-        f.write(html)
-
-    print(f"  [OK] HTML报告: {output_dir / 'report.html'}")
+    report_path = output_dir / "report.html"
+    report_path.write_text(html, encoding="utf-8")
+    print(f"[OK] HTML报告已生成: {report_path}")
 
 
 # =============================================================================
@@ -898,7 +1184,7 @@ def process_examination(examination: Dict[str, Any], db_path: str,
             if landmarks_seq and frames_seq:
                 h, w = frames_seq[0].shape[:2]
                 result = neutral_face.process(landmarks_seq, frames_seq, w, h,
-                                                     video_info, exam_output_dir)
+                                              video_info, exam_output_dir)
                 if result:
                     action_results["NeutralFace"] = result
                     baseline_result = result
@@ -942,24 +1228,28 @@ def process_examination(examination: Dict[str, Any], db_path: str,
     # 计算Sunnybrook评分
     sunnybrook = calculate_sunnybrook_from_results(action_results)
 
-    if sunnybrook:
-        print(f"\n  === Sunnybrook评分 ===")
-        print(f"  Resting: {sunnybrook.resting_score}")
-        print(f"  Voluntary: {sunnybrook.voluntary_score}")
-        print(f"  Synkinesis: {sunnybrook.synkinesis_score}")
-        print(f"  Composite: {sunnybrook.composite_score}")
-        print(f"  Grade: {sunnybrook.grade} - {sunnybrook.grade_description}")
+    prediction = infer_palsy_and_side(action_results)
+    generate_evidence_overlay_images(exam_output_dir, action_results, prediction)
 
-    # 生成HTML报告
-    generate_html_report(exam_id, patient_id, action_results, sunnybrook, labels, exam_output_dir)
-
-    # 保存汇总JSON
+    # summary 里也建议存一份
     summary = {
-        "examination_id": exam_id,
+        "exam_id": exam_id,
         "patient_id": patient_id,
+        "analysis_time": datetime.now().isoformat(),
         "ground_truth": labels,
+        "sunnybrook": sunnybrook.to_dict() if sunnybrook else None,
         "actions": {name: result.to_dict() for name, result in action_results.items()},
+        "prediction": prediction,
     }
+
+    generate_html_report(
+        exam_id, patient_id,
+        action_results,
+        sunnybrook,
+        labels,
+        prediction,
+        exam_output_dir
+    )
 
     if sunnybrook:
         summary["sunnybrook"] = sunnybrook.to_dict()

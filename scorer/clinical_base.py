@@ -24,7 +24,6 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 
-
 # =============================================================================
 # Landmark 索引定义 (MediaPipe 478点)
 # =============================================================================
@@ -91,15 +90,43 @@ class LM:
     CHIN = 152
 
     # ========== 鼻部 ==========
-    NOSE_ALA_L = 129  # 左鼻翼
-    NOSE_ALA_R = 358  # 右鼻翼
-    NOSE_TIP_TOP = 6
+    NOSE_ALA_L = 358  # 左鼻翼
+    NOSE_ALA_R = 129  # 右鼻翼
+    NOSE_TIP_TOP = 4
     NOSE_BRIDGE = 168  # 鼻梁
 
     # ========== 面颊 ==========
     CHEEK_L = [425, 426, 427, 411, 280]
     CHEEK_R = [205, 206, 207, 187, 50]
 
+# =============================================================================
+# JSON 序列化安全转换（处理 numpy.bool_ / numpy.float32 等）
+# =============================================================================
+def make_json_serializable(obj: Any) -> Any:
+    """递归将对象转换为 JSON 可序列化的 Python 原生类型。"""
+    # numpy 标量
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+
+    # numpy 数组
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    # Path
+    if isinstance(obj, Path):
+        return str(obj)
+
+    # dict / list / tuple
+    if isinstance(obj, dict):
+        return {str(k): make_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_json_serializable(v) for v in obj]
+
+    return obj
 
 # =============================================================================
 # 基础几何计算函数
@@ -905,7 +932,7 @@ class ActionResult:
                 }
             }
 
-        return result
+        return make_json_serializable(result)
 
 
 def extract_common_indicators(landmarks, w: int, h: int, result: ActionResult,
@@ -964,3 +991,308 @@ def extract_common_indicators(landmarks, w: int, h: int, result: ActionResult,
     result.left_nlf_length = compute_nlf_length(landmarks, w, h, left=True)
     result.right_nlf_length = compute_nlf_length(landmarks, w, h, left=False)
     result.nlf_ratio = result.left_nlf_length / result.right_nlf_length if result.right_nlf_length > 1e-9 else 1.0
+
+# =============================================================================
+# 新增: 鼻翼到内眦距离计算 (用于ShrugNose)
+# =============================================================================
+
+def compute_ala_to_canthus_distance(landmarks, w: int, h: int, left: bool = True) -> float:
+    """
+    计算鼻翼点到同侧眼角内眦点的距离
+
+    皱鼻动作时，鼻翼上提，此距离变小
+
+    Args:
+        landmarks: MediaPipe landmarks
+        w, h: 图像尺寸
+        left: True=左侧, False=右侧
+
+    Returns:
+        距离 (像素)
+    """
+    if left:
+        ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
+        canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    else:
+        ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
+        canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+
+    return dist(ala, canthus)
+
+
+def compute_ala_canthus_metrics(landmarks, w: int, h: int,
+                                baseline_landmarks=None) -> Dict[str, Any]:
+    """
+    计算双侧鼻翼到内眦距离的指标
+
+    用于ShrugNose动作分析
+
+    Returns:
+        Dict包含:
+        - left_distance: 左侧距离
+        - right_distance: 右侧距离
+        - ratio: 左/右比值
+        - 如果有基线: left_change, right_change, left_change_percent, right_change_percent
+    """
+    left_dist = compute_ala_to_canthus_distance(landmarks, w, h, left=True)
+    right_dist = compute_ala_to_canthus_distance(landmarks, w, h, left=False)
+
+    metrics = {
+        "left_distance": left_dist,
+        "right_distance": right_dist,
+        "ratio": left_dist / right_dist if right_dist > 1e-9 else 1.0,
+    }
+
+    if baseline_landmarks is not None:
+        baseline_left = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=True)
+        baseline_right = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=False)
+
+        metrics["baseline_left"] = baseline_left
+        metrics["baseline_right"] = baseline_right
+
+        # 变化量 (皱鼻时应为负值，表示距离变小)
+        metrics["left_change"] = left_dist - baseline_left
+        metrics["right_change"] = right_dist - baseline_right
+
+        # 变化百分比
+        if baseline_left > 1e-9:
+            metrics["left_change_percent"] = (left_dist - baseline_left) / baseline_left * 100
+        else:
+            metrics["left_change_percent"] = 0
+
+        if baseline_right > 1e-9:
+            metrics["right_change_percent"] = (right_dist - baseline_right) / baseline_right * 100
+        else:
+            metrics["right_change_percent"] = 0
+
+    return metrics
+
+
+# =============================================================================
+# 新增: 从闭眼动作检测面瘫侧别
+# =============================================================================
+
+def detect_palsy_side_from_eye_closure(left_ear: float, right_ear: float,
+                                       baseline_left_ear: float = None,
+                                       baseline_right_ear: float = None,
+                                       closure_threshold: float = 0.15) -> Dict[str, Any]:
+    """
+    从闭眼动作检测面瘫侧别
+
+    原理: 面瘫侧的眼睛无法完全闭合，EAR值较大
+
+    Args:
+        left_ear: 左眼EAR值 (闭眼时)
+        right_ear: 右眼EAR值 (闭眼时)
+        baseline_left_ear: 基线左眼EAR值 (可选)
+        baseline_right_ear: 基线右眼EAR值 (可选)
+        closure_threshold: 闭合阈值，EAR低于此值认为完全闭合
+
+    Returns:
+        Dict包含:
+        - palsy_side: 面瘫侧别 (0=无/对称, 1=左, 2=右)
+        - confidence: 置信度 (0-1)
+        - left_closed: 左眼是否闭合
+        - right_closed: 右眼是否闭合
+        - interpretation: 解释文字
+    """
+    left_closed = left_ear < closure_threshold
+    right_closed = right_ear < closure_threshold
+
+    result = {
+        "left_ear": left_ear,
+        "right_ear": right_ear,
+        "left_closed": left_closed,
+        "right_closed": right_closed,
+        "closure_threshold": closure_threshold,
+    }
+
+    if baseline_left_ear is not None and baseline_right_ear is not None:
+        # 使用闭合比例
+        left_closure_ratio = left_ear / baseline_left_ear if baseline_left_ear > 1e-9 else 1.0
+        right_closure_ratio = right_ear / baseline_right_ear if baseline_right_ear > 1e-9 else 1.0
+        result["left_closure_ratio"] = left_closure_ratio
+        result["right_closure_ratio"] = right_closure_ratio
+
+    # 判断面瘫侧别
+    if left_closed and right_closed:
+        # 两眼都能闭合
+        # 看哪只眼的EAR更大（闭合更不完全）
+        ear_diff = abs(left_ear - right_ear)
+        max_ear = max(left_ear, right_ear)
+
+        if ear_diff / max_ear < 0.15 if max_ear > 1e-9 else True:
+            result["palsy_side"] = 0
+            result["confidence"] = 1.0 - (ear_diff / max_ear if max_ear > 1e-9 else 0)
+            result["interpretation"] = "双眼对称闭合"
+        elif left_ear > right_ear:
+            result["palsy_side"] = 1  # 左侧面瘫
+            result["confidence"] = min(1.0, ear_diff / max_ear)
+            result["interpretation"] = f"左眼闭合较弱 (EAR L={left_ear:.3f} > R={right_ear:.3f})"
+        else:
+            result["palsy_side"] = 2  # 右侧面瘫
+            result["confidence"] = min(1.0, ear_diff / max_ear)
+            result["interpretation"] = f"右眼闭合较弱 (EAR R={right_ear:.3f} > L={left_ear:.3f})"
+
+    elif left_closed and not right_closed:
+        # 只有左眼能闭合 -> 右侧面瘫
+        result["palsy_side"] = 2
+        result["confidence"] = min(1.0, (right_ear - closure_threshold) / closure_threshold)
+        result["interpretation"] = f"右眼无法闭合 (EAR={right_ear:.3f}>{closure_threshold})"
+
+    elif right_closed and not left_closed:
+        # 只有右眼能闭合 -> 左侧面瘫
+        result["palsy_side"] = 1
+        result["confidence"] = min(1.0, (left_ear - closure_threshold) / closure_threshold)
+        result["interpretation"] = f"左眼无法闭合 (EAR={left_ear:.3f}>{closure_threshold})"
+
+    else:
+        # 两眼都无法完全闭合
+        ear_diff = abs(left_ear - right_ear)
+        if ear_diff < 0.05:
+            result["palsy_side"] = 0
+            result["confidence"] = 0.5
+            result["interpretation"] = "双眼均无法完全闭合，可能为双侧面瘫或其他原因"
+        elif left_ear > right_ear:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, ear_diff / max(left_ear, right_ear))
+            result["interpretation"] = f"双眼均无法完全闭合，左眼更差 (L={left_ear:.3f}, R={right_ear:.3f})"
+        else:
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, ear_diff / max(left_ear, right_ear))
+            result["interpretation"] = f"双眼均无法完全闭合，右眼更差 (R={right_ear:.3f}, L={left_ear:.3f})"
+
+    return result
+
+
+# =============================================================================
+# 新增: 从嘴角运动检测面瘫侧别
+# =============================================================================
+
+def detect_palsy_side_from_mouth(oral_angle, baseline_oral_angle=None) -> Dict[str, Any]:
+    """
+    从嘴角运动检测面瘫侧别
+
+    Args:
+        oral_angle: OralAngleMeasure对象
+        baseline_oral_angle: 基线OralAngleMeasure对象 (可选)
+
+    Returns:
+        Dict包含:
+        - palsy_side: 面瘫侧别 (0=无/对称, 1=左, 2=右)
+        - confidence: 置信度
+        - interpretation: 解释
+    """
+    if oral_angle is None:
+        return {
+            "palsy_side": 0,
+            "confidence": 0.0,
+            "interpretation": "无口角角度数据"
+        }
+
+    aoe = oral_angle.AOE_angle  # 右侧口角角度
+    bof = oral_angle.BOF_angle  # 左侧口角角度
+    asymmetry = oral_angle.angle_asymmetry
+
+    result = {
+        "aoe_angle": aoe,
+        "bof_angle": bof,
+        "asymmetry": asymmetry,
+    }
+
+    if baseline_oral_angle is not None:
+        # 计算运动幅度变化
+        baseline_aoe = baseline_oral_angle.AOE_angle
+        baseline_bof = baseline_oral_angle.BOF_angle
+
+        aoe_change = aoe - baseline_aoe
+        bof_change = bof - baseline_bof
+
+        result["aoe_change"] = aoe_change
+        result["bof_change"] = bof_change
+
+    # 判断面瘫侧别
+    if asymmetry < 3:  # 对称性良好
+        result["palsy_side"] = 0
+        result["confidence"] = 1.0 - asymmetry / 10
+        result["interpretation"] = f"口角对称 (不对称度={asymmetry:.1f}°)"
+    elif asymmetry < 10:  # 轻度不对称
+        # AOE负值表示右口角下垂，BOF负值表示左口角下垂
+        # 口角下垂的一侧是患侧
+        if aoe < bof:  # 右口角更低
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, asymmetry / 15)
+            result["interpretation"] = f"右口角位置较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
+        else:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, asymmetry / 15)
+            result["interpretation"] = f"左口角位置较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
+    else:  # 明显不对称
+        if aoe < bof:
+            result["palsy_side"] = 2
+            result["confidence"] = min(1.0, asymmetry / 20)
+            result["interpretation"] = f"右口角明显下垂 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°)"
+        else:
+            result["palsy_side"] = 1
+            result["confidence"] = min(1.0, asymmetry / 20)
+            result["interpretation"] = f"左口角明显下垂 (BOF={bof:+.1f}°, AOE={aoe:+.1f}°)"
+
+    return result
+
+
+# =============================================================================
+# 新增: 从运动幅度比较检测面瘫侧别
+# =============================================================================
+
+def detect_palsy_side_from_excursion(left_excursion: float, right_excursion: float,
+                                     threshold_ratio: float = 0.15) -> Dict[str, Any]:
+    """
+    从双侧运动幅度检测面瘫侧别
+
+    适用于: Smile, ShowTeeth, RaiseEyebrow等有明显双侧运动的动作
+
+    Args:
+        left_excursion: 左侧运动幅度
+        right_excursion: 右侧运动幅度
+        threshold_ratio: 判断不对称的阈值比例
+
+    Returns:
+        Dict包含:
+        - palsy_side: 面瘫侧别
+        - confidence: 置信度
+        - interpretation: 解释
+    """
+    max_exc = max(left_excursion, right_excursion)
+    min_exc = min(left_excursion, right_excursion)
+
+    if max_exc < 1e-9:
+        return {
+            "palsy_side": 0,
+            "confidence": 0.0,
+            "left_excursion": left_excursion,
+            "right_excursion": right_excursion,
+            "interpretation": "无明显运动"
+        }
+
+    asymmetry_ratio = (max_exc - min_exc) / max_exc
+
+    result = {
+        "left_excursion": left_excursion,
+        "right_excursion": right_excursion,
+        "asymmetry_ratio": asymmetry_ratio,
+    }
+
+    if asymmetry_ratio < threshold_ratio:
+        result["palsy_side"] = 0
+        result["confidence"] = 1.0 - asymmetry_ratio / threshold_ratio
+        result["interpretation"] = f"双侧运动对称 (不对称比={asymmetry_ratio:.1%})"
+    elif left_excursion < right_excursion:
+        result["palsy_side"] = 1  # 左侧运动弱 -> 左侧面瘫
+        result["confidence"] = min(1.0, asymmetry_ratio)
+        result["interpretation"] = f"左侧运动较弱 (L={left_excursion:.1f} < R={right_excursion:.1f})"
+    else:
+        result["palsy_side"] = 2  # 右侧运动弱 -> 右侧面瘫
+        result["confidence"] = min(1.0, asymmetry_ratio)
+        result["interpretation"] = f"右侧运动较弱 (R={right_excursion:.1f} < L={left_excursion:.1f})"
+
+    return result

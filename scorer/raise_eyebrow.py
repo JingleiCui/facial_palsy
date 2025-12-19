@@ -396,7 +396,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         baseline_metrics = compute_raise_eyebrow_metrics(baseline_landmarks, w, h, None)
 
     vis = visualize_brow_eye_distance(peak_frame, peak_landmarks, w, h, result, metrics, baseline_metrics)
-    cv2.imwrite(str(action_dir / "peak_brow_eye_distance.jpg"), vis)
+    cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 保存JSON
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
