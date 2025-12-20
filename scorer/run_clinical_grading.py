@@ -22,6 +22,8 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 # 添加当前目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -59,6 +61,13 @@ MEDIAPIPE_MODEL_PATH = r"/Users/cuijinglei/PycharmProjects/medicalProject/models
 OUTPUT_DIR = r"/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading"
 PATIENT_LIMIT = None
 TARGET_EXAM_ID = None
+
+# =============================================================================
+# 并行配置（多CPU加速）
+# =============================================================================
+USE_MULTIPROCESS = True
+CPU_N = os.cpu_count()
+MAX_WORKERS = 2
 
 # =============================================================================
 # 动作处理器映射
@@ -1262,6 +1271,18 @@ def process_examination(examination: Dict[str, Any], db_path: str,
     return summary
 
 
+def _process_exam_worker(args):
+    """
+    子进程执行单个检查的处理。
+    注意：spawn 模式下每个进程都需要自己初始化 LandmarkExtractor。
+    """
+    exam, db_path, output_dir_str, model_path = args
+    output_dir = Path(output_dir_str)
+
+    # 这里直接复用本文件的 process_examination（已在模块内定义）
+    with LandmarkExtractor(model_path) as extractor:
+        return process_examination(exam, db_path, output_dir, extractor)
+
 # =============================================================================
 # 主函数
 # =============================================================================
@@ -1297,13 +1318,48 @@ def main():
 
     print(f"\n初始化MediaPipe...")
 
-    all_results = []
+    all_results = [None] * len(examinations)
 
-    with LandmarkExtractor(MEDIAPIPE_MODEL_PATH) as extractor:
-        for i, exam in enumerate(examinations):
-            print(f"\n[{i + 1}/{len(examinations)}]", end="")
-            result = process_examination(exam, DATABASE_PATH, output_dir, extractor)
-            all_results.append(result)
+    if USE_MULTIPROCESS and len(examinations) > 1:
+        print(f"\n启用多进程并行: workers={MAX_WORKERS}, exams={len(examinations)}")
+
+        try:
+            mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
+
+        tasks = [(exam, DATABASE_PATH, str(output_dir), MEDIAPIPE_MODEL_PATH) for exam in examinations]
+
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            future_map = {pool.submit(_process_exam_worker, tasks[i]): i for i in range(len(tasks))}
+
+            done = 0
+            for fut in as_completed(future_map):
+                idx = future_map[fut]
+                done += 1
+                try:
+                    res = fut.result()
+                    all_results[idx] = res
+                    print(
+                        f"\n[{done}/{len(examinations)}] 完成: {examinations[idx].get('examination_id', 'unknown') if isinstance(examinations[idx], dict) else 'exam'}")
+                except Exception as e:
+                    # 不中断全局：记录错误继续跑其他检查
+                    print(f"\n[{done}/{len(examinations)}] 失败: idx={idx}, err={e}")
+                    all_results[idx] = {
+                        "error": str(e),
+                        "exam": examinations[idx] if isinstance(examinations[idx],
+                                                                (str, int, dict, list, tuple)) else "unserializable"
+                    }
+
+        all_results = [r for r in all_results if r is not None]
+
+    else:
+        # 只有1个检查时，多进程收益不大，避免额外开销
+        with LandmarkExtractor(MEDIAPIPE_MODEL_PATH) as extractor:
+            for i, exam in enumerate(examinations):
+                print(f"\n[{i + 1}/{len(examinations)}]", end="")
+                result = process_examination(exam, DATABASE_PATH, output_dir, extractor)
+                all_results.append(result)
 
     print(f"\n\n{'=' * 70}")
     print("处理完成!")
