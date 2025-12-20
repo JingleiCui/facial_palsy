@@ -5,20 +5,14 @@ BlowCheek 动作处理模块
 ================================
 
 分析鼓腮动作:
-1. 唇密封距离 (关键帧检测)
+1. 唇密封距离
 2. 嘴部闭合程度
 3. 口角对称性
 4. 面瘫侧别检测
 5. 联动运动检测
 
-修复内容:
-- 移除错误的NLF分析
-- 使用唇密封距离和口角对称性作为主要指标
-
 关键帧检测方法:
-- upper_lip: 0 (上唇上边界) 到 13 (上唇下边界)
-- lower_lip: 14 (下唇上边界) 到 17 (下唇下边界)
-- 鼓腮时嘴唇紧闭，上述两距离之和最小
+- 鼓腮时嘴唇紧闭，鼓腮体积最大
 """
 
 import cv2
@@ -26,101 +20,384 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import json
+import numpy as np
 
 from clinical_base import (
-    LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
+    LM, pt2d, pt3d, pts2d, dist, compute_ear, compute_eye_area,
     compute_mouth_metrics, compute_oral_angle,
-    compute_icd, extract_common_indicators, compute_lip_seal_distance,
+    compute_icd, polygon_area, extract_common_indicators, compute_lip_seal_distance,
     ActionResult, draw_polygon, draw_landmarks
 )
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 ACTION_NAME = "BlowCheek"
 ACTION_NAME_CN = "鼓腮"
 
 
-def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
-    """
-    找鼓腮峰值帧
+def _safe_pt3d(landmarks, idx: int, w: int, h: int):
+    try:
+        p = np.array(pt3d(landmarks[idx], w, h), dtype=np.float64)  # (x_px, y_px, z_px)
+        if np.any(~np.isfinite(p)):
+            return None
+        return p
+    except Exception:
+        return None
 
-    使用唇密封距离最小的帧作为峰值帧
-    唇密封距离 = 上唇(0-13)距离 + 下唇(14-17)距离
+
+def _estimate_face_plane(landmarks, w: int, h: int):
+    """用双内眦+下巴估计面部参考平面，返回 (origin, unit_normal)，并保证法向朝向鼻尖外侧。"""
+    pL = _safe_pt3d(landmarks, LM.EYE_INNER_L, w, h)
+    pR = _safe_pt3d(landmarks, LM.EYE_INNER_R, w, h)
+    pC = _safe_pt3d(landmarks, LM.CHIN, w, h)
+    pN = _safe_pt3d(landmarks, LM.NOSE_TIP, w, h)
+    if pL is None or pR is None or pC is None or pN is None:
+        return None, None
+
+    v1 = pR - pL
+    v2 = pC - pL
+    n = np.cross(v1, v2)
+    norm = float(np.linalg.norm(n))
+    if norm < 1e-8:
+        return None, None
+    n = n / norm
+
+    origin = (pL + pR + pC) / 3.0
+
+    # 让法向指向“面部外侧”（鼻尖方向）
+    if float(np.dot(n, (pN - origin))) < 0:
+        n = -n
+
+    return origin, n
+
+
+def _tri_area_3d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    return 0.5 * float(np.linalg.norm(np.cross(b - a, c - a)))
+
+
+def _volume_proxy_from_polygon_3d(poly_pts: np.ndarray, origin: np.ndarray, normal: np.ndarray) -> float:
     """
-    min_seal_dist = float('inf')
-    min_idx = 0
+    poly_pts: (N,3) 3D多边形点（按轮廓顺序）
+    体积代理：sum( A_tri * mean(pos_dist_to_plane) )
+    """
+    n = poly_pts.shape[0]
+    if n < 3:
+        return float("nan")
+
+    p0 = poly_pts[0]
+    vol = 0.0
+    for i in range(1, n - 1):
+        a, b, c = p0, poly_pts[i], poly_pts[i + 1]
+        A = _tri_area_3d(a, b, c)
+        d1 = float(np.dot((a - origin), normal))
+        d2 = float(np.dot((b - origin), normal))
+        d3 = float(np.dot((c - origin), normal))
+        # 只取向外鼓出的部分（正值）
+        d_mean = (max(d1, 0.0) + max(d2, 0.0) + max(d3, 0.0)) / 3.0
+        vol += A * d_mean
+    return float(vol)
+
+
+def compute_cheek_volume(landmarks, w: int, h: int, baseline_landmarks=None):
+    """
+    鼓腮体积代理（左右分开 + 总分），并做 ICD^3 归一化，方便跨帧/跨视频稳定。
+    """
+    left_idx = getattr(LM, "BLOW_CHEEK_L", None)
+    right_idx = getattr(LM, "BLOW_CHEEK_R", None)
+    if not isinstance(left_idx, (list, tuple)) or not isinstance(right_idx, (list, tuple)):
+        return {"score": None}
+
+    origin, normal = _estimate_face_plane(landmarks, w, h)
+    if origin is None:
+        return {"score": None}
+
+    def gather(indices):
+        pts = []
+        for idx in indices:
+            p = _safe_pt3d(landmarks, int(idx), w, h)
+            if p is not None:
+                pts.append(p)
+        if len(pts) < 3:
+            return None
+        return np.stack(pts, axis=0)
+
+    L = gather(left_idx)
+    R = gather(right_idx)
+    if L is None or R is None:
+        return {"score": None}
+
+    volL = _volume_proxy_from_polygon_3d(L, origin, normal)
+    volR = _volume_proxy_from_polygon_3d(R, origin, normal)
+
+    icd = float(compute_icd(landmarks, w, h))
+    denom = max(icd, 1e-6) ** 3  # 体积归一化
+    volL_n = volL / denom
+    volR_n = volR / denom
+
+    score = 0.5 * (volL_n + volR_n)
+    asym = abs(volL_n - volR_n)
+
+    out = {
+        "left_vol": volL, "right_vol": volR,
+        "left_norm": volL_n, "right_norm": volR_n,
+        "score": score, "asymmetry": asym,
+    }
+
+    if baseline_landmarks is not None:
+        base = compute_cheek_volume(baseline_landmarks, w, h, baseline_landmarks=None)
+        if base.get("score") is not None:
+            out["baseline_score"] = base["score"]
+            out["score_change"] = out["score"] - base["score"]
+            out["left_change"] = out["left_norm"] - base.get("left_norm", 0.0)
+            out["right_change"] = out["right_norm"] - base.get("right_norm", 0.0)
+
+    return out
+
+
+def find_peak_frame(
+    landmarks_seq, w: int, h: int,
+    baseline_landmarks=None,
+    seal_thr: float = 0.03,      # lip_seal_total / ICD
+    mouth_thr: float = 0.025,    # mouth_height / ICD
+    smooth_win: int = 7
+) -> int:
+    """
+    鼓腮峰值帧：强制闭唇门控 + 3D体积代理Δ最大
+    - seal_thr/mouth_thr 是关键：防止“嘴张开但被选中”
+    """
+    n = len(landmarks_seq)
+    if n == 0:
+        return 0
+
+    icd_arr = np.full(n, np.nan, dtype=np.float64)
+    seal_arr = np.full(n, np.nan, dtype=np.float64)
+    mouth_h_arr = np.full(n, np.nan, dtype=np.float64)
+    vol_arr = np.full(n, np.nan, dtype=np.float64)
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
             continue
+        icd = float(compute_icd(lm, w, h))
+        icd_arr[i] = icd
 
-        seal_result = compute_lip_seal_distance(lm, w, h)
-        total_dist = seal_result["total_distance"]
+        try:
+            seal_arr[i] = float(compute_lip_seal_distance(lm, w, h)["total_distance"])
+        except Exception:
+            pass
 
-        if total_dist < min_seal_dist:
-            min_seal_dist = total_dist
-            min_idx = i
+        try:
+            mouth_h_arr[i] = float(compute_mouth_metrics(lm, w, h)["height"])
+        except Exception:
+            pass
 
-    return min_idx
+        try:
+            m = compute_cheek_volume(lm, w, h, baseline_landmarks=None)
+            vol_arr[i] = float(m["score"]) if m.get("score") is not None else np.nan
+        except Exception:
+            pass
+
+    # baseline：优先使用 NeutralFace 的 baseline_landmarks；否则用前10%
+    if baseline_landmarks is not None:
+        base = compute_cheek_volume(baseline_landmarks, w, h, baseline_landmarks=None)
+        base_score = float(base["score"]) if base.get("score") is not None else float(np.nan)
+    else:
+        k = max(3, int(0.1 * n))
+        base_score = float(np.nanmedian(vol_arr[:k]))
+
+    delta = vol_arr - base_score
+
+    # 简单平滑（滑动平均，忽略nan）
+    def smooth(x, win):
+        if win <= 1:
+            return x
+        y = np.full_like(x, np.nan, dtype=np.float64)
+        half = win // 2
+        for i in range(len(x)):
+            lo = max(0, i - half)
+            hi = min(len(x), i + half + 1)
+            seg = x[lo:hi]
+            if np.all(np.isnan(seg)):
+                continue
+            y[i] = np.nanmean(seg)
+        return y
+
+    delta_s = smooth(delta, smooth_win)
+
+    # 门控：必须闭唇 + 口高不能大（防止张嘴）
+    seal_ok = (seal_arr / np.maximum(icd_arr, 1e-6)) <= seal_thr
+    mouth_ok = (mouth_h_arr / np.maximum(icd_arr, 1e-6)) <= mouth_thr
+    valid = np.isfinite(delta_s) & np.isfinite(seal_arr) & np.isfinite(mouth_h_arr) & seal_ok & mouth_ok
+
+    if valid.sum() < 3:
+        # 门控太严格时：放宽到只要求闭唇（仍然防张嘴）
+        valid = np.isfinite(delta_s) & np.isfinite(seal_arr) & seal_ok
+
+    if valid.sum() == 0:
+        # 再不行就回退：找唇封闭最好的那帧
+        idx = int(np.nanargmin(seal_arr)) if np.isfinite(seal_arr).sum() > 0 else 0
+        return idx
+
+    candidates = np.where(valid)[0]
+    best = candidates[int(np.nanargmax(delta_s[candidates]))]
+    return int(best)
 
 
-def compute_blow_cheek_metrics(landmarks, w: int, h: int,
+def compute_cheek_bulge(landmarks, w: int, h: int,
                                baseline_landmarks=None) -> Dict[str, Any]:
-    """计算鼓腮特有指标"""
-    # 唇密封距离
-    seal_result = compute_lip_seal_distance(landmarks, w, h)
+    """计算“鼓腮凸出/体积代理”指标（基于 3D 点到面部参考平面的投影距离）。
 
-    # 嘴部指标
-    mouth = compute_mouth_metrics(landmarks, w, h)
+    思路：
+    - 用(双内眦 + 下巴)估计面部参考平面；
+    - 计算左右面颊点( LM.CHEEK_L / LM.CHEEK_R )沿平面法向的投影距离；
+    - 距离越大 -> 面颊越“鼓”。
+    """
+    centroid, n = _estimate_face_plane(landmarks, w, h)
+    if centroid is None or n is None:
+        return {"score": None, "left_mean": None, "right_mean": None, "asymmetry": None}
 
-    # 口角角度
-    oral = compute_oral_angle(landmarks, w, h)
+    left_pts = []
+    right_pts = []
+    for idx in LM.BLOW_CHEEK_L:
+        p = _safe_pt3d(landmarks, idx, w, h)
+        if p is not None:
+            left_pts.append(p)
+    for idx in LM.BLOW_CHEEK_R:
+        p = _safe_pt3d(landmarks, idx, w, h)
+        if p is not None:
+            right_pts.append(p)
 
-    metrics = {
-        "lip_seal": {
-            "upper_distance": seal_result["upper_distance"],
-            "lower_distance": seal_result["lower_distance"],
-            "total_distance": seal_result["total_distance"],
-            "upper_outer": seal_result["upper_outer"],
-            "upper_inner": seal_result["upper_inner"],
-            "lower_inner": seal_result["lower_inner"],
-            "lower_outer": seal_result["lower_outer"],
-        },
-        "mouth_width": mouth["width"],
-        "mouth_height": mouth["height"],
-        "left_corner": mouth["left_corner"],
-        "right_corner": mouth["right_corner"],
-        "oral_angle": {
-            "AOE": oral.AOE_angle,
-            "BOF": oral.BOF_angle,
-            "asymmetry": oral.angle_asymmetry,
-        }
+    if len(left_pts) == 0 or len(right_pts) == 0:
+        return {"score": None, "left_mean": None, "right_mean": None, "asymmetry": None}
+
+    left_pts = np.stack(left_pts, axis=0)
+    right_pts = np.stack(right_pts, axis=0)
+
+    left_d = (left_pts - centroid) @ n
+    right_d = (right_pts - centroid) @ n
+
+    left_mean = float(np.mean(left_d))
+    right_mean = float(np.mean(right_d))
+    score = float(0.5 * (left_mean + right_mean))
+    asym = float(abs(left_mean - right_mean))
+
+    out = {
+        "score": score,
+        "left_mean": left_mean,
+        "right_mean": right_mean,
+        "asymmetry": asym,
     }
 
-    # 如果有基线，计算变化
     if baseline_landmarks is not None:
-        baseline_seal = compute_lip_seal_distance(baseline_landmarks, w, h)
-        baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
-        baseline_oral = compute_oral_angle(baseline_landmarks, w, h)
+        base = compute_cheek_bulge(baseline_landmarks, w, h, baseline_landmarks=None)
+        if base.get("score") is not None and out["score"] is not None:
+            out["baseline_score"] = base["score"]
+            out["score_change"] = out["score"] - base["score"]
+            out["left_change"] = out["left_mean"] - base.get("left_mean", 0.0)
+            out["right_change"] = out["right_mean"] - base.get("right_mean", 0.0)
 
-        metrics["baseline"] = {
-            "lip_seal_total": baseline_seal["total_distance"],
-            "mouth_width": baseline_mouth["width"],
+    return out
+
+
+def _smooth_1d_nan(x: np.ndarray, win: int = 5) -> np.ndarray:
+    """对一维序列做简单滑动平均（忽略 NaN）。"""
+    if win <= 1:
+        return x.copy()
+    n = len(x)
+    y = np.full(n, np.nan, dtype=np.float64)
+    half = win // 2
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        seg = x[lo:hi]
+        if np.all(np.isnan(seg)):
+            continue
+        y[i] = np.nanmean(seg)
+    return y
+
+def _get_blow_cheek_polygons():
+    """
+    优先用 LM.BLOW_CHEEK_L/R；如果没有，就回退到 LM.CHEEK_L/R。
+    """
+    left = getattr(LM, "BLOW_CHEEK_L", None)
+    right = getattr(LM, "BLOW_CHEEK_R", None)
+    region_name = "BLOW_CHEEK"
+
+    if left is None or right is None:
+        left = getattr(LM, "CHEEK_L", None)
+        right = getattr(LM, "CHEEK_R", None)
+        region_name = "CHEEK"
+
+    if not isinstance(left, (list, tuple)) or not isinstance(right, (list, tuple)) or len(left) < 3 or len(right) < 3:
+        return None, None, None
+
+    return list(left), list(right), region_name
+
+
+def _minmax01(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float64)
+    v = x[np.isfinite(x)]
+    if v.size == 0:
+        return np.full_like(x, np.nan, dtype=np.float64)
+    mn, mx = float(np.nanmin(v)), float(np.nanmax(v))
+    if abs(mx - mn) < 1e-12:
+        out = np.zeros_like(x, dtype=np.float64)
+        out[~np.isfinite(x)] = np.nan
+        return out
+    return (x - mn) / (mx - mn)
+
+
+def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=None) -> Dict[str, Any]:
+    """
+    鼓腮动作指标：
+    - lip_seal: 唇封闭距离
+    - mouth: 嘴部宽度等
+    - oral_angle: AOE/BOF角（存成dict，避免 .get 报错）
+    - cheek_area: 脸颊区域面积（归一化 + 左右差异 + 相对静息变化）
+    """
+    lip_seal = compute_lip_seal_distance(landmarks, w, h)
+    mouth = compute_mouth_metrics(landmarks, w, h)
+
+    oral_obj = compute_oral_angle(landmarks, w, h)
+    oral = {
+        "AOE": float(oral_obj.AOE_angle),
+        "BOF": float(oral_obj.BOF_angle),
+        "asymmetry": float(oral_obj.angle_asymmetry),
+        "diff": float(oral_obj.angle_diff),
+    }
+
+    cheek_volume = compute_cheek_volume(landmarks, w, h, baseline_landmarks=baseline_landmarks)
+
+    metrics: Dict[str, Any] = {
+        "lip_seal": lip_seal,
+        "mouth_width": float(mouth["width"]),
+        "mouth_height": float(mouth["height"]),
+        "lip_seal_total_distance": float(lip_seal["total_distance"]),
+        "oral_angle": oral,
+        "cheek_volume": cheek_volume,
+    }
+
+    if baseline_landmarks is not None:
+        base_lip = compute_lip_seal_distance(baseline_landmarks, w, h)
+        base_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
+        base_oral_obj = compute_oral_angle(baseline_landmarks, w, h)
+        base_oral = {
+            "AOE": float(base_oral_obj.AOE_angle),
+            "BOF": float(base_oral_obj.BOF_angle),
+            "asymmetry": float(base_oral_obj.angle_asymmetry),
+            "diff": float(base_oral_obj.angle_diff),
         }
 
-        # 变化量
-        metrics["seal_change"] = seal_result["total_distance"] - baseline_seal["total_distance"]
-        metrics["mouth_width_change"] = mouth["width"] - baseline_mouth["width"]
+        corner_shift = abs(mouth["left_corner"][0] - base_mouth["left_corner"][0]) + \
+                       abs(mouth["right_corner"][0] - base_mouth["right_corner"][0])
 
-        # 嘴角位移
-        left_corner = mouth["left_corner"]
-        right_corner = mouth["right_corner"]
-        baseline_left = baseline_mouth["left_corner"]
-        baseline_right = baseline_mouth["right_corner"]
-
-        left_excursion = dist(left_corner, baseline_left)
-        right_excursion = dist(right_corner, baseline_right)
-        metrics["left_excursion"] = left_excursion
-        metrics["right_excursion"] = right_excursion
-        metrics["excursion_ratio"] = left_excursion / right_excursion if right_excursion > 1e-9 else 1.0
+        metrics["baseline"] = {
+            "lip_seal_total_distance": float(base_lip["total_distance"]),
+            "mouth_width": float(base_mouth["width"]),
+            "oral_asymmetry": float(base_oral["asymmetry"]),
+            "corner_shift": float(corner_shift),
+            "cheek_area_score": float(compute_cheek_volume(baseline_landmarks, w, h)["score"]),
+        }
 
     return metrics
 
@@ -282,102 +559,86 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
 
     return synkinesis
 
+def _get_blow_cheek_vis_indices() -> list:
+    """
+    鼓腮可视化：只画嘴唇轮廓 + 鼓腮区域点（BLOW_CHEEK_L/R）
+    """
+    idx = []
 
-def visualize_blow_cheek(frame: np.ndarray, landmarks, w: int, h: int,
-                         result: ActionResult,
-                         metrics: Dict[str, Any],
-                         palsy_detection: Dict[str, Any]) -> np.ndarray:
-    """可视化鼓腮指标"""
+    for name in ("OUTER_LIP", "INNER_LIP"):
+        v = getattr(LM, name, None)
+        if isinstance(v, (list, tuple)):
+            idx += list(v)
+
+    # 鼓腮区域 BLOW_CHEEK_L/R
+    for name in ("BLOW_CHEEK_L", "BLOW_CHEEK_R"):
+        v = getattr(LM, name, None)
+        if isinstance(v, (list, tuple)):
+            idx += list(v)
+
+    # 去重 + 排序
+    return sorted(set(int(i) for i in idx if isinstance(i, (int, np.integer))))
+
+BLOW_CHEEK_VIS_INDICES = _get_blow_cheek_vis_indices()
+
+def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: int):
     img = frame.copy()
 
-    # 绘制嘴部轮廓
-    draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 2)
+    # 画全脸关键点（你原来就有）
+    draw_landmarks(img, landmarks, w, h, BLOW_CHEEK_VIS_INDICES, radius=1)
 
-    # 绘制唇密封距离测量线
-    seal = metrics["lip_seal"]
+    # 嘴唇/封闭点
+    lip_seal = metrics.get("lip_seal", {})
+    upper = lip_seal.get("upper_lip_point", None)
+    lower = lip_seal.get("lower_lip_point", None)
+    left_corner = lip_seal.get("left_corner", None)
+    right_corner = lip_seal.get("right_corner", None)
 
-    # 上唇线 (0-13): 绿色
-    upper_outer = seal["upper_outer"]
-    upper_inner = seal["upper_inner"]
-    cv2.line(img, (int(upper_outer[0]), int(upper_outer[1])),
-             (int(upper_inner[0]), int(upper_inner[1])), (0, 255, 0), 3)
-    cv2.circle(img, (int(upper_outer[0]), int(upper_outer[1])), 5, (255, 255, 0), -1)
-    cv2.circle(img, (int(upper_inner[0]), int(upper_inner[1])), 5, (255, 255, 0), -1)
+    if upper is not None and lower is not None:
+        cv2.line(img, tuple(upper), tuple(lower), (255, 255, 255), 2)
+    if left_corner is not None and right_corner is not None:
+        cv2.line(img, tuple(left_corner), tuple(right_corner), (255, 255, 255), 2)
 
-    # 下唇线 (14-17): 黄色
-    lower_inner = seal["lower_inner"]
-    lower_outer = seal["lower_outer"]
-    cv2.line(img, (int(lower_inner[0]), int(lower_inner[1])),
-             (int(lower_outer[0]), int(lower_outer[1])), (0, 255, 255), 3)
-    cv2.circle(img, (int(lower_inner[0]), int(lower_inner[1])), 5, (0, 255, 255), -1)
-    cv2.circle(img, (int(lower_outer[0]), int(lower_outer[1])), 5, (0, 255, 255), -1)
+    # 画左右脸颊区域（BLOW_CHEEK_L/R）
+    left_idx, right_idx, region = _get_blow_cheek_polygons()
+    if left_idx is not None:
+        left_pts = pts2d(landmarks, left_idx, w, h).astype(np.int32)
+        right_pts = pts2d(landmarks, right_idx, w, h).astype(np.int32)
 
-    # 绘制嘴角点
-    left_corner = metrics["left_corner"]
-    right_corner = metrics["right_corner"]
-    cv2.circle(img, (int(left_corner[0]), int(left_corner[1])), 5, (255, 0, 0), -1)
-    cv2.circle(img, (int(right_corner[0]), int(right_corner[1])), 5, (0, 0, 255), -1)
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [left_pts], (0, 255, 255))   # 黄
+        cv2.fillPoly(overlay, [right_pts], (255, 255, 0))  # 青
+        img = cv2.addWeighted(overlay, 0.25, img, 0.75, 0)
 
-    # 信息面板
-    panel_h = 300
-    cv2.rectangle(img, (5, 5), (400, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (400, panel_h), (255, 255, 255), 1)
+        cv2.polylines(img, [left_pts], True, (0, 255, 255), 2)
+        cv2.polylines(img, [right_pts], True, (255, 255, 0), 2)
 
-    y = 28
-    cv2.putText(img, f"{ACTION_NAME}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    y += 28
+        cv2.putText(img, f"CheekRegion: {region}", (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    cv2.putText(img, "=== Lip Seal Distance ===", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    y += 20
+    # 写指标文字
+    cheek = metrics.get("cheek_area", {})
+    ln = cheek.get("left_norm", float("nan"))
+    rn = cheek.get("right_norm", float("nan"))
+    asym = cheek.get("asymmetry", float("nan"))
+    delta = None
+    if isinstance(cheek.get("change", None), dict):
+        delta = cheek["change"].get("score_delta", None)
 
-    cv2.putText(img, f"Upper (0-13): {seal['upper_distance']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-    y += 18
+    cv2.putText(img, f"CheekNorm L/R: {ln:.4f} / {rn:.4f}", (30, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(img, f"CheekAsym: {asym:.4f}", (30, 120),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    if delta is not None:
+        cv2.putText(img, f"CheekDelta(vs neutral): {float(delta):+.4f}", (30, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    cv2.putText(img, f"Lower (14-17): {seal['lower_distance']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    y += 18
+    cv2.putText(img, f"LipSealDist: {metrics.get('lip_seal_total_distance', 0):.2f}px", (30, 180),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    cv2.putText(img, f"Total: {seal['total_distance']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 25
-
-    cv2.putText(img, "=== Mouth Metrics ===", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    y += 20
-
-    cv2.putText(img, f"Mouth W: {metrics['mouth_width']:.1f}px  H: {metrics['mouth_height']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 22
-
-    # 口角对称性
     oral = metrics.get("oral_angle", {})
-    oral_asym = oral.get("asymmetry", 0)
-    asym_color = (0, 255, 0) if oral_asym < 5 else (0, 165, 255) if oral_asym < 10 else (0, 0, 255)
-    cv2.putText(img, f"Oral Asymmetry: {oral_asym:.1f} deg", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, asym_color, 1)
-    y += 22
-
-    # 面瘫侧别检测结果
-    palsy_side = palsy_detection.get("palsy_side", 0)
-    palsy_text = {0: "无/对称", 1: "左侧", 2: "右侧"}.get(palsy_side, "未知")
-    palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
-    cv2.putText(img, f"Palsy Side: {palsy_text}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)
-    y += 25
-
-    # Voluntary Score
-    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-    # 图例
-    legend_y = panel_h + 15
-    cv2.line(img, (15, legend_y), (45, legend_y), (0, 255, 0), 3)
-    cv2.putText(img, "Upper lip (0-13)", (50, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-    cv2.line(img, (200, legend_y), (230, legend_y), (0, 255, 255), 3)
-    cv2.putText(img, "Lower lip (14-17)", (235, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    cv2.putText(img, f"AOE/BOF: {oral.get('AOE', 0):.2f} / {oral.get('BOF', 0):.2f}", (30, 210),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
     return img
 
@@ -390,8 +651,14 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     if not landmarks_seq or not frames_seq:
         return None
 
-    # 找峰值帧 (唇密封距离最小)
-    peak_idx = find_peak_frame(landmarks_seq, frames_seq, w, h)
+    # 找峰值帧
+    peak_idx = find_peak_frame(
+        landmarks_seq, w, h,
+        baseline_landmarks=baseline_landmarks,
+        seal_thr=0.03,
+        mouth_thr=0.025,
+        smooth_win=7
+    )
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
@@ -426,12 +693,12 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
-    # 存储动作特有指标
     result.action_specific = {
         "lip_seal": metrics["lip_seal"],
         "mouth_width": metrics["mouth_width"],
         "mouth_height": metrics["mouth_height"],
         "oral_angle": metrics["oral_angle"],
+        "cheek_area": metrics.get("cheek_area", {}),  # 用面积
         "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
@@ -442,6 +709,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         result.action_specific["changes"] = {
             "seal_change": metrics.get("seal_change", 0),
             "mouth_width_change": metrics.get("mouth_width_change", 0),
+            "cheek_area_change": metrics.get("cheek_area_change", None),  # 用面积
         }
 
     # 创建输出目录
@@ -452,7 +720,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
     # 保存可视化
-    vis = visualize_blow_cheek(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
+    vis = visualize_blow_cheek(peak_frame, peak_landmarks, metrics, w, h)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 保存JSON

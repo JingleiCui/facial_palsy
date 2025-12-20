@@ -8,7 +8,7 @@ ShowTeeth 动作处理模块
 1. 嘴角位移和对称性
 2. 口角角度变化
 3. 上唇提升程度
-4. 鼻唇沟变化
+4. 嘴部开口/露齿幅度 (以内唇圈面积近似)
 5. 联动运动检测 (眼部联动)
 
 对应Sunnybrook: Open mouth smile (ZYG/RIS)
@@ -25,8 +25,8 @@ from typing import Dict, List, Optional, Any, Tuple
 import json
 
 from clinical_base import (
-    LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
-    compute_mouth_metrics, compute_oral_angle, compute_nlf_length,
+    LM, pt2d, pts2d, dist, polygon_area, compute_ear, compute_eye_area,
+    compute_mouth_metrics, compute_oral_angle,
     compute_icd, extract_common_indicators,
     ActionResult, OralAngleMeasure, draw_polygon
 )
@@ -40,32 +40,49 @@ ACTION_NAME_CN = "露齿"
 
 
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
-    """
-    找露齿峰值帧
+    """找露齿峰值帧
 
-    使用嘴宽最大的帧 (与Smile类似，但更强调张嘴程度)
+    露齿的“峰值”不一定来自“上唇提升”，也可能来自“下颌下压/下唇下拉”。
+    因此这里用 **内唇缘一圈(Inner Lip)围成的开口面积** 作为露齿强度的近似指标：
+    - 开口面积越大，通常牙齿暴露越明显
+    - 为减轻前后距离变化的影响，对面积做 ICD² 归一化
+
+    注意：这仍是“牙齿暴露”的几何代理指标。若后续接入牙齿/口腔分割，可进一步更准。
     """
-    max_width = -1.0
-    max_idx = 0
+    best_score = -1.0
+    best_idx = 0
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
             continue
-        l_corner = pt2d(lm[LM.MOUTH_L], w, h)
-        r_corner = pt2d(lm[LM.MOUTH_R], w, h)
-        width = dist(l_corner, r_corner)
-        if width > max_width:
-            max_width = width
-            max_idx = i
 
-    return max_idx
+        # 1) 内唇缘面积
+        inner_pts = np.array(pts2d(lm, LM.INNER_LIP, w, h), dtype=np.float32)
+        area = float(abs(polygon_area(inner_pts))) if len(inner_pts) >= 3 else 0.0
 
+        # 2) ICD²归一化，降低面部远近变化带来的面积缩放
+        icd = float(compute_icd(lm, w, h))
+        score = area / (icd * icd + 1e-9)
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    return best_idx
 
 def compute_show_teeth_metrics(landmarks, w: int, h: int,
                                baseline_landmarks=None) -> Dict[str, Any]:
-    """计算露齿特有指标"""
+    """计算露齿(ShowTeeth)特有指标
+
+    关键：用“内唇缘开口面积”作为露齿/张口幅度的几何代理指标。
+    鼻唇沟(NLF)相关几何指标已禁用（当前实现为鼻翼-嘴角连线，不等价于真实鼻唇沟）。
+    """
     mouth = compute_mouth_metrics(landmarks, w, h)
     oral = compute_oral_angle(landmarks, w, h)
+
+    # 内唇缘开口面积 (牙齿暴露的几何代理)
+    inner_pts = np.array(pts2d(landmarks, LM.INNER_LIP, w, h), dtype=np.float32)
+    inner_mouth_area = float(abs(polygon_area(inner_pts))) if len(inner_pts) >= 3 else 0.0
 
     # 嘴角位置
     left_corner = mouth["left_corner"]
@@ -73,82 +90,50 @@ def compute_show_teeth_metrics(landmarks, w: int, h: int,
 
     # 嘴角高度 (相对于嘴中心)
     mouth_center_y = (left_corner[1] + right_corner[1]) / 2
-    left_height_from_center = mouth_center_y - left_corner[1]  # 正值表示左嘴角较高
+    left_height_from_center = mouth_center_y - left_corner[1]   # 正值: 左嘴角更高
     right_height_from_center = mouth_center_y - right_corner[1]
 
-    # 上唇提升量 (通过上唇中心位置评估)
+    # 上唇/下唇中心位置（用于描述上唇提升或下颌下压）
     lip_top = mouth["top_center"]
+    lip_bottom = mouth["bottom_center"]
 
-    # NLF长度
-    left_nlf = compute_nlf_length(landmarks, w, h, left=True)
-    right_nlf = compute_nlf_length(landmarks, w, h, left=False)
-
-    metrics = {
-        "mouth_width": mouth["width"],
-        "mouth_height": mouth["height"],
-        "mouth_opening_ratio": mouth["height"] / mouth["width"] if mouth["width"] > 1e-9 else 0,
+    metrics: Dict[str, Any] = {
+        "mouth_width": float(mouth["width"]),
+        "mouth_height": float(mouth["height"]),
+        "mouth_opening_ratio": float(mouth["height"] / (mouth["width"] + 1e-9)),
+        "inner_mouth_area": float(inner_mouth_area),
         "left_corner": left_corner,
         "right_corner": right_corner,
-        "lip_top": lip_top,
-        "left_corner_height": left_height_from_center,
-        "right_corner_height": right_height_from_center,
-        "corner_height_diff": left_height_from_center - right_height_from_center,
-        "left_nlf": left_nlf,
-        "right_nlf": right_nlf,
-        "nlf_ratio": left_nlf / right_nlf if right_nlf > 1e-9 else 1.0,
+        "left_height_from_center": float(left_height_from_center),
+        "right_height_from_center": float(right_height_from_center),
+        "lip_top_y": float(lip_top[1]),
+        "lip_bottom_y": float(lip_bottom[1]),
         "oral_angle": {
-            "AOE": oral.AOE_angle,
-            "BOF": oral.BOF_angle,
-            "diff": oral.angle_diff,
-            "asymmetry": oral.angle_asymmetry,
-        }
+            "AOE": float(getattr(oral, "AOE_angle", 0.0) or 0.0),
+            "BOF": float(getattr(oral, "BOF_angle", 0.0) or 0.0),
+            "asymmetry": float(getattr(oral, "angle_asymmetry", 0.0) or 0.0),
+        },
+        "nlf_disabled": True,
     }
 
-    # 如果有基线，计算运动幅度
+    # 基线参考 (NeutralFace)
     if baseline_landmarks is not None:
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
-        baseline_left = baseline_mouth["left_corner"]
-        baseline_right = baseline_mouth["right_corner"]
-        baseline_top = baseline_mouth["top_center"]
-        baseline_left_nlf = compute_nlf_length(baseline_landmarks, w, h, left=True)
-        baseline_right_nlf = compute_nlf_length(baseline_landmarks, w, h, left=False)
 
-        # 嘴角位移
-        left_excursion = dist(left_corner, baseline_left)
-        right_excursion = dist(right_corner, baseline_right)
-
-        # 水平和垂直分量
-        left_horizontal = left_corner[0] - baseline_left[0]
-        left_vertical = baseline_left[1] - left_corner[1]  # 向上为正
-        right_horizontal = right_corner[0] - baseline_right[0]
-        right_vertical = baseline_right[1] - right_corner[1]
-
-        # 上唇提升量
-        lip_lift = baseline_top[1] - lip_top[1]  # 向上为正
-
-        metrics["excursion"] = {
-            "left_total": left_excursion,
-            "right_total": right_excursion,
-            "excursion_ratio": left_excursion / right_excursion if right_excursion > 1e-9 else 1.0,
-            "left_horizontal": left_horizontal,
-            "left_vertical": left_vertical,
-            "right_horizontal": right_horizontal,
-            "right_vertical": right_vertical,
-            "baseline_width": baseline_mouth["width"],
-            "width_change": mouth["width"] - baseline_mouth["width"],
-            "lip_lift": lip_lift,
-        }
+        baseline_inner_pts = np.array(pts2d(baseline_landmarks, LM.INNER_LIP, w, h), dtype=np.float32)
+        baseline_inner_area = float(abs(polygon_area(baseline_inner_pts))) if len(baseline_inner_pts) >= 3 else 0.0
 
         metrics["baseline"] = {
-            "mouth_width": baseline_mouth["width"],
-            "mouth_height": baseline_mouth["height"],
-            "left_nlf": baseline_left_nlf,
-            "right_nlf": baseline_right_nlf,
+            "mouth_width": float(baseline_mouth["width"]),
+            "mouth_height": float(baseline_mouth["height"]),
+            "mouth_opening_ratio": float(baseline_mouth["height"] / (baseline_mouth["width"] + 1e-9)),
+            "inner_mouth_area": float(baseline_inner_area),
         }
-
-        metrics["nlf_change"] = {
-            "left": left_nlf - baseline_left_nlf,
-            "right": right_nlf - baseline_right_nlf,
+        metrics["delta"] = {
+            "mouth_width": float(mouth["width"] - baseline_mouth["width"]),
+            "mouth_height": float(mouth["height"] - baseline_mouth["height"]),
+            "mouth_opening_ratio": float(mouth["height"] / (mouth["width"] + 1e-9)),
+            "inner_mouth_area": float(inner_mouth_area - baseline_inner_area),
         }
 
     return metrics
@@ -259,14 +244,7 @@ def visualize_show_teeth(frame: np.ndarray, landmarks, w: int, h: int,
                  (int(oral.A[0]), int(oral.A[1])), (0, 0, 255), 2)
         cv2.line(img, (int(oral.O[0]), int(oral.O[1])),
                  (int(oral.B[0]), int(oral.B[1])), (255, 0, 0), 2)
-
-    # 绘制鼻唇沟
-    l_ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
-    r_ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
-    l_mouth = pt2d(landmarks[LM.MOUTH_L], w, h)
-    r_mouth = pt2d(landmarks[LM.MOUTH_R], w, h)
-    cv2.line(img, (int(l_ala[0]), int(l_ala[1])), (int(l_mouth[0]), int(l_mouth[1])), (255, 100, 100), 2)
-    cv2.line(img, (int(r_ala[0]), int(r_ala[1])), (int(r_mouth[0]), int(r_mouth[1])), (100, 165, 255), 2)
+    # 鼻唇沟（NLF）几何指标已禁用：目前实现为“鼻翼-嘴角连线”，不等价于真实鼻唇沟纹理/沟壑。
 
     # 信息面板
     panel_h = 300
@@ -301,16 +279,14 @@ def visualize_show_teeth(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.putText(img, f"Asymmetry: {asym:.1f} deg", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, asym_color, 1)
     y += 22
-
-    # NLF
-    cv2.putText(img, f"NLF L: {metrics['left_nlf']:.1f}px  R: {metrics['right_nlf']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    # NLF（禁用）
+    cv2.putText(img, "NLF: disabled", (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
     y += 18
 
-    nlf_ratio = metrics['nlf_ratio']
-    nlf_color = (0, 255, 0) if 0.9 <= nlf_ratio <= 1.1 else (0, 0, 255)
-    cv2.putText(img, f"NLF Ratio: {nlf_ratio:.3f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, nlf_color, 1)
+    # 露齿/张口幅度（内唇缘开口面积）
+    cv2.putText(img, f"Inner Mouth Area: {metrics.get('inner_mouth_area', 0.0):.1f}px^2", (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
     y += 22
 
     # 运动幅度

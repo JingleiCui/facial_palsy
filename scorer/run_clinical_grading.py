@@ -44,7 +44,7 @@ import neutral_face
 import eye_blink
 import close_eye
 import smile
-import show_teeth  # 独立的ShowTeeth模块
+import show_teeth
 import raise_eyebrow
 import lip_pucker
 import blow_cheek
@@ -1091,6 +1091,7 @@ def generate_html_report(exam_id: str, patient_id: str,
         rest_img = _img_tag("resting_symmetry.jpg", "Resting Symmetry")
         ear_curve = _img_tag("ear_curve.png", "EAR曲线")
         eye_curve = _img_tag("eye_curve.png", "眼睛曲线")
+        cheek_curve = _img_tag("cheek_curve.png", "鼓腮曲线")
         ev_img = _img_tag("peak_evidence.jpg", "证据叠加图")
 
         # 修复: 使用 result.icd 而不是 result.icd_px
@@ -1123,6 +1124,7 @@ def generate_html_report(exam_id: str, patient_id: str,
             {ev_img}
             {ear_curve}
             {eye_curve}
+            {cheek_curve}
             {rest_img}
         </div>
     </div>
