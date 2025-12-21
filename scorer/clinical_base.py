@@ -695,6 +695,50 @@ def db_fetch_labels(db_path: str, examination_id: str) -> Dict[str, Any]:
     return {"has_palsy": row[0], "palsy_side": row[1], "hb_grade": row[2], "sunnybrook_score": row[3]}
 
 
+class LazyVideoFrames:
+    """
+    懒加载视频帧序列：不把所有帧读进内存。
+    只缓存第一帧（用于 w/h），其它帧按需从磁盘读取。
+    用法保持和 list 一样：frames_seq[i]、len(frames_seq)
+    """
+    def __init__(self, video_path: str, start_frame: int, count: int, first_frame=None):
+        self.video_path = video_path
+        self.start_frame = int(start_frame)
+        self.count = int(count)
+        self._first_frame = first_frame  # 只缓存1张，不会爆内存
+
+    def __len__(self):
+        return self.count
+
+    def __bool__(self):
+        return self.count > 0
+
+    def __getitem__(self, idx: int):
+        if isinstance(idx, slice):
+            # 很少用到；需要的话你可以按 slice 逐帧读取
+            start, stop, step = idx.indices(self.count)
+            return [self[i] for i in range(start, stop, step)]
+
+        if idx < 0:
+            idx = self.count + idx
+        if idx < 0 or idx >= self.count:
+            raise IndexError("LazyVideoFrames index out of range")
+
+        # 0号帧优先用缓存（避免重复解码）
+        if idx == 0 and self._first_frame is not None:
+            return self._first_frame
+
+        frame_no = self.start_frame + idx
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            return None
+        return frame
+
 # =============================================================================
 # Landmark提取器
 # =============================================================================
@@ -745,7 +789,11 @@ class LandmarkExtractor:
 
     def extract_sequence(self, video_path: str, start_frame: int = 0,
                          end_frame: Optional[int] = None) -> Tuple[List, List]:
-        """从视频提取landmarks序列"""
+        """
+        从视频提取 landmarks 序列。
+        不再把所有帧存进 frames_seq（会爆内存）
+        frames_seq 返回 LazyVideoFrames：需要哪一帧就读哪一帧
+        """
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return [], []
@@ -754,22 +802,42 @@ class LandmarkExtractor:
         if end_frame is None or end_frame >= total_frames:
             end_frame = total_frames - 1
 
+        start_frame = max(0, int(start_frame))
+        end_frame = min(int(end_frame), total_frames - 1)
+        if end_frame < start_frame:
+            cap.release()
+            return [], []
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
         landmarks_seq = []
-        frames_seq = []
+        first_frame_cache = None
         current_frame = start_frame
+        read_count = 0
 
         while current_frame <= end_frame:
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame is None:
                 break
+
+            # 只缓存第一帧：给外面 frames_seq[0].shape 用
+            if read_count == 0:
+                first_frame_cache = frame.copy()
+
             landmarks = self.extract_from_frame(frame)
             landmarks_seq.append(landmarks)
-            frames_seq.append(frame)
+
             current_frame += 1
+            read_count += 1
 
         cap.release()
+
+        frames_seq = LazyVideoFrames(
+            video_path=video_path,
+            start_frame=start_frame,
+            count=len(landmarks_seq),
+            first_frame=first_frame_cache
+        )
         return landmarks_seq, frames_seq
 
 
