@@ -1641,7 +1641,7 @@ def _worker_analyze_one(task: Dict):
 def main():
     """主函数示例"""
     analyzer = FacialSymmetryAnalyzer(
-        db_path='/Users/cuijinglei/PycharmProjects/medicalProject/facialPalsy/facialPalsy.db'
+        db_path='/facial_palsy/facialPalsy.db'
     )
 
     analyzer.batch_process_database(

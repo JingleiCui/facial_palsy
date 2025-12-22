@@ -4,7 +4,7 @@ import pandas as pd
 
 db_path = 'facialPalsy.db'
 
-output_folder = '/Users/cuijinglei/Documents/facialPalsy/HGFA/database'
+output_folder = '/Users/cuijinglei/Documents/facial_palsy/HGFA/database'
 os.makedirs(output_folder, exist_ok=True)
 
 conn = sqlite3.connect(db_path)

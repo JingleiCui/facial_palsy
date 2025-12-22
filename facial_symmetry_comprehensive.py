@@ -2089,7 +2089,7 @@ def batch_process_database(
 def main():
     """示例用法"""
     # 配置路径
-    db_path = "/Users/cuijinglei/PycharmProjects/medicalProject/facialPalsy/facialPalsy.db"
+    db_path = "/facial_palsy/facialPalsy.db"
     model_path = "/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"
     output_dir = "/Users/cuijinglei/Documents/facialPalsy/HGFA/comprehensive_analysis"
 

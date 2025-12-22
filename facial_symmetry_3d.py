@@ -603,7 +603,7 @@ def process_one(task: Dict) -> bool:
 
 def main():
     # ⚠️ 这里按你本地环境改路径
-    DB_PATH = "/Users/cuijinglei/PycharmProjects/medicalProject/facialPalsy/facialPalsy.db"
+    DB_PATH = "/facial_palsy/facialPalsy.db"
     MODEL_PATH = "/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"
     OUT_DIR = "/Users/cuijinglei/Documents/facialPalsy/HGFA/symmetry_pnp"
 

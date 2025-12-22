@@ -23,9 +23,9 @@ import time
 # OpenCV 线程数设置为 1，避免与多进程冲突
 cv2.setNumThreads(1)
 
-from facialPalsy.action_feature_integrator import ActionFeatureIntegrator
-from facialPalsy.face_segmenter import to_segmented_path
-from facialPalsy.core.augmentation_utils import (
+from facial_palsy.action_feature_integrator import ActionFeatureIntegrator
+from facial_palsy.face_segmenter import to_segmented_path
+from facial_palsy.core.augmentation_utils import (
     flip_palsy_side,
     adjust_brightness_contrast,
     mirror_indicators_dict,

@@ -31,7 +31,7 @@
 
 import numpy as np
 from typing import Dict, List, Optional, Tuple
-from facialPalsy.actions import ACTION_CLASSES
+from facial_palsy.actions import ACTION_CLASSES
 
 class ActionFeatureIntegrator:
     """

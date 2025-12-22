@@ -1315,7 +1315,7 @@ def _worker_analyze_one_3d(task: Dict):
 def main():
     """主函数"""
     # ========= 路径配置 =========
-    db_path = "/Users/cuijinglei/PycharmProjects/medicalProject/facialPalsy/facialPalsy.db"
+    db_path = "/facial_palsy/facialPalsy.db"
     model_path = "/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"
     output_dir = "/Users/cuijinglei/Documents/facialPalsy/HGFA/symmetry_pose_robust_3d"
     # ============================

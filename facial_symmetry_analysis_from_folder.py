@@ -30,10 +30,10 @@ from facial_symmetry_analysis import FacialSymmetryAnalyzer
 
 # ===================== 你只需要改这里 =====================
 
-VIDEO_ROOT = r"/Users/cuijinglei/Documents/facialPalsy/phone_videos"
+VIDEO_ROOT = r"/Users/cuijinglei/Documents/facial_palsy/phone_videos"
 
 # 你指定的固定输出目录
-OUTPUT_ROOT = r"/Users/cuijinglei/Documents/facialPalsy/HGFA/phone_symmetry_analysis"
+OUTPUT_ROOT = r"/Users/cuijinglei/Documents/facial_palsy/HGFA/phone_symmetry_analysis"
 
 # MediaPipe FaceLandmarker 模型路径（如你工程里不同，请改成实际位置）
 MODEL_PATH = r"/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"

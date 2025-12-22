@@ -56,7 +56,7 @@ import shrug_nose
 # 配置参数
 # =============================================================================
 
-DATABASE_PATH = r"/Users/cuijinglei/PycharmProjects/medicalProject/facialPalsy/facialPalsy.db"
+DATABASE_PATH = r"/facial_palsy/facialPalsy.db"
 MEDIAPIPE_MODEL_PATH = r"/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"
 OUTPUT_DIR = r"/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading"
 PATIENT_LIMIT = None

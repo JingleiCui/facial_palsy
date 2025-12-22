@@ -55,24 +55,24 @@ from typing import Dict, List, Optional, Any, Tuple
 
 # 根据实际项目结构调整导入路径
 
-from facialPalsy.core.landmark_extractor import LandmarkExtractor
-from facialPalsy.core.motion_utils import compute_motion_features
-from facialPalsy.core.constants import ActionNames
-from facialPalsy.action_feature_integrator import ActionFeatureIntegrator
+from facial_palsy.core.landmark_extractor import LandmarkExtractor
+from facial_palsy.core.motion_utils import compute_motion_features
+from facial_palsy.core.constants import ActionNames
+from facial_palsy.action_feature_integrator import ActionFeatureIntegrator
 
 # 导入所有动作类
-from facialPalsy.actions.base_action import BaseAction, ActionResult, NeutralBaseline
-from facialPalsy.actions.neutral_face import NeutralFaceAction
-from facialPalsy.actions.raise_eyebrow import RaiseEyebrowAction
-from facialPalsy.actions.close_eye_softly import CloseEyeSoftlyAction
-from facialPalsy.actions.close_eye_hardly import CloseEyeHardlyAction
-from facialPalsy.actions.smile import SmileAction
-from facialPalsy.actions.shrug_nose import ShrugNoseAction
-from facialPalsy.actions.lip_pucker import LipPuckerAction
-from facialPalsy.actions.show_teeth import ShowTeethAction
-from facialPalsy.actions.blow_cheek import BlowCheekAction
-from facialPalsy.actions.voluntary_eye_blink import VoluntaryEyeBlinkAction
-from facialPalsy.actions.spontaneous_eye_blink import SpontaneousEyeBlinkAction
+from facial_palsy.actions.base_action import BaseAction, ActionResult, NeutralBaseline
+from facial_palsy.actions.neutral_face import NeutralFaceAction
+from facial_palsy.actions.raise_eyebrow import RaiseEyebrowAction
+from facial_palsy.actions.close_eye_softly import CloseEyeSoftlyAction
+from facial_palsy.actions.close_eye_hardly import CloseEyeHardlyAction
+from facial_palsy.actions.smile import SmileAction
+from facial_palsy.actions.shrug_nose import ShrugNoseAction
+from facial_palsy.actions.lip_pucker import LipPuckerAction
+from facial_palsy.actions.show_teeth import ShowTeethAction
+from facial_palsy.actions.blow_cheek import BlowCheekAction
+from facial_palsy.actions.voluntary_eye_blink import VoluntaryEyeBlinkAction
+from facial_palsy.actions.spontaneous_eye_blink import SpontaneousEyeBlinkAction
 
 
 
