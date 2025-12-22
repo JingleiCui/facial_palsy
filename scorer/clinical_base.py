@@ -484,7 +484,7 @@ def compute_lip_seal_distance(landmarks, w: int, h: int) -> Dict[str, Any]:
     计算方法:
     - 上唇: LIP_TOP_CENTER (0) 到 LIP_TOP (13) 的距离
     - 下唇: LIP_BOT (14) 到 LIP_BOT_CENTER (17) 的距离
-    - 总距离: 上唇距离 + 下唇距离
+    - 总距离: 上唇距离 + 上唇到下唇距离 + 下唇距离
 
     鼓腮时嘴唇紧闭，此距离最小
     """
@@ -494,11 +494,13 @@ def compute_lip_seal_distance(landmarks, w: int, h: int) -> Dict[str, Any]:
     lower_outer = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)  # 17
 
     upper_dist = dist(upper_outer, upper_inner)
+    middle_dist = dist(upper_inner, lower_inner)
     lower_dist = dist(lower_inner, lower_outer)
-    total_dist = upper_dist + lower_dist
+    total_dist = upper_dist + middle_dist + lower_dist
 
     return {
         "upper_distance": upper_dist,
+        "middle_distance": middle_dist,
         "lower_distance": lower_dist,
         "total_distance": total_dist,
         "upper_outer": upper_outer,

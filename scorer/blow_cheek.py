@@ -98,68 +98,184 @@ def _volume_proxy_from_polygon_3d(poly_pts: np.ndarray, origin: np.ndarray, norm
         vol += A * d_mean
     return float(vol)
 
+def _kabsch_rigid(P: np.ndarray, Q: np.ndarray):
+    """
+    求刚体变换：把 P(当前帧稳定点) 对齐到 Q(基线稳定点)
+    返回 R(3x3), t(3,)
+    """
+    if P is None or Q is None:
+        return None, None
+    if P.shape[0] < 3 or Q.shape[0] < 3:
+        return None, None
+
+    Pc = P.mean(axis=0)
+    Qc = Q.mean(axis=0)
+    X = P - Pc
+    Y = Q - Qc
+
+    H = X.T @ Y
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    # 防止反射
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    t = Qc - (R @ Pc)
+    return R, t
+
+
+def _apply_rt(points: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """对 (N,3) 点集应用刚体变换"""
+    return (R @ points.T).T + t
+
+
+def _relative_extrusion_volume(cur_poly: np.ndarray,
+                              base_poly: np.ndarray,
+                              origin: np.ndarray,
+                              normal: np.ndarray) -> float:
+    """
+    相对“鼓出体积代理”：
+    用基线多边形三角剖分面积作为权重，乘以 (当前-基线) 沿法向的“正向鼓出距离”(负值截断为0)
+    """
+    n = base_poly.shape[0]
+    if n < 3:
+        return float("nan")
+
+    p0b = base_poly[0]
+    vol = 0.0
+    for i in range(1, n - 1):
+        ab = p0b
+        bb = base_poly[i]
+        cb = base_poly[i + 1]
+
+        A = _tri_area_3d(ab, bb, cb)
+
+        # 三角形三个顶点的“相对鼓出距离”（只取鼓出的正值）
+        dc_a = float(np.dot(cur_poly[0] - origin, normal)) - float(np.dot(ab - origin, normal))
+        dc_b = float(np.dot(cur_poly[i] - origin, normal)) - float(np.dot(bb - origin, normal))
+        dc_c = float(np.dot(cur_poly[i + 1] - origin, normal)) - float(np.dot(cb - origin, normal))
+
+        d = max(0.0, (dc_a + dc_b + dc_c) / 3.0)
+        vol += A * d
+
+    return float(vol)
+
 
 def compute_cheek_volume(landmarks, w: int, h: int, baseline_landmarks=None):
     """
-    鼓腮体积代理（左右分开 + 总分），并做 ICD^3 归一化，方便跨帧/跨视频稳定。
+    ✅ 鼓腮“相对体积代理”（左右分开 + 总分）：
+    1) 先把当前帧 3D 点刚体对齐到 NeutralFace（baseline_landmarks）
+    2) 用 NeutralFace 的参考平面（双内眦+下巴，法向朝鼻尖外侧）
+    3) 计算 BLOW_CHEEK_L/R 多边形相对基线的“正向鼓出体积代理”
+    4) 用 baseline 的 ICD^3 做归一化（跨人/跨帧更稳）
     """
     left_idx = getattr(LM, "BLOW_CHEEK_L", None)
     right_idx = getattr(LM, "BLOW_CHEEK_R", None)
     if not isinstance(left_idx, (list, tuple)) or not isinstance(right_idx, (list, tuple)):
         return {"score": None}
 
-    origin, normal = _estimate_face_plane(landmarks, w, h)
-    if origin is None:
+    # 如果没有 baseline，就退化到“绝对体积代理”（不推荐但保证可跑）
+    if baseline_landmarks is None:
+        origin, normal = _estimate_face_plane(landmarks, w, h)
+        if origin is None:
+            return {"score": None}
+
+        L = np.array([_safe_pt3d(landmarks, i, w, h) for i in left_idx], dtype=np.float64)
+        R = np.array([_safe_pt3d(landmarks, i, w, h) for i in right_idx], dtype=np.float64)
+        if np.any(np.isnan(L)) or np.any(np.isnan(R)):
+            return {"score": None}
+
+        volL = _volume_proxy_from_polygon_3d(L, origin, normal)
+        volR = _volume_proxy_from_polygon_3d(R, origin, normal)
+
+        icd = float(compute_icd(landmarks, w, h))
+        denom = max(icd, 1e-6) ** 3
+        volL_n = volL / denom
+        volR_n = volR / denom
+        score = 0.5 * (volL_n + volR_n)
+        asym = abs(volL_n - volR_n)
+        return {"score": score, "left": volL_n, "right": volR_n, "asym": asym}
+
+    # ========== 1) 用稳定点做当前帧 -> baseline 刚体对齐 ==========
+    stable_idx = [
+        LM.EYE_INNER_L, LM.EYE_INNER_R,
+        LM.EYE_OUTER_L, LM.EYE_OUTER_R,
+        LM.NOSE_BRIDGE, LM.NOSE_TIP,
+        LM.CHIN
+    ]
+
+    P = []
+    Q = []
+    for i in stable_idx:
+        p = _safe_pt3d(landmarks, i, w, h)
+        q = _safe_pt3d(baseline_landmarks, i, w, h)
+        if p is None or q is None:
+            continue
+        P.append(p)
+        Q.append(q)
+
+    if len(P) < 3:
         return {"score": None}
 
-    def gather(indices):
-        pts = []
-        for idx in indices:
-            p = _safe_pt3d(landmarks, int(idx), w, h)
-            if p is not None:
-                pts.append(p)
-        if len(pts) < 3:
-            return None
-        return np.stack(pts, axis=0)
+    P = np.stack(P, axis=0).astype(np.float64)
+    Q = np.stack(Q, axis=0).astype(np.float64)
 
-    L = gather(left_idx)
-    R = gather(right_idx)
-    if L is None or R is None:
+    Rm, t = _kabsch_rigid(P, Q)
+    if Rm is None:
         return {"score": None}
 
-    volL = _volume_proxy_from_polygon_3d(L, origin, normal)
-    volR = _volume_proxy_from_polygon_3d(R, origin, normal)
+    # ========== 2) 基线参考平面（只用 baseline 定义） ==========
+    origin_b, normal_b = _estimate_face_plane(baseline_landmarks, w, h)
+    if origin_b is None:
+        return {"score": None}
 
-    icd = float(compute_icd(landmarks, w, h))
-    denom = max(icd, 1e-6) ** 3  # 体积归一化
+    # ========== 3) 计算左右 cheek 多边形相对“正向鼓出体积代理” ==========
+    curL = []
+    curR = []
+    baseL = []
+    baseR = []
+
+    for i in left_idx:
+        p = _safe_pt3d(landmarks, i, w, h)
+        q = _safe_pt3d(baseline_landmarks, i, w, h)
+        if p is None or q is None:
+            return {"score": None}
+        curL.append(p)
+        baseL.append(q)
+
+    for i in right_idx:
+        p = _safe_pt3d(landmarks, i, w, h)
+        q = _safe_pt3d(baseline_landmarks, i, w, h)
+        if p is None or q is None:
+            return {"score": None}
+        curR.append(p)
+        baseR.append(q)
+
+    curL = _apply_rt(np.stack(curL, axis=0).astype(np.float64), Rm, t)
+    curR = _apply_rt(np.stack(curR, axis=0).astype(np.float64), Rm, t)
+    baseL = np.stack(baseL, axis=0).astype(np.float64)
+    baseR = np.stack(baseR, axis=0).astype(np.float64)
+
+    volL = _relative_extrusion_volume(curL, baseL, origin_b, normal_b)
+    volR = _relative_extrusion_volume(curR, baseR, origin_b, normal_b)
+
+    # ========== 4) 归一化（用 baseline ICD^3 更稳） ==========
+    icd_b = float(compute_icd(baseline_landmarks, w, h))
+    denom = max(icd_b, 1e-6) ** 3
     volL_n = volL / denom
     volR_n = volR / denom
 
-    score = 0.5 * (volL_n + volR_n)
-    asym = abs(volL_n - volR_n)
+    score = 0.5 * (volL_n + volR_n)      # 总鼓出
+    asym = abs(volL_n - volR_n)          # 左右差
 
-    out = {
-        "left_vol": volL, "right_vol": volR,
-        "left_norm": volL_n, "right_norm": volR_n,
-        "score": score, "asymmetry": asym,
-    }
-
-    if baseline_landmarks is not None:
-        base = compute_cheek_volume(baseline_landmarks, w, h, baseline_landmarks=None)
-        if base.get("score") is not None:
-            out["baseline_score"] = base["score"]
-            out["score_change"] = out["score"] - base["score"]
-            out["left_change"] = out["left_norm"] - base.get("left_norm", 0.0)
-            out["right_change"] = out["right_norm"] - base.get("right_norm", 0.0)
-
-    return out
-
+    return {"score": score, "left": volL_n, "right": volR_n, "asym": asym}
 
 def find_peak_frame(
     landmarks_seq, w: int, h: int,
     baseline_landmarks=None,
-    seal_thr: float = 0.03,      # lip_seal_total / ICD
-    mouth_thr: float = 0.025,    # mouth_height / ICD
+    seal_thr: float = 0.23,      # lip_seal_total / ICD
+    mouth_thr: float = 0.125,    # mouth_height / ICD
     smooth_win: int = 7
 ) -> int:
     """
@@ -192,15 +308,14 @@ def find_peak_frame(
             pass
 
         try:
-            m = compute_cheek_volume(lm, w, h, baseline_landmarks=None)
+            m = compute_cheek_volume(lm, w, h, baseline_landmarks=baseline_landmarks)
             vol_arr[i] = float(m["score"]) if m.get("score") is not None else np.nan
         except Exception:
             pass
 
     # baseline：优先使用 NeutralFace 的 baseline_landmarks；否则用前10%
     if baseline_landmarks is not None:
-        base = compute_cheek_volume(baseline_landmarks, w, h, baseline_landmarks=None)
-        base_score = float(base["score"]) if base.get("score") is not None else float(np.nan)
+        base_score = 0.0
     else:
         k = max(3, int(0.1 * n))
         base_score = float(np.nanmedian(vol_arr[:k]))

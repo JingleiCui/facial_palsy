@@ -24,10 +24,13 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import json
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from clinical_base import (
-    LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
-    compute_mouth_metrics, compute_oral_angle,
+    LM, pt2d, pt3d, pts2d, dist, compute_ear, compute_eye_area,
+    compute_mouth_metrics, compute_oral_angle, compute_lip_seal_distance,
     compute_icd, extract_common_indicators,
     ActionResult, draw_polygon
 )
@@ -36,24 +39,181 @@ ACTION_NAME = "LipPucker"
 ACTION_NAME_CN = "撅嘴"
 
 
-def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
-    """
-    找撅嘴峰值帧
+def _kabsch_rigid(P: np.ndarray, Q: np.ndarray):
+    """把当前帧稳定点 P 刚体对齐到基线稳定点 Q，返回 R,t"""
+    if P is None or Q is None or P.shape[0] < 3 or Q.shape[0] < 3:
+        return None, None
+    Pc = P.mean(axis=0); Qc = Q.mean(axis=0)
+    X = P - Pc; Y = Q - Qc
+    H = X.T @ Y
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    t = Qc - (R @ Pc)
+    return R, t
 
-    撅嘴时嘴唇宽度最小，使用嘴宽最小的帧
+
+def _apply_rt(points: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    return (R @ points.T).T + t
+
+
+def _mean_lip_z_aligned(landmarks, w: int, h: int, baseline_landmarks=None) -> float:
     """
-    min_width = float('inf')
-    min_idx = 0
+    计算“唇部区域平均z”（更稳：先把当前帧刚体对齐到 baseline，再取 z）。
+    z 越小（更负）表示越靠近镜头。
+    """
+    lip_indices = list(LM.OUTER_LIP) + list(LM.INNER_LIP)
+
+    # 没 baseline：直接算当前帧平均z（不推荐但可跑）
+    if baseline_landmarks is None:
+        zs = []
+        for idx in lip_indices:
+            x, y, z = pt3d(landmarks[idx], w, h)
+            zs.append(z)
+        return float(np.mean(zs)) if zs else float("nan")
+
+    stable_idx = [
+        LM.EYE_INNER_L, LM.EYE_INNER_R,
+        LM.EYE_OUTER_L, LM.EYE_OUTER_R,
+        LM.NOSE_BRIDGE, LM.NOSE_TIP,
+        LM.CHIN
+    ]
+
+    P, Q = [], []
+    for i in stable_idx:
+        px, py, pz = pt3d(landmarks[i], w, h)
+        qx, qy, qz = pt3d(baseline_landmarks[i], w, h)
+        P.append([px, py, pz])
+        Q.append([qx, qy, qz])
+
+    P = np.asarray(P, dtype=np.float64)
+    Q = np.asarray(Q, dtype=np.float64)
+    Rm, t = _kabsch_rigid(P, Q)
+    if Rm is None:
+        # 对齐失败就退化
+        return _mean_lip_z_aligned(landmarks, w, h, baseline_landmarks=None)
+
+    # 当前唇部点 -> 对齐到 baseline 坐标
+    cur = []
+    for idx in lip_indices:
+        x, y, z = pt3d(landmarks[idx], w, h)
+        cur.append([x, y, z])
+    cur = np.asarray(cur, dtype=np.float64)
+    cur_aligned = _apply_rt(cur, Rm, t)
+
+    return float(np.mean(cur_aligned[:, 2]))
+
+
+def _save_lip_z_curve_png(png_path, z_delta_norm, peak_idx: int):
+    """画嘴唇区域 z 轴运动曲线（相对基线的 delta_z/ICD）"""
+    if not z_delta_norm:
+        return
+    plt.figure()
+    plt.plot(list(range(len(z_delta_norm))), z_delta_norm)
+    plt.axvline(int(peak_idx), linestyle="--")
+    plt.title("Lip region depth curve (baseline_z - current_z) / ICD")
+    plt.xlabel("Frame")
+    plt.ylabel("Delta depth (normalized)")
+    plt.tight_layout()
+    plt.savefig(str(png_path), dpi=150)
+    plt.close()
+
+def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
+                    baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
+    """
+    撅嘴峰值帧：
+    - 主：嘴宽相对 baseline 明显变小
+    - 辅：唇部区域更靠近镜头（baseline_z - current_z 更大）
+    - 门控：不张嘴 + 唇密封（避免误选说话/张口帧）
+    """
+    n = len(landmarks_seq)
+    if n == 0:
+        return 0, {}
+
+    # baseline mouth width / ICD / baseline lip z
+    if baseline_landmarks is not None:
+        base_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
+        base_width = float(base_mouth["width"])
+        base_icd = float(compute_icd(baseline_landmarks, w, h))
+        base_z = _mean_lip_z_aligned(baseline_landmarks, w, h, baseline_landmarks=None)
+    else:
+        # 没 baseline 就用第一帧当 baseline（退化）
+        first = next((lm for lm in landmarks_seq if lm is not None), None)
+        base_mouth = compute_mouth_metrics(first, w, h) if first is not None else {"width": 1.0}
+        base_width = float(base_mouth["width"])
+        base_icd = float(compute_icd(first, w, h)) if first is not None else 1.0
+        base_z = _mean_lip_z_aligned(first, w, h, baseline_landmarks=None) if first is not None else 0.0
+
+    base_width = max(base_width, 1e-6)
+    base_icd = max(base_icd, 1e-6)
+
+    # 门控阈值（你可以按数据再调）
+    mouth_h_thr = 0.32      # mouth_height / ICD 过大 => 张口
+    seal_thr = 0.3         # lip_seal_total / ICD 过大 => 唇不闭合
+
+    best_score = -1e18
+    best_idx = 0
+
+    width_ratio_list = []
+    z_delta_norm_list = []
+    score_list = []
+    valid_list = []
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
+            width_ratio_list.append(float("nan"))
+            z_delta_norm_list.append(float("nan"))
+            score_list.append(float("nan"))
+            valid_list.append(False)
             continue
-        mouth = compute_mouth_metrics(lm, w, h)
-        if mouth["width"] < min_width:
-            min_width = mouth["width"]
-            min_idx = i
 
-    return min_idx
+        mouth = compute_mouth_metrics(lm, w, h)
+        width = float(mouth["width"])
+        height = float(mouth["height"])
+
+        width_ratio = width / base_width
+        mouth_h_ratio = height / base_icd
+
+        # 唇密封（越小越闭合）
+        seal = compute_lip_seal_distance(lm, w, h)
+        seal_ratio = float(seal["total_distance"]) / base_icd
+
+        # 唇部深度：对齐后取唇部平均z（越小越靠前）
+        cur_z = _mean_lip_z_aligned(lm, w, h, baseline_landmarks=baseline_landmarks)
+        # delta_z：baseline_z - current_z （越大表示越“靠前”）
+        z_delta = float(base_z - cur_z)
+        z_delta_norm = z_delta / base_icd
+
+        # 门控：不张口 + 唇闭合（避免嘴张开误选）
+        valid = (mouth_h_ratio <= mouth_h_thr) and (seal_ratio <= seal_thr)
+
+        # 联合评分：宽度收缩为主，前突为辅
+        # width_ratio 越小越好 => (1 - width_ratio) 越大越好
+        score = (1.2 * (1.0 - width_ratio)) + (0.8 * z_delta_norm)
+
+        # 如果没通过门控，强惩罚
+        if not valid:
+            score -= 10.0
+
+        width_ratio_list.append(width_ratio)
+        z_delta_norm_list.append(z_delta_norm)
+        score_list.append(score)
+        valid_list.append(valid)
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    debug = {
+        "width_ratio": width_ratio_list,
+        "lip_z_delta_norm": z_delta_norm_list,
+        "score": score_list,
+        "valid": valid_list,
+        "best_score": float(best_score)
+    }
+    return best_idx, debug
 
 
 def compute_lip_pucker_metrics(landmarks, w: int, h: int,
@@ -375,7 +535,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         return None
 
     # 找峰值帧 (嘴宽最小)
-    peak_idx = find_peak_frame(landmarks_seq, frames_seq, w, h)
+    peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks=baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
@@ -441,6 +601,15 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 保存可视化
     vis = visualize_lip_pucker(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
+
+    # 保存嘴唇Z轴曲线（相对基线）
+    if peak_debug and "lip_z_delta_norm" in peak_debug:
+        _save_lip_z_curve_png(action_dir / "mouth_z_curve.png",
+                              peak_debug["lip_z_delta_norm"],
+                              peak_idx)
+
+    # 也把 debug 写进 json（可解释性）
+    result.action_specific["peak_debug"] = peak_debug
 
     # 保存JSON
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
