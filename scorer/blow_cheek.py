@@ -189,6 +189,7 @@ def _save_cheek_depth_curve_png(png_path,
                                 left_series: List[float],
                                 right_series: List[float],
                                 mean_series: List[float],
+                                score_smooth: List[float],
                                 peak_idx: int,
                                 valid_mask: List[bool] = None,
                                 palsy_detection: Dict[str, Any] = None) -> None:
@@ -206,7 +207,25 @@ def _save_cheek_depth_curve_png(png_path,
 
     ax.plot(xs, left_series, 'b-', label="Left cheek (delta_z/ICD)", linewidth=2)
     ax.plot(xs, right_series, 'r-', label="Right cheek (delta_z/ICD)", linewidth=2)
-    ax.plot(xs, mean_series, 'g-', label="Mean (delta_z/ICD)", linewidth=2)
+
+    # 绘制原始 mean_delta
+    ax.plot(xs, mean_series, 'g-', label="Mean (delta_z/ICD) - Raw", linewidth=2, alpha=0.7)
+
+    # 绘制平滑后的 score
+    ax.plot(xs, score_smooth, 'purple', label="Mean (delta_z/ICD) - Smoothed",
+            linewidth=2.5, linestyle='--')
+
+    # 标注原始mean_delta的最高点
+    max_mean_idx = np.nanargmax(mean_series)
+    ax.scatter([max_mean_idx], [mean_series[max_mean_idx]],
+               color='green', s=100, zorder=4, marker='o',
+               edgecolors='black', linewidths=1, label='Max raw mean')
+
+    # 标注实际选择的峰值（score_smooth的最高点）
+    ax.axvline(peak_idx, linestyle="--", color='black', linewidth=2)
+    ax.scatter([peak_idx], [score_smooth[peak_idx]],
+               color='red', s=150, zorder=5, marker='*',
+               edgecolors='black', linewidths=2, label='Selected peak')
 
     peak_idx = int(max(0, min(peak_idx, len(xs) - 1)))
     ax.axvline(peak_idx, linestyle="--", color='black', linewidth=2)
@@ -944,10 +963,13 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         right_series = peak_debug.get("right_delta_norm", [])
         mean_series = peak_debug.get("mean_delta_norm", [])
         valid_mask = peak_debug.get("valid", None)
+        score_smooth = peak_debug.get("score", [])
 
         _save_cheek_depth_curve_png(
             action_dir / "cheek_depth_curve.png",
-            left_series, right_series, mean_series, peak_idx,
+            left_series, right_series, mean_series,
+            score_smooth,
+            peak_idx,
             valid_mask=valid_mask,
             palsy_detection=palsy_detection
         )
