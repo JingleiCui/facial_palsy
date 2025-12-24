@@ -512,7 +512,7 @@ def find_peak_frame(
             peak_idx = 0
     else:
         cand = np.where(valid)[0]
-        peak_idx = int(cand[int(np.nanargmax(score_s[cand]))])
+        peak_idx = int(cand[int(np.nanargmax(score_raw[cand]))])
 
     # =============== peak_debug：保证字段齐全 ===============
     peak_debug = {
