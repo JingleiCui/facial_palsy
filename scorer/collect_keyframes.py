@@ -80,13 +80,6 @@ def collect_one_exam(exam_dir: Path):
         dst_name = f"{exam_id}_{action_name}_peak_raw{src_peak.suffix.lower()}"
         dst_path = dst_action_dir / dst_name
 
-        if dst_path.exists():
-            while True:
-                alt = dst_action_dir / f"{exam_id}_{action_name}_peak_raw{src_peak.suffix.lower()}"
-                if not alt.exists():
-                    dst_path = alt
-                    break
-
         try:
             shutil.copy2(src_peak, dst_path)
             copied += 1

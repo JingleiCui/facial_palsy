@@ -195,10 +195,14 @@ def compute_smile_metrics(landmarks, w: int, h: int,
 
     # 如果有基线，计算运动幅度（统一尺度）
     if baseline_landmarks is not None:
-        # ========== 计算统一 scale ==========
-        scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+        # ========== 计算统一 scale（优化：传入预计算的 ICD）==========
+        icd_current = compute_icd(landmarks, w, h)
+        # 假设 baseline 的 icd 已在 NeutralFace 时计算并存储
+        # 如果有传入 icd_base 参数，使用它；否则重新计算
+        scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h,
+                                          icd_current=icd_current)
         metrics["scale"] = scale
-        # ====================================
+        metrics["icd_current"] = icd_current
 
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
         baseline_oral = compute_oral_angle(baseline_landmarks, w, h)

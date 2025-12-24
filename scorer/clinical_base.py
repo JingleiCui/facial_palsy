@@ -136,9 +136,34 @@ def make_json_serializable(obj: Any) -> Any:
 # 统一尺度归一化 (Scale Normalization)
 # =============================================================================
 
-def compute_scale_to_baseline(current_landmarks, baseline_landmarks, w: int, h: int) -> float:
+def compute_icd_cached(landmarks, w: int, h: int, cache: dict = None, key: str = None) -> float:
     """
-    计算将当前帧缩放到 baseline 尺度的比例因子
+    计算 ICD，支持缓存避免重复计算
+
+    Args:
+        landmarks: 面部关键点
+        w, h: 图像尺寸
+        cache: 缓存字典（可选）
+        key: 缓存键名（可选）
+
+    Returns:
+        ICD 值
+    """
+    if cache is not None and key is not None and key in cache:
+        return cache[key]
+
+    icd = compute_icd(landmarks, w, h)
+
+    if cache is not None and key is not None:
+        cache[key] = icd
+
+    return icd
+
+
+def compute_scale_to_baseline(current_landmarks, baseline_landmarks, w: int, h: int,
+                              icd_base: float = None, icd_current: float = None) -> float:
+    """
+    计算将当前帧缩放到 baseline 尺度的比例因子（优化版）
 
     scale = ICD_base / ICD_current
 
@@ -148,6 +173,8 @@ def compute_scale_to_baseline(current_landmarks, baseline_landmarks, w: int, h: 
         current_landmarks: 当前帧 landmarks
         baseline_landmarks: 静息帧 landmarks
         w, h: 图像尺寸
+        icd_base: 预计算的基线 ICD（可选，避免重复计算）
+        icd_current: 预计算的当前帧 ICD（可选）
 
     Returns:
         scale 比例因子 (ICD_base / ICD_current)
@@ -155,8 +182,11 @@ def compute_scale_to_baseline(current_landmarks, baseline_landmarks, w: int, h: 
     if baseline_landmarks is None or current_landmarks is None:
         return 1.0
 
-    icd_base = compute_icd(baseline_landmarks, w, h)
-    icd_current = compute_icd(current_landmarks, w, h)
+    # 使用传入的 ICD 值，或计算
+    if icd_base is None:
+        icd_base = compute_icd(baseline_landmarks, w, h)
+    if icd_current is None:
+        icd_current = compute_icd(current_landmarks, w, h)
 
     if icd_current < 1e-6:
         return 1.0
@@ -221,6 +251,93 @@ class ScaledMetrics:
             "raw": self._raw.copy(),
             "scaled": self._scaled.copy()
         }
+
+
+# =============================================================================
+# 批量处理函数 - NumPy 向量化
+# =============================================================================
+
+def batch_compute_ear(landmarks_seq: list, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    批量计算整个序列的 EAR 值（向量化优化）
+
+    Args:
+        landmarks_seq: landmarks 序列
+        w, h: 图像尺寸
+
+    Returns:
+        (left_ear_array, right_ear_array)
+    """
+    n = len(landmarks_seq)
+    left_ear = np.full(n, np.nan)
+    right_ear = np.full(n, np.nan)
+
+    for i, lm in enumerate(landmarks_seq):
+        if lm is not None:
+            left_ear[i] = compute_ear(lm, w, h, True)
+            right_ear[i] = compute_ear(lm, w, h, False)
+
+    return left_ear, right_ear
+
+
+def batch_compute_mouth_width(landmarks_seq: list, w: int, h: int) -> np.ndarray:
+    """
+    批量计算嘴宽
+
+    Returns:
+        mouth_width_array
+    """
+    n = len(landmarks_seq)
+    mouth_width = np.full(n, np.nan)
+
+    for i, lm in enumerate(landmarks_seq):
+        if lm is not None:
+            l_corner = pt2d(lm[LM.MOUTH_L], w, h)
+            r_corner = pt2d(lm[LM.MOUTH_R], w, h)
+            mouth_width[i] = dist(l_corner, r_corner)
+
+    return mouth_width
+
+
+def batch_compute_palpebral_height(landmarks_seq: list, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    批量计算眼睑裂高度
+
+    Returns:
+        (left_height_array, right_height_array)
+    """
+    n = len(landmarks_seq)
+    left_height = np.full(n, np.nan)
+    right_height = np.full(n, np.nan)
+
+    for i, lm in enumerate(landmarks_seq):
+        if lm is not None:
+            left_height[i] = compute_palpebral_height(lm, w, h, True)
+            right_height[i] = compute_palpebral_height(lm, w, h, False)
+
+    return left_height, right_height
+
+
+def find_peak_by_metric(metric_array: np.ndarray, mode: str = 'max') -> int:
+    """
+    根据指标数组找峰值帧索引
+
+    Args:
+        metric_array: 指标数组
+        mode: 'max' 或 'min'
+
+    Returns:
+        峰值帧索引
+    """
+    valid_mask = np.isfinite(metric_array)
+    if not np.any(valid_mask):
+        return 0
+
+    if mode == 'max':
+        return int(np.nanargmax(metric_array))
+    else:
+        return int(np.nanargmin(metric_array))
+
 
 # =============================================================================
 # 基础几何计算函数
