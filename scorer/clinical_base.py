@@ -92,15 +92,15 @@ class LM:
     # ========== 鼻部 ==========
     NOSE_ALA_L = 358  # 左鼻翼
     NOSE_ALA_R = 129  # 右鼻翼
-    NOSE_TIP_TOP = 4
+    NOSE_TIP_TOP = 4  # 鼻尖
     NOSE_BRIDGE = 168  # 鼻梁
 
     # ========== 面颊 ==========
     CHEEK_L = [425, 426, 427, 411, 280]
     CHEEK_R = [205, 206, 207, 187, 50]
 
-    BLOW_CHEEK_L = [280, 376, 433, 364, 430, 422, 393, 423, 266,]
-    BLOW_CHEEK_R = [50, 147, 213, 135, 210, 202, 167, 203, 36,]
+    BLOW_CHEEK_L = [280, 376, 433, 364, 430, 422, 423, 266,]
+    BLOW_CHEEK_R = [50, 147, 213, 135, 210, 202, 203, 36,]
 
 # =============================================================================
 # JSON 序列化安全转换（处理 numpy.bool_ / numpy.float32 等）
@@ -130,6 +130,97 @@ def make_json_serializable(obj: Any) -> Any:
         return [make_json_serializable(v) for v in obj]
 
     return obj
+
+
+# =============================================================================
+# 统一尺度归一化 (Scale Normalization)
+# =============================================================================
+
+def compute_scale_to_baseline(current_landmarks, baseline_landmarks, w: int, h: int) -> float:
+    """
+    计算将当前帧缩放到 baseline 尺度的比例因子
+
+    scale = ICD_base / ICD_current
+
+    用法: 当前帧距离 × scale = baseline尺度下的距离
+
+    Args:
+        current_landmarks: 当前帧 landmarks
+        baseline_landmarks: 静息帧 landmarks
+        w, h: 图像尺寸
+
+    Returns:
+        scale 比例因子 (ICD_base / ICD_current)
+    """
+    if baseline_landmarks is None or current_landmarks is None:
+        return 1.0
+
+    icd_base = compute_icd(baseline_landmarks, w, h)
+    icd_current = compute_icd(current_landmarks, w, h)
+
+    if icd_current < 1e-6:
+        return 1.0
+
+    return icd_base / icd_current
+
+
+def scale_distance(distance: float, scale: float) -> float:
+    """将距离缩放到 baseline 尺度"""
+    return distance * scale
+
+
+def scale_point(point: Tuple[float, float], scale: float,
+                anchor: Tuple[float, float] = None) -> Tuple[float, float]:
+    """
+    将点坐标缩放到 baseline 尺度
+
+    Args:
+        point: 当前帧坐标
+        scale: 缩放比例
+        anchor: 缩放锚点（默认为原点）
+
+    Returns:
+        缩放后的坐标
+    """
+    if anchor is None:
+        return (point[0] * scale, point[1] * scale)
+    else:
+        dx = point[0] - anchor[0]
+        dy = point[1] - anchor[1]
+        return (anchor[0] + dx * scale, anchor[1] + dy * scale)
+
+
+class ScaledMetrics:
+    """
+    统一尺度的指标容器
+
+    存储已缩放到 baseline 尺度的指标，方便直接对比
+    """
+
+    def __init__(self, scale: float = 1.0):
+        self.scale = scale
+        self._raw = {}  # 原始值
+        self._scaled = {}  # 缩放后的值
+
+    def add(self, name: str, raw_value: float) -> float:
+        """添加一个距离指标，自动缩放"""
+        self._raw[name] = raw_value
+        scaled = raw_value * self.scale
+        self._scaled[name] = scaled
+        return scaled
+
+    def get_raw(self, name: str) -> float:
+        return self._raw.get(name, 0.0)
+
+    def get_scaled(self, name: str) -> float:
+        return self._scaled.get(name, 0.0)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "scale": self.scale,
+            "raw": self._raw.copy(),
+            "scaled": self._scaled.copy()
+        }
 
 # =============================================================================
 # 基础几何计算函数
@@ -208,6 +299,46 @@ def angle_between_vectors(v1: Tuple[float, float], v2: Tuple[float, float]) -> f
 def compute_centroid(points: np.ndarray) -> Tuple[float, float]:
     """计算点集的质心"""
     return (float(np.mean(points[:, 0])), float(np.mean(points[:, 1])))
+
+
+# 建议添加到 clinical_base.py 或 geometry_utils.py
+
+def kabsch_rigid_transform(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    计算刚体变换：把 P(当前帧稳定点) 对齐到 Q(基线稳定点)
+
+    Args:
+        P: 当前帧点集 (N, 3)
+        Q: 基线帧点集 (N, 3)
+
+    Returns:
+        R: 旋转矩阵 (3, 3)
+        t: 平移向量 (3,)
+    """
+    if P is None or Q is None or P.shape[0] < 3 or Q.shape[0] < 3:
+        return None, None
+
+    Pc = P.mean(axis=0)
+    Qc = Q.mean(axis=0)
+    X = P - Pc
+    Y = Q - Qc
+
+    H = X.T @ Y
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # 防止反射
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    t = Qc - (R @ Pc)
+    return R, t
+
+
+def apply_rigid_transform(points: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """对 (N,3) 点集应用刚体变换"""
+    return (R @ points.T).T + t
 
 
 # =============================================================================
@@ -316,30 +447,93 @@ def compute_brow_eye_distance(landmarks, w: int, h: int, left: bool = True) -> D
     """
     计算眉眼距
 
-    眼内眦点到眉毛质心的距离
+    定义：
+    - 眉眼距 = “眉毛质心” 到 “眼部水平线(双眼内眦点连线)” 的垂直距离（像素）
+    - 同时给出眼部水平线用于可视化：方向取内眦连线，线段端点延长到眉毛最左(300)与最右(70)的对齐范围
 
     Returns:
         Dict包含:
-        - distance: 眉眼距 (像素)
-        - eye_inner: 眼内眦点坐标
-        - brow_centroid: 眉毛质心坐标
+        - distance: 眉眼距(垂直距离, px)
+        - brow_centroid: 眉毛质心
+        - eye_inner_l / eye_inner_r: 左/右内眦点
+        - foot: 垂足点（眉毛质心投影到眼水平线上的点）
+        - eye_line_p0 / eye_line_p1: 画线用端点（与眉毛左右极值对齐后的线段端点）
+        - brow_extreme_left / brow_extreme_right: 眉毛极值点(300/70)
+        - eye_inner: 为兼容旧代码保留（left=True 返回左内眦；否则右内眦）
     """
-    # 眼内眦点
-    if left:
-        eye_inner = pt2d(landmarks[LM.EYE_INNER_L], w, h)
-    else:
-        eye_inner = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+    # 眼内眦点（用于定义“眼部水平线”）
+    eye_inner_l = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    eye_inner_r = pt2d(landmarks[LM.EYE_INNER_R], w, h)
 
-    # 眉毛质心
+    # 眉毛质心（左右分别算）
     brow_centroid = compute_brow_centroid(landmarks, w, h, left)
 
-    # 眉眼距
-    distance = dist(eye_inner, brow_centroid)
+    x1, y1 = float(eye_inner_l[0]), float(eye_inner_l[1])
+    x2, y2 = float(eye_inner_r[0]), float(eye_inner_r[1])
+    cx, cy = float(brow_centroid[0]), float(brow_centroid[1])
+
+    vx, vy = (x2 - x1), (y2 - y1)
+    denom = vx * vx + vy * vy
+
+    # 防止极端退化
+    if denom < 1e-9:
+        # 退化时回退为“到对应内眦点的距离”
+        eye_inner = eye_inner_l if left else eye_inner_r
+        return {
+            "distance": dist(eye_inner, brow_centroid),
+            "eye_inner": eye_inner,
+            "brow_centroid": brow_centroid,
+            "eye_inner_l": eye_inner_l,
+            "eye_inner_r": eye_inner_r,
+            "foot": eye_inner,
+            "eye_line_p0": eye_inner_l,
+            "eye_line_p1": eye_inner_r,
+            "brow_extreme_left": pt2d(landmarks[300], w, h),
+            "brow_extreme_right": pt2d(landmarks[70], w, h),
+        }
+
+    # 垂足（投影点）
+    t = ((cx - x1) * vx + (cy - y1) * vy) / denom
+    foot = (x1 + t * vx, y1 + t * vy)
+
+    # 垂直距离（点到直线距离）
+    # |v x (c - p1)| / |v|
+    distance = abs(vx * (cy - y1) - vy * (cx - x1)) / (denom ** 0.5)
+
+    # 眉毛左右极值点（用于“画眼水平线的端点对齐范围”）
+    brow_extreme_left = pt2d(landmarks[300], w, h)   # 眉毛最左点
+    brow_extreme_right = pt2d(landmarks[70], w, h)   # 眉毛最右点
+
+    def _point_on_eye_line_aligned_to_anchor(anchor_xy):
+        ax, ay = float(anchor_xy[0]), float(anchor_xy[1])
+        # 用变化更大的轴求参数，避免除零
+        if abs(vx) >= abs(vy) and abs(vx) > 1e-6:
+            tt = (ax - x1) / vx
+        elif abs(vy) > 1e-6:
+            tt = (ay - y1) / vy
+        else:
+            tt = 0.0
+        return (x1 + tt * vx, y1 + tt * vy)
+
+    eye_line_p0 = _point_on_eye_line_aligned_to_anchor(brow_extreme_left)
+    eye_line_p1 = _point_on_eye_line_aligned_to_anchor(brow_extreme_right)
+
+    eye_inner = eye_inner_l if left else eye_inner_r
 
     return {
-        "distance": distance,
+        "distance": float(distance),
         "eye_inner": eye_inner,
-        "brow_centroid": brow_centroid
+        "brow_centroid": brow_centroid,
+
+        "eye_inner_l": eye_inner_l,
+        "eye_inner_r": eye_inner_r,
+        "foot": (float(foot[0]), float(foot[1])),
+
+        "eye_line_p0": (float(eye_line_p0[0]), float(eye_line_p0[1])),
+        "eye_line_p1": (float(eye_line_p1[0]), float(eye_line_p1[1])),
+
+        "brow_extreme_left": brow_extreme_left,
+        "brow_extreme_right": brow_extreme_right,
     }
 
 
@@ -1066,7 +1260,7 @@ def extract_common_indicators(landmarks, w: int, h: int, result: ActionResult,
     result.nlf_ratio = result.left_nlf_length / result.right_nlf_length if result.right_nlf_length > 1e-9 else 1.0
 
 # =============================================================================
-# 新增: 鼻翼到内眦距离计算 (用于ShrugNose)
+# 鼻翼到内眦距离计算 (用于ShrugNose)
 # =============================================================================
 
 def compute_ala_to_canthus_distance(landmarks, w: int, h: int, left: bool = True) -> float:
@@ -1142,7 +1336,7 @@ def compute_ala_canthus_metrics(landmarks, w: int, h: int,
 
 
 # =============================================================================
-# 新增: 从闭眼动作检测面瘫侧别
+# 从闭眼动作检测面瘫侧别
 # =============================================================================
 
 def detect_palsy_side_from_eye_closure(left_ear: float, right_ear: float,
@@ -1239,7 +1433,7 @@ def detect_palsy_side_from_eye_closure(left_ear: float, right_ear: float,
 
 
 # =============================================================================
-# 新增: 从嘴角运动检测面瘫侧别
+# 从嘴角运动检测面瘫侧别
 # =============================================================================
 
 def detect_palsy_side_from_mouth(oral_angle, baseline_oral_angle=None) -> Dict[str, Any]:
@@ -1314,7 +1508,7 @@ def detect_palsy_side_from_mouth(oral_angle, baseline_oral_angle=None) -> Dict[s
 
 
 # =============================================================================
-# 新增: 从运动幅度比较检测面瘫侧别
+# 从运动幅度比较检测面瘫侧别
 # =============================================================================
 
 def detect_palsy_side_from_excursion(left_excursion: float, right_excursion: float,

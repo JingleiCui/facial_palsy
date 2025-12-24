@@ -29,8 +29,8 @@ import json
 from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
     compute_mouth_metrics, compute_oral_angle, compute_icd,
-    extract_common_indicators,
-    ActionResult, OralAngleMeasure, draw_polygon
+    extract_common_indicators, compute_scale_to_baseline,
+    ActionResult, OralAngleMeasure, draw_polygon,
 )
 
 from sunnybrook_scorer import (
@@ -38,7 +38,7 @@ from sunnybrook_scorer import (
 )
 
 
-def find_peak_frame_smile(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
+def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
     """找微笑峰值帧 (嘴宽最大)"""
     max_width = -1.0
     max_idx = 0
@@ -56,9 +56,115 @@ def find_peak_frame_smile(landmarks_seq: List, frames_seq: List, w: int, h: int)
     return max_idx
 
 
+def extract_smile_sequences(landmarks_seq: List, w: int, h: int) -> Dict[str, List[float]]:
+    """
+    提取微笑关键指标的时序序列
+
+    Returns:
+        包含嘴宽和口角角度的时序数据
+    """
+    mouth_width_seq = []
+    aoe_seq = []
+    bof_seq = []
+
+    for lm in landmarks_seq:
+        if lm is None:
+            mouth_width_seq.append(np.nan)
+            aoe_seq.append(np.nan)
+            bof_seq.append(np.nan)
+        else:
+            l_corner = pt2d(lm[LM.MOUTH_L], w, h)
+            r_corner = pt2d(lm[LM.MOUTH_R], w, h)
+            width = dist(l_corner, r_corner)
+            mouth_width_seq.append(width)
+
+            oral = compute_oral_angle(lm, w, h)
+            aoe_seq.append(oral.AOE_angle if oral else np.nan)
+            bof_seq.append(oral.BOF_angle if oral else np.nan)
+
+    return {
+        "Mouth Width": mouth_width_seq,
+        "AOE (Right)": aoe_seq,
+        "BOF (Left)": bof_seq,
+    }
+
+
+def plot_smile_peak_selection(
+        sequences: Dict[str, List[float]],
+        fps: float,
+        peak_idx: int,
+        output_path: Path,
+        action_name: str = "Smile"
+) -> None:
+    """
+    绘制微笑关键帧选择的可解释性曲线
+
+    微笑选择标准: 嘴宽最大的帧
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+    n_frames = len(sequences["Mouth Width"])
+    frames = np.arange(n_frames)
+    time_sec = frames / fps if fps > 0 else frames
+    x_label = 'Time (seconds)' if fps > 0 else 'Frame'
+    peak_time = peak_idx / fps if fps > 0 else peak_idx
+
+    # 上图: 嘴宽曲线 (关键帧选择依据)
+    ax1 = axes[0]
+    mouth_width = sequences["Mouth Width"]
+    ax1.plot(time_sec, mouth_width, 'g-', label='Mouth Width', linewidth=2)
+
+    # 标注峰值帧
+    ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
+    width_at_peak = mouth_width[peak_idx] if peak_idx < len(mouth_width) else 0
+    ax1.scatter([peak_time], [width_at_peak], color='red', s=150, zorder=5,
+                edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
+    ax1.annotate(f'Max: {width_at_peak:.1f}px', xy=(peak_time, width_at_peak),
+                 xytext=(10, -20), textcoords='offset points', fontsize=10, fontweight='bold')
+
+    ax1.set_xlabel(x_label, fontsize=11)
+    ax1.set_ylabel('Mouth Width (pixels)', fontsize=11)
+    ax1.set_title(f'{action_name} Peak Selection: Maximum Mouth Width', fontsize=13, fontweight='bold')
+    ax1.legend(loc='best')
+    ax1.grid(True, alpha=0.3)
+
+    # 下图: 口角角度 (用于患侧判断)
+    ax2 = axes[1]
+    ax2.plot(time_sec, sequences["AOE (Right)"], 'r-', label='AOE (Right)', linewidth=2)
+    ax2.plot(time_sec, sequences["BOF (Left)"], 'b-', label='BOF (Left)', linewidth=2)
+    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7, label=f'Peak Frame {peak_idx}')
+    ax2.axhline(y=0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
+
+    # 在峰值帧标注角度值
+    aoe_at_peak = sequences["AOE (Right)"][peak_idx] if peak_idx < len(sequences["AOE (Right)"]) else 0
+    bof_at_peak = sequences["BOF (Left)"][peak_idx] if peak_idx < len(sequences["BOF (Left)"]) else 0
+    if not np.isnan(aoe_at_peak):
+        ax2.scatter([peak_time], [aoe_at_peak], color='red', s=80, zorder=5, edgecolors='white', linewidths=1.5)
+        ax2.annotate(f'{aoe_at_peak:+.1f}°', xy=(peak_time, aoe_at_peak),
+                     xytext=(5, 5), textcoords='offset points', fontsize=9, color='red')
+    if not np.isnan(bof_at_peak):
+        ax2.scatter([peak_time], [bof_at_peak], color='blue', s=80, zorder=5, edgecolors='white', linewidths=1.5)
+        ax2.annotate(f'{bof_at_peak:+.1f}°', xy=(peak_time, bof_at_peak),
+                     xytext=(5, -15), textcoords='offset points', fontsize=9, color='blue')
+
+    ax2.set_xlabel(x_label, fontsize=11)
+    ax2.set_ylabel('Oral Angle (degrees)', fontsize=11)
+    ax2.set_title('Oral Commissure Angles (for Palsy Detection)', fontsize=12)
+    ax2.legend(loc='best')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
 def compute_smile_metrics(landmarks, w: int, h: int,
                           baseline_landmarks=None) -> Dict[str, Any]:
-    """计算微笑特有指标"""
+    """计算微笑特有指标 - 使用统一 scale"""
     mouth = compute_mouth_metrics(landmarks, w, h)
     oral = compute_oral_angle(landmarks, w, h)
 
@@ -87,36 +193,42 @@ def compute_smile_metrics(landmarks, w: int, h: int,
         }
     }
 
-    # 如果有基线，计算运动幅度
+    # 如果有基线，计算运动幅度（统一尺度）
     if baseline_landmarks is not None:
+        # ========== 计算统一 scale ==========
+        scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+        metrics["scale"] = scale
+        # ====================================
+
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
         baseline_oral = compute_oral_angle(baseline_landmarks, w, h)
         baseline_left = baseline_mouth["left_corner"]
         baseline_right = baseline_mouth["right_corner"]
 
-        # 嘴角位移
-        left_excursion = dist(left_corner, baseline_left)
-        right_excursion = dist(right_corner, baseline_right)
+        # ========== 缩放当前帧距离到 baseline 尺度 ==========
+        # 嘴角位移（先计算原始位移，再缩放）
+        left_excursion_raw = dist(left_corner, baseline_left)
+        right_excursion_raw = dist(right_corner, baseline_right)
 
-        # 水平和垂直分量
-        left_horizontal = left_corner[0] - baseline_left[0]
-        left_vertical = baseline_left[1] - left_corner[1]  # 向上为正
-        right_horizontal = right_corner[0] - baseline_right[0]
-        right_vertical = baseline_right[1] - right_corner[1]
+        # 缩放到 baseline 尺度
+        left_excursion = left_excursion_raw * scale
+        right_excursion = right_excursion_raw * scale
+
+        # 嘴宽变化
+        width_change = mouth["width"] * scale - baseline_mouth["width"]
 
         metrics["excursion"] = {
             "left_total": left_excursion,
             "right_total": right_excursion,
             "excursion_ratio": left_excursion / right_excursion if right_excursion > 1e-9 else 1.0,
-            "left_horizontal": left_horizontal,
-            "left_vertical": left_vertical,
-            "right_horizontal": right_horizontal,
-            "right_vertical": right_vertical,
             "baseline_width": baseline_mouth["width"],
-            "width_change": mouth["width"] - baseline_mouth["width"],
+            "width_change": width_change,
+            # 保留原始值供调试
+            "left_raw": left_excursion_raw,
+            "right_raw": right_excursion_raw,
         }
 
-        # 口角角度变化
+        # 口角角度变化（角度不需要缩放）
         metrics["oral_angle_change"] = {
             "AOE_change": oral.AOE_angle - baseline_oral.AOE_angle,
             "BOF_change": oral.BOF_angle - baseline_oral.BOF_angle,
@@ -311,7 +423,7 @@ def process_smile(landmarks_seq: List, frames_seq: List, w: int, h: int,
                   baseline_result: Optional[ActionResult] = None,
                   baseline_landmarks=None) -> Optional[ActionResult]:
     """处理Smile动作"""
-    return _process_smile_action(
+    return process(
         landmarks_seq, frames_seq, w, h, video_info, output_dir,
         action_name="Smile",
         action_name_cn="微笑",
@@ -319,22 +431,7 @@ def process_smile(landmarks_seq: List, frames_seq: List, w: int, h: int,
         baseline_landmarks=baseline_landmarks
     )
 
-
-def process_show_teeth(landmarks_seq: List, frames_seq: List, w: int, h: int,
-                       video_info: Dict[str, Any], output_dir: Path,
-                       baseline_result: Optional[ActionResult] = None,
-                       baseline_landmarks=None) -> Optional[ActionResult]:
-    """处理ShowTeeth动作"""
-    return _process_smile_action(
-        landmarks_seq, frames_seq, w, h, video_info, output_dir,
-        action_name="ShowTeeth",
-        action_name_cn="露齿",
-        baseline_result=baseline_result,
-        baseline_landmarks=baseline_landmarks
-    )
-
-
-def _process_smile_action(landmarks_seq: List, frames_seq: List, w: int, h: int,
+def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
                           video_info: Dict[str, Any], output_dir: Path,
                           action_name: str, action_name_cn: str,
                           baseline_result: Optional[ActionResult] = None,
@@ -344,9 +441,12 @@ def _process_smile_action(landmarks_seq: List, frames_seq: List, w: int, h: int,
         return None
 
     # 找峰值帧
-    peak_idx = find_peak_frame_smile(landmarks_seq, frames_seq, w, h)
+    peak_idx = find_peak_frame(landmarks_seq, frames_seq, w, h)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
+
+    # 提取时序序列用于可视化
+    sequences = extract_smile_sequences(landmarks_seq, w, h)
 
     if peak_landmarks is None:
         return None
@@ -413,6 +513,15 @@ def _process_smile_action(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 创建输出目录
     action_dir = output_dir / action_name
     action_dir.mkdir(parents=True, exist_ok=True)
+
+    # 绘制关键帧选择曲线
+    plot_smile_peak_selection(
+        sequences,
+        video_info.get("fps", 30.0),
+        peak_idx,
+        action_dir / "peak_selection_curve.png",
+        action_name
+    )
 
     # 保存原始帧
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)

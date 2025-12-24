@@ -56,7 +56,7 @@ import shrug_nose
 # 配置参数
 # =============================================================================
 
-DATABASE_PATH = r"/facial_palsy/facialPalsy.db"
+DATABASE_PATH = r"/Users/cuijinglei/PycharmProjects/medicalProject/facial_palsy/facialPalsy.db"
 MEDIAPIPE_MODEL_PATH = r"/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"
 OUTPUT_DIR = r"/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading"
 PATIENT_LIMIT = None
@@ -1101,10 +1101,9 @@ def generate_html_report(exam_id: str, patient_id: str,
         ear_curve = _img_tag("ear_curve.png", "EAR曲线")
         eye_curve = _img_tag("eye_curve.png", "眼睛曲线")
         cheek_curve = _img_tag("cheek_curve.png", "鼓腮曲线")
+        brow_curve = _img_tag("brow_curve.png", "眉眼距曲线")
         ev_img = _img_tag("peak_evidence.jpg", "证据叠加图")
 
-        # 修复: 使用 result.icd 而不是 result.icd_px
-        # 修复: 使用 result.oral_angle.angle_asymmetry 而不是 result.oral_asymmetry
         oral_asym = result.oral_angle.angle_asymmetry if result.oral_angle else 0.0
 
         html += f"""
@@ -1131,6 +1130,7 @@ def generate_html_report(exam_id: str, patient_id: str,
             {raw_img}
             {ind_img}
             {ev_img}
+            {brow_curve}
             {ear_curve}
             {eye_curve}
             {cheek_curve}

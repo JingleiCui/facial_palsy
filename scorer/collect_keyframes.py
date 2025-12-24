@@ -80,15 +80,12 @@ def collect_one_exam(exam_dir: Path):
         dst_name = f"{exam_id}_{action_name}_peak_raw{src_peak.suffix.lower()}"
         dst_path = dst_action_dir / dst_name
 
-        # 如果已存在同名文件，避免覆盖：追加序号
         if dst_path.exists():
-            i = 2
             while True:
-                alt = dst_action_dir / f"{exam_id}_{action_name}_peak_raw_{i}{src_peak.suffix.lower()}"
+                alt = dst_action_dir / f"{exam_id}_{action_name}_peak_raw{src_peak.suffix.lower()}"
                 if not alt.exists():
                     dst_path = alt
                     break
-                i += 1
 
         try:
             shutil.copy2(src_peak, dst_path)

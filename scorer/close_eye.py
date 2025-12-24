@@ -34,7 +34,7 @@ from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
     compute_palpebral_height, compute_mouth_metrics,
     compute_icd, extract_common_indicators,
-    ActionResult, draw_polygon
+    ActionResult, draw_polygon, compute_scale_to_baseline
 )
 
 
@@ -195,7 +195,7 @@ def detect_palsy_side_from_closure(left_ear: float, right_ear: float,
 
 def compute_close_eye_metrics(landmarks, w: int, h: int,
                               baseline_landmarks=None) -> Dict[str, Any]:
-    """计算闭眼特有指标"""
+    """计算闭眼特有指标 - 使用统一 scale"""
     # 当前EAR和面积
     l_ear = compute_ear(landmarks, w, h, True)
     r_ear = compute_ear(landmarks, w, h, False)
@@ -217,53 +217,41 @@ def compute_close_eye_metrics(landmarks, w: int, h: int,
     }
 
     # 如果有基线，计算闭合程度
-    baseline_l_ear = None
-    baseline_r_ear = None
-
     if baseline_landmarks is not None:
+        # ========== 计算统一 scale ==========
+        scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+        metrics["scale"] = scale
+        # ====================================
+
         baseline_l_ear = compute_ear(baseline_landmarks, w, h, True)
         baseline_r_ear = compute_ear(baseline_landmarks, w, h, False)
-        baseline_l_area, _ = compute_eye_area(baseline_landmarks, w, h, True)
-        baseline_r_area, _ = compute_eye_area(baseline_landmarks, w, h, False)
+        baseline_l_height = compute_palpebral_height(baseline_landmarks, w, h, True)
+        baseline_r_height = compute_palpebral_height(baseline_landmarks, w, h, False)
 
-        metrics["baseline"] = {
-            "left_ear": baseline_l_ear,
-            "right_ear": baseline_r_ear,
-            "left_area": baseline_l_area,
-            "right_area": baseline_r_area,
-        }
+        # EAR 是比值，不需要缩放
+        # 眼睑裂高度需要缩放
+        l_height_scaled = l_height * scale
+        r_height_scaled = r_height * scale
 
-        # 闭合比例 (越接近0越完全闭合)
-        if baseline_l_ear > 1e-9:
-            metrics["left_closure_ratio"] = l_ear / baseline_l_ear
-        else:
-            metrics["left_closure_ratio"] = 1.0
+        # 闭合比例 (当前/基线)
+        left_closure_ratio = l_ear / baseline_l_ear if baseline_l_ear > 1e-9 else 1.0
+        right_closure_ratio = r_ear / baseline_r_ear if baseline_r_ear > 1e-9 else 1.0
 
-        if baseline_r_ear > 1e-9:
-            metrics["right_closure_ratio"] = r_ear / baseline_r_ear
-        else:
-            metrics["right_closure_ratio"] = 1.0
+        # 闭合百分比 (1 - ratio) * 100%
+        metrics["left_closure_percent"] = (1 - left_closure_ratio) * 100
+        metrics["right_closure_percent"] = (1 - right_closure_ratio) * 100
+        metrics["left_closure_ratio"] = left_closure_ratio
+        metrics["right_closure_ratio"] = right_closure_ratio
 
-        # 闭合百分比 (越接近100%越完全闭合)
-        metrics["left_closure_percent"] = (1 - metrics["left_closure_ratio"]) * 100
-        metrics["right_closure_percent"] = (1 - metrics["right_closure_ratio"]) * 100
+        # 高度变化（缩放后）
+        metrics["left_height_change"] = l_height_scaled - baseline_l_height
+        metrics["right_height_change"] = r_height_scaled - baseline_r_height
 
-        # 面积变化
-        if baseline_l_area > 1e-9:
-            metrics["left_area_change_percent"] = (l_area - baseline_l_area) / baseline_l_area * 100
-        else:
-            metrics["left_area_change_percent"] = 0
-
-        if baseline_r_area > 1e-9:
-            metrics["right_area_change_percent"] = (r_area - baseline_r_area) / baseline_r_area * 100
-        else:
-            metrics["right_area_change_percent"] = 0
-
-    # 添加面瘫侧别检测
-    palsy_detection = detect_palsy_side_from_closure(
-        l_ear, r_ear, baseline_l_ear, baseline_r_ear
-    )
-    metrics["palsy_detection"] = palsy_detection
+        # 面瘫侧别检测
+        palsy_detection = detect_palsy_side_from_closure(
+            l_ear, r_ear, baseline_l_ear, baseline_r_ear
+        )
+        metrics["palsy_detection"] = palsy_detection
 
     return metrics
 

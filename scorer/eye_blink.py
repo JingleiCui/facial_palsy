@@ -24,7 +24,7 @@ from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
     compute_palpebral_height, compute_mouth_metrics,
     compute_oral_angle, compute_icd, extract_common_indicators,
-    ActionResult, draw_polygon
+    ActionResult, draw_polygon, compute_scale_to_baseline
 )
 
 
@@ -93,7 +93,7 @@ def extract_eye_area_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, 
 
 
 def analyze_blink_dynamics(ear_seq: Dict[str, List[float]],
-                           fps: float) -> Dict[str, Any]:
+                           fps: float, scale: float = 1.0) -> Dict[str, Any]:
     """分析眨眼动态特征"""
     left = np.array(ear_seq["left"])
     right = np.array(ear_seq["right"])
@@ -146,6 +146,7 @@ def analyze_blink_dynamics(ear_seq: Dict[str, List[float]],
         "symmetry_ratio_mean": symmetry_mean,
         "symmetry_ratio_std": symmetry_std,
         "fps": fps,
+        "scale": scale,  # 记录使用的scale
     }
 
 

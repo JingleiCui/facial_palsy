@@ -22,7 +22,7 @@ from clinical_base import (
     compute_mouth_metrics, compute_oral_angle, compute_nlf_length,
     compute_icd, extract_common_indicators,
     ActionResult, OralAngleMeasure,
-    draw_text_with_background, draw_landmarks, draw_polygon
+    draw_text_with_background, draw_landmarks, draw_polygon, compute_brow_eye_distance
 )
 
 from sunnybrook_scorer import (
@@ -284,12 +284,31 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 提取通用指标
     extract_common_indicators(peak_landmarks, w, h, result)
 
+    # ========== 存储 baseline ICD 和关键距离 ==========
+    icd_base = compute_icd(peak_landmarks, w, h)
+
+    # 存储 baseline 距离（原始像素值，作为后续动作的参考）
+    baseline_distances = {
+        "icd": icd_base,
+        "left_palpebral_height": compute_palpebral_height(peak_landmarks, w, h, left=True),
+        "right_palpebral_height": compute_palpebral_height(peak_landmarks, w, h, left=False),
+        "left_brow_eye_distance": compute_brow_eye_distance(peak_landmarks, w, h, left=True),
+        "right_brow_eye_distance": compute_brow_eye_distance(peak_landmarks, w, h, left=False),
+        "mouth_width": result.mouth_width,
+        "mouth_height": result.mouth_height,
+        "left_nlf_length": result.left_nlf_length,
+        "right_nlf_length": result.right_nlf_length,
+    }
+
     # 提取动作特有指标
     extract_action_specific_indicators(peak_landmarks, w, h, result)
 
     # 计算Resting Symmetry
     resting = compute_resting_symmetry_from_result(result)
     result.action_specific["resting_symmetry"] = resting.to_dict()
+
+    # ========== 存储 baseline 距离 ==========
+    result.action_specific["baseline_distances"] = baseline_distances
 
     # 创建输出目录
     action_dir = output_dir / ACTION_NAME

@@ -28,7 +28,8 @@ from clinical_base import (
     LM, pt2d, pts2d, dist, polygon_area, compute_ear, compute_eye_area,
     compute_mouth_metrics, compute_oral_angle,
     compute_icd, extract_common_indicators,
-    ActionResult, OralAngleMeasure, draw_polygon
+    ActionResult, OralAngleMeasure, draw_polygon,
+    compute_scale_to_baseline,
 )
 
 from sunnybrook_scorer import (
@@ -70,9 +71,106 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> in
 
     return best_idx
 
+
+def extract_show_teeth_sequences(landmarks_seq: List, w: int, h: int) -> Dict[str, List[float]]:
+    """
+    提取露齿关键指标的时序序列
+
+    Returns:
+        包含内唇面积和口角角度的时序数据
+    """
+    inner_area_seq = []
+    aoe_seq = []
+    bof_seq = []
+
+    for lm in landmarks_seq:
+        if lm is None:
+            inner_area_seq.append(np.nan)
+            aoe_seq.append(np.nan)
+            bof_seq.append(np.nan)
+        else:
+            # 内唇面积
+            inner_pts = np.array(pts2d(lm, LM.INNER_LIP, w, h), dtype=np.float32)
+            area = float(abs(polygon_area(inner_pts))) if len(inner_pts) >= 3 else 0.0
+            # ICD归一化
+            icd = float(compute_icd(lm, w, h))
+            normalized_area = area / (icd * icd + 1e-9)
+            inner_area_seq.append(normalized_area)
+
+            oral = compute_oral_angle(lm, w, h)
+            aoe_seq.append(oral.AOE_angle if oral else np.nan)
+            bof_seq.append(oral.BOF_angle if oral else np.nan)
+
+    return {
+        "Inner Mouth Area (norm)": inner_area_seq,
+        "AOE (Right)": aoe_seq,
+        "BOF (Left)": bof_seq,
+    }
+
+
+def plot_show_teeth_peak_selection(
+        sequences: Dict[str, List[float]],
+        fps: float,
+        peak_idx: int,
+        output_path: Path
+) -> None:
+    """
+    绘制露齿关键帧选择的可解释性曲线
+
+    露齿选择标准: 内唇缘开口面积(ICD归一化)最大的帧
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+    n_frames = len(sequences["Inner Mouth Area (norm)"])
+    frames = np.arange(n_frames)
+    time_sec = frames / fps if fps > 0 else frames
+    x_label = 'Time (seconds)' if fps > 0 else 'Frame'
+    peak_time = peak_idx / fps if fps > 0 else peak_idx
+
+    # 上图: 内唇面积曲线 (关键帧选择依据)
+    ax1 = axes[0]
+    area_seq = sequences["Inner Mouth Area (norm)"]
+    ax1.plot(time_sec, area_seq, 'purple', label='Inner Mouth Area (ICD² normalized)', linewidth=2)
+
+    # 标注峰值帧
+    ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
+    area_at_peak = area_seq[peak_idx] if peak_idx < len(area_seq) else 0
+    ax1.scatter([peak_time], [area_at_peak], color='red', s=150, zorder=5,
+                edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
+    ax1.annotate(f'Max: {area_at_peak:.3f}', xy=(peak_time, area_at_peak),
+                 xytext=(10, -20), textcoords='offset points', fontsize=10, fontweight='bold')
+
+    ax1.set_xlabel(x_label, fontsize=11)
+    ax1.set_ylabel('Normalized Area', fontsize=11)
+    ax1.set_title('ShowTeeth Peak Selection: Maximum Inner Lip Area (ICD² normalized)', fontsize=13, fontweight='bold')
+    ax1.legend(loc='best')
+    ax1.grid(True, alpha=0.3)
+
+    # 下图: 口角角度 (用于患侧判断)
+    ax2 = axes[1]
+    ax2.plot(time_sec, sequences["AOE (Right)"], 'r-', label='AOE (Right)', linewidth=2)
+    ax2.plot(time_sec, sequences["BOF (Left)"], 'b-', label='BOF (Left)', linewidth=2)
+    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7, label=f'Peak Frame {peak_idx}')
+    ax2.axhline(y=0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
+
+    ax2.set_xlabel(x_label, fontsize=11)
+    ax2.set_ylabel('Oral Angle (degrees)', fontsize=11)
+    ax2.set_title('Oral Commissure Angles (for Palsy Detection)', fontsize=12)
+    ax2.legend(loc='best')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
 def compute_show_teeth_metrics(landmarks, w: int, h: int,
                                baseline_landmarks=None) -> Dict[str, Any]:
-    """计算露齿(ShowTeeth)特有指标
+    """计算露齿(ShowTeeth)特有指标 - 使用统一 scale
 
     关键：用“内唇缘开口面积”作为露齿/张口幅度的几何代理指标。
     鼻唇沟(NLF)相关几何指标已禁用（当前实现为鼻翼-嘴角连线，不等价于真实鼻唇沟）。
@@ -116,24 +214,32 @@ def compute_show_teeth_metrics(landmarks, w: int, h: int,
         "nlf_disabled": True,
     }
 
-    # 基线参考 (NeutralFace)
+    # 基线参考
     if baseline_landmarks is not None:
-        baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
+        # ========== 计算统一 scale ==========
+        scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+        metrics["scale"] = scale
+        # ====================================
 
+        baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
         baseline_inner_pts = np.array(pts2d(baseline_landmarks, LM.INNER_LIP, w, h), dtype=np.float32)
         baseline_inner_area = float(abs(polygon_area(baseline_inner_pts))) if len(baseline_inner_pts) >= 3 else 0.0
+
+        # ========== 缩放到 baseline 尺度 ==========
+        # 面积需要用 scale² 缩放
+        scaled_inner_area = inner_mouth_area * (scale ** 2)
+        scaled_width = mouth["width"] * scale
+        scaled_height = mouth["height"] * scale
 
         metrics["baseline"] = {
             "mouth_width": float(baseline_mouth["width"]),
             "mouth_height": float(baseline_mouth["height"]),
-            "mouth_opening_ratio": float(baseline_mouth["height"] / (baseline_mouth["width"] + 1e-9)),
             "inner_mouth_area": float(baseline_inner_area),
         }
         metrics["delta"] = {
-            "mouth_width": float(mouth["width"] - baseline_mouth["width"]),
-            "mouth_height": float(mouth["height"] - baseline_mouth["height"]),
-            "mouth_opening_ratio": float(mouth["height"] / (mouth["width"] + 1e-9)),
-            "inner_mouth_area": float(inner_mouth_area - baseline_inner_area),
+            "mouth_width": float(scaled_width - baseline_mouth["width"]),
+            "mouth_height": float(scaled_height - baseline_mouth["height"]),
+            "inner_mouth_area": float(scaled_inner_area - baseline_inner_area),
         }
 
     return metrics
@@ -342,6 +448,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
+    # 提取时序序列用于可视化
+    sequences = extract_show_teeth_sequences(landmarks_seq, w, h)
+
     if peak_landmarks is None:
         return None
 
@@ -387,6 +496,14 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 保存可视化
     vis = visualize_show_teeth(peak_frame, peak_landmarks, w, h, result, metrics)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
+
+    # 绘制关键帧选择曲线
+    plot_show_teeth_peak_selection(
+        sequences,
+        video_info.get("fps", 30.0),
+        peak_idx,
+        action_dir / "peak_selection_curve.png"
+    )
 
     # 保存JSON
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:

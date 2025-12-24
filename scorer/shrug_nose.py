@@ -26,7 +26,7 @@ import json
 from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
     compute_mouth_metrics, compute_icd, extract_common_indicators,
-    ActionResult, draw_polygon
+    ActionResult, draw_polygon, compute_scale_to_baseline,
 )
 
 ACTION_NAME = "ShrugNose"
@@ -76,9 +76,122 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
     return min_idx
 
 
+def extract_shrug_nose_sequences(
+        landmarks_seq: List,
+        w: int, h: int
+) -> Dict[str, List[float]]:
+    """
+    提取皱鼻关键指标的时序序列
+
+    Returns:
+        包含鼻翼-内眦距离的时序数据
+    """
+    left_dist_seq = []
+    right_dist_seq = []
+    total_dist_seq = []
+
+    for lm in landmarks_seq:
+        if lm is None:
+            left_dist_seq.append(np.nan)
+            right_dist_seq.append(np.nan)
+            total_dist_seq.append(np.nan)
+        else:
+            left_dist = compute_ala_to_canthus_distance(lm, w, h, left=True)
+            right_dist = compute_ala_to_canthus_distance(lm, w, h, left=False)
+            left_dist_seq.append(left_dist)
+            right_dist_seq.append(right_dist)
+            total_dist_seq.append(left_dist + right_dist)
+
+    return {
+        "Left Ala-Canthus": left_dist_seq,
+        "Right Ala-Canthus": right_dist_seq,
+        "Total Distance": total_dist_seq,
+    }
+
+
+def plot_shrug_nose_peak_selection(
+        sequences: Dict[str, List[float]],
+        fps: float,
+        peak_idx: int,
+        output_path: Path,
+        baseline_values: Dict[str, float] = None
+) -> None:
+    """
+    绘制皱鼻关键帧选择的可解释性曲线
+
+    皱鼻选择标准: 双侧鼻翼-内眦距离之和最小的帧
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    n_frames = len(sequences["Left Ala-Canthus"])
+    frames = np.arange(n_frames)
+    time_sec = frames / fps if fps > 0 else frames
+    x_label = 'Time (seconds)' if fps > 0 else 'Frame'
+    peak_time = peak_idx / fps if fps > 0 else peak_idx
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+    # 上图: 鼻翼-内眦距离曲线
+    ax1 = axes[0]
+    ax1.plot(time_sec, sequences["Left Ala-Canthus"], 'b-', label='Left Ala-Canthus', linewidth=2)
+    ax1.plot(time_sec, sequences["Right Ala-Canthus"], 'r-', label='Right Ala-Canthus', linewidth=2)
+
+    # 绘制基线
+    if baseline_values:
+        if "left" in baseline_values:
+            ax1.axhline(y=baseline_values["left"], color='blue', linestyle=':', alpha=0.5, label='Left Baseline')
+        if "right" in baseline_values:
+            ax1.axhline(y=baseline_values["right"], color='red', linestyle=':', alpha=0.5, label='Right Baseline')
+
+    ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
+
+    # 标注峰值帧处的值
+    left_at_peak = sequences["Left Ala-Canthus"][peak_idx] if peak_idx < len(sequences["Left Ala-Canthus"]) else 0
+    right_at_peak = sequences["Right Ala-Canthus"][peak_idx] if peak_idx < len(sequences["Right Ala-Canthus"]) else 0
+
+    if not np.isnan(left_at_peak):
+        ax1.scatter([peak_time], [left_at_peak], color='blue', s=80, zorder=5, edgecolors='white', linewidths=1.5)
+        ax1.annotate(f'L:{left_at_peak:.1f}', xy=(peak_time, left_at_peak),
+                     xytext=(-50, 5), textcoords='offset points', fontsize=9, color='blue')
+    if not np.isnan(right_at_peak):
+        ax1.scatter([peak_time], [right_at_peak], color='red', s=80, zorder=5, edgecolors='white', linewidths=1.5)
+        ax1.annotate(f'R:{right_at_peak:.1f}', xy=(peak_time, right_at_peak),
+                     xytext=(5, 5), textcoords='offset points', fontsize=9, color='red')
+
+    ax1.set_xlabel(x_label, fontsize=11)
+    ax1.set_ylabel('Distance (pixels)', fontsize=11)
+    ax1.set_title('Ala-Canthus Distance Over Time', fontsize=12)
+    ax1.legend(loc='best')
+    ax1.grid(True, alpha=0.3)
+
+    # 下图: 总距离曲线 (关键帧选择依据)
+    ax2 = axes[1]
+    total_arr = np.array(sequences["Total Distance"])
+    ax2.plot(time_sec, total_arr, 'g-', label='Total Distance (selection criterion)', linewidth=2)
+
+    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
+    total_at_peak = total_arr[peak_idx] if peak_idx < len(total_arr) else 0
+    ax2.scatter([peak_time], [total_at_peak], color='red', s=150, zorder=5,
+                edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
+    ax2.annotate(f'Min: {total_at_peak:.1f}px', xy=(peak_time, total_at_peak),
+                 xytext=(10, 10), textcoords='offset points', fontsize=10, fontweight='bold')
+
+    ax2.set_xlabel(x_label, fontsize=11)
+    ax2.set_ylabel('Total Distance (pixels)', fontsize=11)
+    ax2.set_title('ShrugNose Peak Selection: Minimum Total Ala-Canthus Distance', fontsize=13, fontweight='bold')
+    ax2.legend(loc='best')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
 def compute_shrug_nose_metrics(landmarks, w: int, h: int,
                                baseline_landmarks=None) -> Dict[str, Any]:
-    """计算皱鼻特有指标"""
+    """计算皱鼻特有指标  - 使用统一 scale"""
     # 鼻翼到内眦距离
     left_ac_dist = compute_ala_to_canthus_distance(landmarks, w, h, left=True)
     right_ac_dist = compute_ala_to_canthus_distance(landmarks, w, h, left=False)
@@ -109,6 +222,11 @@ def compute_shrug_nose_metrics(landmarks, w: int, h: int,
 
     # 如果有基线，计算变化
     if baseline_landmarks is not None:
+        # ========== 计算统一 scale ==========
+        scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+        metrics["scale"] = scale
+        # ====================================
+
         baseline_left = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=True)
         baseline_right = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=False)
         baseline_left_ala = pt2d(baseline_landmarks[LM.NOSE_ALA_L], w, h)
@@ -120,24 +238,29 @@ def compute_shrug_nose_metrics(landmarks, w: int, h: int,
             "ala_width": dist(baseline_left_ala, baseline_right_ala),
         }
 
-        # 距离变化 (皱鼻时应为负值，表示距离变小)
-        metrics["left_change"] = left_ac_dist - baseline_left
-        metrics["right_change"] = right_ac_dist - baseline_right
+        # ========== 缩放到 baseline 尺度后计算变化 ==========
+        left_scaled = left_ac_dist * scale
+        right_scaled = right_ac_dist * scale
+
+        # 距离变化 (皱鼻时应为负值)
+        metrics["left_change"] = left_scaled - baseline_left
+        metrics["right_change"] = right_scaled - baseline_right
+        # ===================================================
 
         # 变化百分比
         if baseline_left > 1e-9:
-            metrics["left_change_percent"] = (left_ac_dist - baseline_left) / baseline_left * 100
+            metrics["left_change_percent"] = metrics["left_change"] / baseline_left * 100
         else:
             metrics["left_change_percent"] = 0
 
         if baseline_right > 1e-9:
-            metrics["right_change_percent"] = (right_ac_dist - baseline_right) / baseline_right * 100
+            metrics["right_change_percent"] = metrics["right_change"] / baseline_right * 100
         else:
             metrics["right_change_percent"] = 0
 
-        # 鼻翼垂直移动量 (Y轴，向上为负)
-        metrics["left_ala_vertical_move"] = left_ala[1] - baseline_left_ala[1]
-        metrics["right_ala_vertical_move"] = right_ala[1] - baseline_right_ala[1]
+        # 鼻翼垂直移动量 (缩放后)
+        metrics["left_ala_vertical_move"] = (left_ala[1] - baseline_left_ala[1]) * scale
+        metrics["right_ala_vertical_move"] = (right_ala[1] - baseline_right_ala[1]) * scale
 
     return metrics
 
@@ -430,6 +553,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
+    # 提取时序序列用于可视化
+    sequences = extract_shrug_nose_sequences(landmarks_seq, w, h)
+
     if peak_landmarks is None:
         return None
 
@@ -493,6 +619,22 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 保存可视化
     vis = visualize_shrug_nose(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
+
+    # 准备基线值
+    baseline_values = None
+    if baseline_landmarks is not None:
+        baseline_left = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=True)
+        baseline_right = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=False)
+        baseline_values = {"left": baseline_left, "right": baseline_right}
+
+    # 绘制关键帧选择曲线
+    plot_shrug_nose_peak_selection(
+        sequences,
+        video_info.get("fps", 30.0),
+        peak_idx,
+        action_dir / "peak_selection_curve.png",
+        baseline_values
+    )
 
     # 保存JSON
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:

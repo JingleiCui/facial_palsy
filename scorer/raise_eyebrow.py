@@ -18,6 +18,9 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import json
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
@@ -25,7 +28,7 @@ from clinical_base import (
     compute_icd, extract_common_indicators,
     compute_brow_eye_distance, compute_brow_eye_distance_ratio,
     compute_brow_eye_distance_change, compute_brow_eye_distance_change_ratio,
-    compute_brow_centroid,
+    compute_brow_centroid, compute_scale_to_baseline,
     ActionResult, draw_polygon, draw_landmarks
 )
 
@@ -33,40 +36,310 @@ ACTION_NAME = "RaiseEyebrow"
 ACTION_NAME_CN = "抬眉/皱额"
 
 
-def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
-                    baseline_landmarks=None) -> int:
+def find_peak_frame(
+    landmarks_seq: List,
+    frames_seq: List,
+    w: int,
+    h: int,
+    baseline_landmarks=None,
+    smooth_win: int = 5,
+) -> Tuple[int, Dict[str, Any]]:
     """
-    找抬眉峰值帧
+    找抬眉峰值帧 + 生成可解释性曲线数据（peak_debug）
 
-    使用眉眼距最大的帧作为峰值帧
-    如果有基线，使用眉眼距变化度最大的帧
+    选择逻辑：
+    - 有 baseline_landmarks：使用 “眉眼距变化量 change = current - baseline” 的均值（左右平均）最大作为峰值
+    - 无 baseline_landmarks：使用 “眉眼距 bed” 的均值（左右平均）最大作为峰值
+
+    同时输出曲线（左右/均值），并在 peak_debug 里记录 peak_idx，方便画图标注。
     """
-    max_bed = -1.0
-    max_idx = 0
+
+    n = len(landmarks_seq)
+    if n == 0:
+        return 0, {}
+
+    left_series = [None] * n
+    right_series = [None] * n
+    mean_series = [None] * n
+
+    # 记录原始值（用于你调试：bed 或 change 的 px 值）
+    left_raw = [None] * n
+    right_raw = [None] * n
+    mean_raw = [None] * n
+
+    # 选择依据
+    if baseline_landmarks is not None:
+        metric_name = "BED_change_px"  # 相对静息变化（像素）
+    else:
+        metric_name = "BED_abs_px"     # 绝对眉眼距（像素）
+
+    # 逐帧计算
+    best_val = -1e18
+    best_idx = 0
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
             continue
 
-        if baseline_landmarks is not None:
-            # 使用变化度
-            left_change = compute_brow_eye_distance_change(lm, baseline_landmarks, w, h, left=True)
-            right_change = compute_brow_eye_distance_change(lm, baseline_landmarks, w, h, left=False)
-            # 取两侧变化度的平均
-            avg_change = (left_change["change"] + right_change["change"]) / 2
-            if avg_change > max_bed:
-                max_bed = avg_change
-                max_idx = i
+        try:
+            if baseline_landmarks is not None:
+                # 变化量：当前 - baseline
+                lc = compute_brow_eye_distance_change(lm, baseline_landmarks, w, h, left=True)
+                rc = compute_brow_eye_distance_change(lm, baseline_landmarks, w, h, left=False)
+
+                lv = float(lc["change"])
+                rv = float(rc["change"])
+            else:
+                # 绝对值：当前眉眼距
+                bed = compute_brow_eye_distance_ratio(lm, w, h)
+                lv = float(bed["left_distance"])
+                rv = float(bed["right_distance"])
+
+            mv = 0.5 * (lv + rv)
+
+            left_raw[i] = lv
+            right_raw[i] = rv
+            mean_raw[i] = mv
+
+            # 用 raw 值作为时序曲线（同一视频内像素尺度一致，可解释性直观）
+            left_series[i] = lv
+            right_series[i] = rv
+            mean_series[i] = mv
+
+            if mv > best_val:
+                best_val = mv
+                best_idx = i
+        except Exception:
+            continue
+
+    # 简单平滑（避免抖动导致选到噪声尖峰）
+    def _smooth(arr: List[Optional[float]], win: int) -> List[Optional[float]]:
+        if win <= 1:
+            return arr
+        half = win // 2
+        out = [None] * len(arr)
+        for k in range(len(arr)):
+            a = max(0, k - half)
+            b = min(len(arr), k + half + 1)
+            seg = [v for v in arr[a:b] if v is not None]
+            out[k] = float(sum(seg) / len(seg)) if seg else None
+        return out
+
+    left_s = _smooth(left_series, smooth_win)
+    right_s = _smooth(right_series, smooth_win)
+    mean_s = _smooth(mean_series, smooth_win)
+
+    # 平滑后重新选一次峰值（更稳）
+    best_val2 = -1e18
+    best_idx2 = best_idx
+    for i, v in enumerate(mean_s):
+        if v is None:
+            continue
+        if v > best_val2:
+            best_val2 = v
+            best_idx2 = i
+
+    peak_idx = int(best_idx2)
+
+    peak_debug = {
+        "metric": metric_name,
+        "smooth_win": int(smooth_win),
+
+        "left_curve": left_s,
+        "right_curve": right_s,
+        "mean_curve": mean_s,
+
+        "left_raw": left_raw,
+        "right_raw": right_raw,
+        "mean_raw": mean_raw,
+
+        "peak_idx": peak_idx,
+        "peak_value": float(mean_s[peak_idx]) if mean_s[peak_idx] is not None else None,
+    }
+
+    return peak_idx, peak_debug
+
+
+def extract_raise_eyebrow_sequences(
+        landmarks_seq: List,
+        w: int, h: int,
+        baseline_landmarks=None
+) -> Dict[str, List[float]]:
+    """
+    提取抬眉关键指标的时序序列
+
+    Returns:
+        包含眉眼距和变化度的时序数据
+    """
+    left_bed_seq = []
+    right_bed_seq = []
+    avg_bed_seq = []
+    left_change_seq = []
+    right_change_seq = []
+
+    for lm in landmarks_seq:
+        if lm is None:
+            left_bed_seq.append(np.nan)
+            right_bed_seq.append(np.nan)
+            avg_bed_seq.append(np.nan)
+            left_change_seq.append(np.nan)
+            right_change_seq.append(np.nan)
         else:
-            # 使用绝对值
             bed_result = compute_brow_eye_distance_ratio(lm, w, h)
-            avg_bed = (bed_result["left_distance"] + bed_result["right_distance"]) / 2
-            if avg_bed > max_bed:
-                max_bed = avg_bed
-                max_idx = i
+            left_bed_seq.append(bed_result["left_distance"])
+            right_bed_seq.append(bed_result["right_distance"])
+            avg_bed_seq.append((bed_result["left_distance"] + bed_result["right_distance"]) / 2)
 
-    return max_idx
+            if baseline_landmarks is not None:
+                left_change = compute_brow_eye_distance_change(lm, baseline_landmarks, w, h, left=True)
+                right_change = compute_brow_eye_distance_change(lm, baseline_landmarks, w, h, left=False)
+                left_change_seq.append(left_change["change"])
+                right_change_seq.append(right_change["change"])
+            else:
+                left_change_seq.append(np.nan)
+                right_change_seq.append(np.nan)
 
+    return {
+        "Left BED": left_bed_seq,
+        "Right BED": right_bed_seq,
+        "Average BED": avg_bed_seq,
+        "Left Change": left_change_seq,
+        "Right Change": right_change_seq,
+    }
+
+
+def plot_raise_eyebrow_peak_selection(
+        sequences: Dict[str, List[float]],
+        fps: float,
+        peak_idx: int,
+        output_path: Path,
+        has_baseline: bool = False
+) -> None:
+    """
+    绘制抬眉关键帧选择的可解释性曲线
+
+    抬眉选择标准:
+    - 有基线时：眉眼距变化度最大
+    - 无基线时：眉眼距绝对值最大
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    n_frames = len(sequences["Left BED"])
+    frames = np.arange(n_frames)
+    time_sec = frames / fps if fps > 0 else frames
+    x_label = 'Time (seconds)' if fps > 0 else 'Frame'
+    peak_time = peak_idx / fps if fps > 0 else peak_idx
+
+    if has_baseline:
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+        # 上图: 眉眼距变化曲线 (关键帧选择依据)
+        ax1 = axes[0]
+        ax1.plot(time_sec, sequences["Left Change"], 'b-', label='Left BED Change', linewidth=2)
+        ax1.plot(time_sec, sequences["Right Change"], 'r-', label='Right BED Change', linewidth=2)
+
+        # 计算平均变化
+        avg_change = [(l + r) / 2 if not (np.isnan(l) or np.isnan(r)) else np.nan
+                      for l, r in zip(sequences["Left Change"], sequences["Right Change"])]
+        ax1.plot(time_sec, avg_change, 'g--', label='Average Change', linewidth=2, alpha=0.7)
+
+        # 标注峰值帧
+        ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
+        change_at_peak = avg_change[peak_idx] if peak_idx < len(avg_change) else 0
+        ax1.scatter([peak_time], [change_at_peak], color='green', s=150, zorder=5,
+                    edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
+        ax1.annotate(f'Max: {change_at_peak:.1f}px', xy=(peak_time, change_at_peak),
+                     xytext=(10, 10), textcoords='offset points', fontsize=10, fontweight='bold')
+
+        ax1.axhline(y=0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
+        ax1.set_xlabel(x_label, fontsize=11)
+        ax1.set_ylabel('Distance Change (pixels)', fontsize=11)
+        ax1.set_title('RaiseEyebrow Peak Selection: Maximum BED Change from Baseline', fontsize=13, fontweight='bold')
+        ax1.legend(loc='best')
+        ax1.grid(True, alpha=0.3)
+
+        # 下图: 眉眼距绝对值
+        ax2 = axes[1]
+    else:
+        fig, ax2 = plt.subplots(figsize=(12, 5))
+
+    # 眉眼距绝对值曲线
+    ax2.plot(time_sec, sequences["Left BED"], 'b-', label='Left BED', linewidth=2)
+    ax2.plot(time_sec, sequences["Right BED"], 'r-', label='Right BED', linewidth=2)
+    ax2.plot(time_sec, sequences["Average BED"], 'g--', label='Average BED', linewidth=2, alpha=0.7)
+
+    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7, label=f'Peak Frame {peak_idx}')
+
+    # 在峰值帧标注值
+    for name, seq, color in [("Left", sequences["Left BED"], 'blue'),
+                             ("Right", sequences["Right BED"], 'red')]:
+        if peak_idx < len(seq) and not np.isnan(seq[peak_idx]):
+            ax2.scatter([peak_time], [seq[peak_idx]], color=color, s=80, zorder=5,
+                        edgecolors='white', linewidths=1.5)
+
+    ax2.set_xlabel(x_label, fontsize=11)
+    ax2.set_ylabel('Distance (pixels)', fontsize=11)
+    title = 'Brow-Eye Distance Over Time' if has_baseline else 'RaiseEyebrow Peak Selection: Maximum BED'
+    ax2.set_title(title, fontsize=12 if has_baseline else 13, fontweight='bold')
+    ax2.legend(loc='best')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def save_brow_curve_plot(peak_debug: Dict[str, Any], save_path: Path):
+    """
+    画“眉眼距/眉眼距变化量”的时序曲线，并标注关键帧点（peak_idx）
+    输出：brow_curve.png
+    """
+    if not peak_debug:
+        return
+
+    x = list(range(len(peak_debug.get("mean_curve", []))))
+    left = peak_debug.get("left_curve", [])
+    right = peak_debug.get("right_curve", [])
+    mean = peak_debug.get("mean_curve", [])
+    peak_idx = int(peak_debug.get("peak_idx", 0))
+    metric = peak_debug.get("metric", "BED")
+
+    def _to_xy(arr):
+        xs, ys = [], []
+        for i, v in enumerate(arr):
+            if v is None:
+                continue
+            xs.append(i)
+            ys.append(v)
+        return xs, ys
+
+    xl, yl = _to_xy(left)
+    xr, yr = _to_xy(right)
+    xm, ym = _to_xy(mean)
+
+    plt.figure(figsize=(10, 6))
+    if xl:
+        plt.plot(xl, yl, label="Left (BED)")
+    if xr:
+        plt.plot(xr, yr, label="Right (BED)")
+    if xm:
+        plt.plot(xm, ym, label="Mean (BED)")
+
+    # 标注关键帧：竖线 + 点
+    if 0 <= peak_idx < len(mean) and mean[peak_idx] is not None:
+        plt.axvline(peak_idx, linestyle="--")
+        plt.scatter([peak_idx], [mean[peak_idx]], zorder=5)
+        plt.text(peak_idx, mean[peak_idx], f" peak={peak_idx}", fontsize=10)
+
+    plt.title(f"RaiseEyebrow curve ({metric})")
+    plt.xlabel("Frame")
+    plt.ylabel("Value (px)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(str(save_path))
+    plt.close()
 
 def compute_raise_eyebrow_metrics(landmarks, w: int, h: int,
                                   baseline_landmarks=None) -> Dict[str, Any]:
@@ -86,21 +359,41 @@ def compute_raise_eyebrow_metrics(landmarks, w: int, h: int,
 
     # 如果有基线，计算变化度
     if baseline_landmarks is not None:
-        bedc_result = compute_brow_eye_distance_change_ratio(landmarks, baseline_landmarks, w, h)
-        metrics["left_change"] = bedc_result["left_change"]
-        metrics["right_change"] = bedc_result["right_change"]
-        metrics["change_ratio"] = bedc_result["ratio"]
-        metrics["left_baseline_distance"] = bedc_result["left_baseline_distance"]
-        metrics["right_baseline_distance"] = bedc_result["right_baseline_distance"]
+        # ========== 计算统一 scale ==========
+        scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+        metrics["scale"] = scale
+        # ====================================
 
-        # 计算变化百分比
-        if bedc_result["left_baseline_distance"] > 1e-9:
-            metrics["left_change_percent"] = bedc_result["left_change"] / bedc_result["left_baseline_distance"] * 100
+        baseline_bed = compute_brow_eye_distance_ratio(baseline_landmarks, w, h)
+
+        # ========== 缩放到 baseline 尺度后计算变化 ==========
+        left_scaled = bed_result["left_distance"] * scale
+        right_scaled = bed_result["right_distance"] * scale
+
+        left_change = left_scaled - baseline_bed["left_distance"]
+        right_change = right_scaled - baseline_bed["right_distance"]
+        # ===================================================
+
+        metrics["left_change"] = left_change
+        metrics["right_change"] = right_change
+
+        # 变化比值
+        if abs(right_change) > 1e-9:
+            metrics["change_ratio"] = left_change / right_change
+        else:
+            metrics["change_ratio"] = 1.0 if abs(left_change) < 1e-9 else float('inf')
+
+        metrics["left_baseline_distance"] = baseline_bed["left_distance"]
+        metrics["right_baseline_distance"] = baseline_bed["right_distance"]
+
+        # 变化百分比
+        if baseline_bed["left_distance"] > 1e-9:
+            metrics["left_change_percent"] = left_change / baseline_bed["left_distance"] * 100
         else:
             metrics["left_change_percent"] = 0
 
-        if bedc_result["right_baseline_distance"] > 1e-9:
-            metrics["right_change_percent"] = bedc_result["right_change"] / bedc_result["right_baseline_distance"] * 100
+        if baseline_bed["right_distance"] > 1e-9:
+            metrics["right_change_percent"] = right_change / baseline_bed["right_distance"] * 100
         else:
             metrics["right_change_percent"] = 0
 
@@ -235,11 +528,36 @@ def visualize_brow_eye_distance(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.circle(img, (int(left_eye_inner[0]), int(left_eye_inner[1])), 5, (255, 0, 0), -1)
     cv2.circle(img, (int(right_eye_inner[0]), int(right_eye_inner[1])), 5, (255, 0, 0), -1)
 
-    # 绘制眉眼距连线 (黄色)
-    cv2.line(img, (int(left_eye_inner[0]), int(left_eye_inner[1])),
-             (int(left_brow_centroid[0]), int(left_brow_centroid[1])), (0, 255, 255), 2)
-    cv2.line(img, (int(right_eye_inner[0]), int(right_eye_inner[1])),
-             (int(right_brow_centroid[0]), int(right_brow_centroid[1])), (0, 255, 255), 2)
+    # 画“眼部水平线(内眦连线延长到眉毛极值范围)” + “眉毛质心到该线的垂线”
+    bedL = compute_brow_eye_distance(landmarks, w, h, left=True)
+    bedR = compute_brow_eye_distance(landmarks, w, h, left=False)
+
+    # 眼部水平线（端点对齐到 300/70）
+    p0 = bedL.get("eye_line_p0", left_eye_inner)
+    p1 = bedL.get("eye_line_p1", right_eye_inner)
+    cv2.line(img, (int(p0[0]), int(p0[1])), (int(p1[0]), int(p1[1])), (0, 255, 0), 2)
+
+    # 画眉毛极值点（可选：你想看“对齐范围”就保留）
+    bl = bedL.get("brow_extreme_left", None)  # index 300
+    br = bedL.get("brow_extreme_right", None)  # index 70
+    if bl is not None:
+        cv2.circle(img, (int(bl[0]), int(bl[1])), 4, (0, 255, 0), -1)
+    if br is not None:
+        cv2.circle(img, (int(br[0]), int(br[1])), 4, (0, 255, 0), -1)
+
+    # 左侧垂线
+    footL = bedL.get("foot", None)
+    if footL is not None:
+        cv2.line(img, (int(left_brow_centroid[0]), int(left_brow_centroid[1])),
+                 (int(footL[0]), int(footL[1])), (0, 255, 255), 2)
+        cv2.circle(img, (int(footL[0]), int(footL[1])), 4, (0, 255, 255), -1)
+
+    # 右侧垂线
+    footR = bedR.get("foot", None)
+    if footR is not None:
+        cv2.line(img, (int(right_brow_centroid[0]), int(right_brow_centroid[1])),
+                 (int(footR[0]), int(footR[1])), (0, 255, 255), 2)
+        cv2.circle(img, (int(footR[0]), int(footR[1])), 4, (0, 255, 255), -1)
 
     # 信息面板
     panel_h = 280
@@ -331,9 +649,12 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         return None
 
     # 找峰值帧
-    peak_idx = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
+    peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
+
+    # 提取时序序列用于可视化
+    sequences = extract_raise_eyebrow_sequences(landmarks_seq, w, h, baseline_landmarks)
 
     if peak_landmarks is None:
         return None
@@ -382,13 +703,24 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
             "left_change_percent": metrics.get("left_change_percent", 0),
             "right_change_percent": metrics.get("right_change_percent", 0),
         })
+    result.action_specific["peak_debug"] = peak_debug
 
     # 创建输出目录
     action_dir = output_dir / ACTION_NAME
     action_dir.mkdir(parents=True, exist_ok=True)
 
+    save_brow_curve_plot(peak_debug, action_dir / "brow_curve.png")
     # 保存原始帧
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
+
+    # 绘制关键帧选择曲线
+    plot_raise_eyebrow_peak_selection(
+        sequences,
+        video_info.get("fps", 30.0),
+        peak_idx,
+        action_dir / "peak_selection_curve.png",
+        has_baseline=(baseline_landmarks is not None)
+    )
 
     # 保存可视化
     baseline_metrics = None

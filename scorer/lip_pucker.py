@@ -32,31 +32,12 @@ from clinical_base import (
     LM, pt2d, pt3d, pts2d, dist, compute_ear, compute_eye_area,
     compute_mouth_metrics, compute_oral_angle, compute_lip_seal_distance,
     compute_icd, extract_common_indicators,
-    ActionResult, draw_polygon
+    ActionResult, draw_polygon, compute_scale_to_baseline,
+    kabsch_rigid_transform, apply_rigid_transform,
 )
 
 ACTION_NAME = "LipPucker"
 ACTION_NAME_CN = "撅嘴"
-
-
-def _kabsch_rigid(P: np.ndarray, Q: np.ndarray):
-    """把当前帧稳定点 P 刚体对齐到基线稳定点 Q，返回 R,t"""
-    if P is None or Q is None or P.shape[0] < 3 or Q.shape[0] < 3:
-        return None, None
-    Pc = P.mean(axis=0); Qc = Q.mean(axis=0)
-    X = P - Pc; Y = Q - Qc
-    H = X.T @ Y
-    U, S, Vt = np.linalg.svd(H)
-    R = Vt.T @ U.T
-    if np.linalg.det(R) < 0:
-        Vt[-1, :] *= -1
-        R = Vt.T @ U.T
-    t = Qc - (R @ Pc)
-    return R, t
-
-
-def _apply_rt(points: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    return (R @ points.T).T + t
 
 
 def _mean_lip_z_aligned(landmarks, w: int, h: int, baseline_landmarks=None) -> float:
@@ -90,7 +71,7 @@ def _mean_lip_z_aligned(landmarks, w: int, h: int, baseline_landmarks=None) -> f
 
     P = np.asarray(P, dtype=np.float64)
     Q = np.asarray(Q, dtype=np.float64)
-    Rm, t = _kabsch_rigid(P, Q)
+    Rm, t = kabsch_rigid_transform(P, Q)
     if Rm is None:
         # 对齐失败就退化
         return _mean_lip_z_aligned(landmarks, w, h, baseline_landmarks=None)
@@ -101,7 +82,7 @@ def _mean_lip_z_aligned(landmarks, w: int, h: int, baseline_landmarks=None) -> f
         x, y, z = pt3d(landmarks[idx], w, h)
         cur.append([x, y, z])
     cur = np.asarray(cur, dtype=np.float64)
-    cur_aligned = _apply_rt(cur, Rm, t)
+    cur_aligned = apply_rigid_transform(cur, Rm, t)
 
     return float(np.mean(cur_aligned[:, 2]))
 
@@ -218,7 +199,7 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
 def compute_lip_pucker_metrics(landmarks, w: int, h: int,
                                baseline_landmarks=None) -> Dict[str, Any]:
-    """计算撅嘴特有指标"""
+    """计算撅嘴特有指标 - 使用统一 scale"""
     mouth = compute_mouth_metrics(landmarks, w, h)
     oral = compute_oral_angle(landmarks, w, h)
 
@@ -245,37 +226,39 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
         }
     }
 
-    # 如果有基线，计算变化
+    # 如果有基线，计算变化（统一尺度）
     if baseline_landmarks is not None:
+        # ========== 计算统一 scale ==========
+        scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+        metrics["scale"] = scale
+        # ====================================
+
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
-        baseline_oral = compute_oral_angle(baseline_landmarks, w, h)
-        baseline_left = baseline_mouth["left_corner"]
-        baseline_right = baseline_mouth["right_corner"]
+
+        # ========== 缩放到 baseline 尺度 ==========
+        scaled_width = mouth["width"] * scale
+        scaled_height = mouth["height"] * scale
+
+        width_change = scaled_width - baseline_mouth["width"]
+        height_change = scaled_height - baseline_mouth["height"]
+        # ==========================================
 
         metrics["baseline"] = {
             "mouth_width": baseline_mouth["width"],
             "mouth_height": baseline_mouth["height"],
         }
 
-        # 变化量
-        metrics["width_change"] = mouth["width"] - baseline_mouth["width"]
-        metrics["height_change"] = mouth["height"] - baseline_mouth["height"]
+        metrics["width_change"] = width_change
+        metrics["height_change"] = height_change
+
+        # 宽度收缩比（撅嘴时应 < 1）
+        metrics["width_ratio"] = scaled_width / baseline_mouth["width"] if baseline_mouth["width"] > 1e-9 else 1.0
 
         # 变化百分比
         if baseline_mouth["width"] > 1e-9:
-            metrics["width_change_percent"] = (mouth["width"] - baseline_mouth["width"]) / baseline_mouth["width"] * 100
+            metrics["width_change_percent"] = width_change / baseline_mouth["width"] * 100
         else:
             metrics["width_change_percent"] = 0
-
-        # 收缩比例 (撅嘴时应该<1)
-        metrics["width_ratio"] = mouth["width"] / baseline_mouth["width"] if baseline_mouth["width"] > 1e-9 else 1.0
-
-        # 嘴角位移
-        left_excursion = dist(left_corner, baseline_left)
-        right_excursion = dist(right_corner, baseline_right)
-        metrics["left_excursion"] = left_excursion
-        metrics["right_excursion"] = right_excursion
-        metrics["excursion_ratio"] = left_excursion / right_excursion if right_excursion > 1e-9 else 1.0
 
     return metrics
 
