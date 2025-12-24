@@ -29,8 +29,11 @@ from clinical_base import (
     compute_brow_eye_distance, compute_brow_eye_distance_ratio,
     compute_brow_eye_distance_change, compute_brow_eye_distance_change_ratio,
     compute_brow_centroid, compute_scale_to_baseline,
-    ActionResult, draw_polygon, draw_landmarks
+    ActionResult, draw_polygon, draw_landmarks,
+    add_valid_region_shading, get_palsy_side_text,
 )
+
+from thresholds import THR
 
 ACTION_NAME = "RaiseEyebrow"
 ACTION_NAME_CN = "抬眉/皱额"
@@ -213,7 +216,9 @@ def plot_raise_eyebrow_peak_selection(
         fps: float,
         peak_idx: int,
         output_path: Path,
-        has_baseline: bool = False
+        has_baseline: bool = False,
+        valid_mask: List[bool] = None,
+        palsy_detection: Dict[str, Any] = None
 ) -> None:
     """
     绘制抬眉关键帧选择的可解释性曲线
@@ -233,10 +238,13 @@ def plot_raise_eyebrow_peak_selection(
     peak_time = peak_idx / fps if fps > 0 else peak_idx
 
     if has_baseline:
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+        fig, axes = plt.subplots(2, 1, figsize=(16, 9))
 
         # 上图: 眉眼距变化曲线 (关键帧选择依据)
         ax1 = axes[0]
+        if valid_mask is not None:
+            add_valid_region_shading(ax1, valid_mask, time_sec)
+
         ax1.plot(time_sec, sequences["Left Change"], 'b-', label='Left BED Change', linewidth=2)
         ax1.plot(time_sec, sequences["Right Change"], 'r-', label='Right BED Change', linewidth=2)
 
@@ -245,46 +253,67 @@ def plot_raise_eyebrow_peak_selection(
                       for l, r in zip(sequences["Left Change"], sequences["Right Change"])]
         ax1.plot(time_sec, avg_change, 'g--', label='Average Change', linewidth=2, alpha=0.7)
 
-        # 标注峰值帧
         ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
         change_at_peak = avg_change[peak_idx] if peak_idx < len(avg_change) else 0
-        ax1.scatter([peak_time], [change_at_peak], color='green', s=150, zorder=5,
-                    edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
-        ax1.annotate(f'Max: {change_at_peak:.1f}px', xy=(peak_time, change_at_peak),
-                     xytext=(10, 10), textcoords='offset points', fontsize=10, fontweight='bold')
+        if not np.isnan(change_at_peak):
+            ax1.scatter([peak_time], [change_at_peak], color='red', s=150, zorder=5,
+                        edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
 
-        ax1.axhline(y=0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
         ax1.set_xlabel(x_label, fontsize=11)
-        ax1.set_ylabel('Distance Change (pixels)', fontsize=11)
-        ax1.set_title('RaiseEyebrow Peak Selection: Maximum BED Change from Baseline', fontsize=13, fontweight='bold')
+        ax1.set_ylabel('BED Change (pixels)', fontsize=11)
+
+        title = 'RaiseEyebrow Peak Selection: Maximum BED Change'
+        if palsy_detection:
+            palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
+            title += f' | Detected: {palsy_text}'
+        ax1.set_title(title, fontsize=13, fontweight='bold')
         ax1.legend(loc='best')
         ax1.grid(True, alpha=0.3)
 
         # 下图: 眉眼距绝对值
         ax2 = axes[1]
+
+        if valid_mask is not None:
+            add_valid_region_shading(ax2, valid_mask, time_sec)
+
+        ax2.plot(time_sec, sequences["Left BED"], 'b-', label='Left BED', linewidth=2)
+        ax2.plot(time_sec, sequences["Right BED"], 'r-', label='Right BED', linewidth=2)
+        ax2.plot(time_sec, sequences["Average BED"], 'g--', label='Average BED', linewidth=1.5, alpha=0.7)
+        ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
+
+        ax2.set_xlabel(x_label, fontsize=11)
+        ax2.set_ylabel('BED (pixels)', fontsize=11)
+        ax2.set_title('Brow-Eye Distance Over Time', fontsize=12)
+        ax2.legend(loc='best')
+        ax2.grid(True, alpha=0.3)
+
     else:
-        fig, ax2 = plt.subplots(figsize=(12, 5))
+        # 没有基线时只画一张图
+        fig, ax = plt.subplots(figsize=(16, 5))  # 增加宽度
 
-    # 眉眼距绝对值曲线
-    ax2.plot(time_sec, sequences["Left BED"], 'b-', label='Left BED', linewidth=2)
-    ax2.plot(time_sec, sequences["Right BED"], 'r-', label='Right BED', linewidth=2)
-    ax2.plot(time_sec, sequences["Average BED"], 'g--', label='Average BED', linewidth=2, alpha=0.7)
+        if valid_mask is not None:
+            add_valid_region_shading(ax, valid_mask, time_sec)
 
-    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7, label=f'Peak Frame {peak_idx}')
+        ax.plot(time_sec, sequences["Left BED"], 'b-', label='Left BED', linewidth=2)
+        ax.plot(time_sec, sequences["Right BED"], 'r-', label='Right BED', linewidth=2)
+        ax.plot(time_sec, sequences["Average BED"], 'g--', label='Average BED', linewidth=2, alpha=0.7)
 
-    # 在峰值帧标注值
-    for name, seq, color in [("Left", sequences["Left BED"], 'blue'),
-                             ("Right", sequences["Right BED"], 'red')]:
-        if peak_idx < len(seq) and not np.isnan(seq[peak_idx]):
-            ax2.scatter([peak_time], [seq[peak_idx]], color=color, s=80, zorder=5,
-                        edgecolors='white', linewidths=1.5)
+        ax.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
+        bed_at_peak = sequences["Average BED"][peak_idx] if peak_idx < len(sequences["Average BED"]) else 0
+        if not np.isnan(bed_at_peak):
+            ax.scatter([peak_time], [bed_at_peak], color='red', s=150, zorder=5,
+                       edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
 
-    ax2.set_xlabel(x_label, fontsize=11)
-    ax2.set_ylabel('Distance (pixels)', fontsize=11)
-    title = 'Brow-Eye Distance Over Time' if has_baseline else 'RaiseEyebrow Peak Selection: Maximum BED'
-    ax2.set_title(title, fontsize=12 if has_baseline else 13, fontweight='bold')
-    ax2.legend(loc='best')
-    ax2.grid(True, alpha=0.3)
+        ax.set_xlabel(x_label, fontsize=11)
+        ax.set_ylabel('Brow-Eye Distance (pixels)', fontsize=11)
+
+        title = 'RaiseEyebrow Peak Selection: Maximum BED'
+        if palsy_detection:
+            palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
+            title += f' | Detected: {palsy_text}'
+        ax.set_title(title, fontsize=13, fontweight='bold')
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(str(output_path), dpi=150, bbox_inches='tight')

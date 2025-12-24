@@ -99,8 +99,9 @@ class LM:
     CHEEK_L = [425, 426, 427, 411, 280]
     CHEEK_R = [205, 206, 207, 187, 50]
 
-    BLOW_CHEEK_L = [280, 376, 433, 364, 430, 422, 423, 266,]
-    BLOW_CHEEK_R = [50, 147, 213, 135, 210, 202, 203, 36,]
+    BLOW_CHEEK_L = [280, 376, 433, 367, 364, 430, 273, 423, 266, ]
+    BLOW_CHEEK_R = [50, 147, 213, 138, 135, 210, 43, 203, 36, ]
+
 
 # =============================================================================
 # JSON 序列化安全转换（处理 numpy.bool_ / numpy.float32 等）
@@ -1680,3 +1681,117 @@ def detect_palsy_side_from_excursion(left_excursion: float, right_excursion: flo
         result["interpretation"] = f"右侧运动较弱 (R={right_excursion:.1f} < L={left_excursion:.1f})"
 
     return result
+
+
+# =============================================================================
+# 通用绘图辅助函数
+# =============================================================================
+
+def add_valid_region_shading(ax, valid_mask: List[bool], time_or_frames: np.ndarray,
+                             alpha: float = 0.15) -> None:
+    """
+    在曲线图中标注 valid/invalid 区域
+
+    Args:
+        ax: matplotlib axes
+        valid_mask: valid 状态的布尔列表
+        time_or_frames: x 轴数值（时间或帧号）
+        alpha: 无效区域的透明度
+    """
+    if valid_mask is None or len(valid_mask) == 0:
+        return
+
+    valid_arr = np.array(valid_mask, dtype=bool)
+    n = len(valid_arr)
+    if n != len(time_or_frames):
+        return
+
+    # 找出 invalid 区域并着色
+    in_invalid = False
+    start_idx = 0
+
+    for i in range(n):
+        if not valid_arr[i] and not in_invalid:
+            # 进入 invalid 区域
+            start_idx = i
+            in_invalid = True
+        elif valid_arr[i] and in_invalid:
+            # 离开 invalid 区域
+            ax.axvspan(time_or_frames[start_idx], time_or_frames[i - 1],
+                       color='red', alpha=alpha, label='Invalid' if start_idx == 0 else None)
+            in_invalid = False
+
+    # 处理末尾的 invalid 区域
+    if in_invalid:
+        ax.axvspan(time_or_frames[start_idx], time_or_frames[n - 1],
+                   color='red', alpha=alpha)
+
+
+def get_palsy_side_text(palsy_side: int, confidence: float = None) -> str:
+    """
+    根据患侧编码返回显示文本
+
+    Args:
+        palsy_side: 0=无/对称, 1=左侧, 2=右侧
+        confidence: 置信度（可选）
+
+    Returns:
+        显示用的文本
+    """
+    side_map = {0: "Normal/Symmetric", 1: "Left Palsy", 2: "Right Palsy"}
+    text = side_map.get(palsy_side, "Unknown")
+    if confidence is not None and confidence > 0:
+        text += f" ({confidence * 100:.0f}%)"
+    return text
+
+
+def get_palsy_side_color(palsy_side: int) -> Tuple[int, int, int]:
+    """
+    根据患侧编码返回显示颜色 (BGR格式)
+
+    Args:
+        palsy_side: 0=无/对称, 1=左侧, 2=右侧
+
+    Returns:
+        BGR颜色元组
+    """
+    color_map = {
+        0: (0, 255, 0),  # 绿色 - 正常
+        1: (0, 0, 255),  # 红色 - 左侧面瘫
+        2: (255, 0, 0),  # 蓝色 - 右侧面瘫
+    }
+    return color_map.get(palsy_side, (255, 255, 255))
+
+
+def draw_palsy_side_label(img: np.ndarray, palsy_detection: Dict[str, Any],
+                          x: int = 10, y: int = 25) -> np.ndarray:
+    """
+    在图像左上角绘制患侧标签
+
+    Args:
+        img: 图像
+        palsy_detection: 包含 palsy_side, confidence, interpretation 的字典
+        x, y: 标签位置
+
+    Returns:
+        绘制后的图像
+    """
+    if not palsy_detection:
+        return img
+
+    palsy_side = palsy_detection.get("palsy_side", 0)
+    confidence = palsy_detection.get("confidence", 0)
+    interpretation = palsy_detection.get("interpretation", "")
+
+    color = get_palsy_side_color(palsy_side)
+    text = get_palsy_side_text(palsy_side, confidence)
+
+    # 绘制背景框
+    (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    cv2.rectangle(img, (x - 2, y - text_h - 5), (x + text_w + 5, y + 5), (0, 0, 0), -1)
+    cv2.rectangle(img, (x - 2, y - text_h - 5), (x + text_w + 5, y + 5), color, 2)
+
+    # 绘制文本
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    return img

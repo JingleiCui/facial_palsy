@@ -41,6 +41,8 @@ from sunnybrook_scorer import (
     compute_sunnybrook_composite, SUNNYBROOK_EXPRESSION_MAPPING
 )
 
+from thresholds import THR
+
 # 导入动作模块
 import neutral_face
 import eye_blink
@@ -129,7 +131,7 @@ def process_action_generic(landmarks_seq, frames_seq, w, h, video_info, output_d
 
     # --- Smile ---
     elif action_name == "Smile":
-        return smile.process_smile(
+        return smile.process(
             landmarks_seq, frames_seq, w, h, video_info, output_dir,
             baseline_result, baseline_landmarks
         )

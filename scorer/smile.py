@@ -25,18 +25,27 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import math
 import json
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
     compute_mouth_metrics, compute_oral_angle, compute_icd,
     extract_common_indicators, compute_scale_to_baseline,
     ActionResult, OralAngleMeasure, draw_polygon,
+    add_valid_region_shading, get_palsy_side_text,
+    draw_palsy_side_label,
 )
+
+from thresholds import THR
 
 from sunnybrook_scorer import (
     VoluntaryMovementItem, compute_voluntary_score_from_ratio
 )
 
+ACTION_NAME ="Smile"
+ACTION_NAME_CN ="微笑"
 
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
     """找微笑峰值帧 (嘴宽最大)"""
@@ -94,18 +103,16 @@ def plot_smile_peak_selection(
         fps: float,
         peak_idx: int,
         output_path: Path,
-        action_name: str = "Smile"
+        action_name: str = ACTION_NAME,
+        valid_mask: List[bool] = None,
+        palsy_detection: Dict[str, Any] = None
 ) -> None:
     """
     绘制微笑关键帧选择的可解释性曲线
 
     微笑选择标准: 嘴宽最大的帧
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    fig, axes = plt.subplots(2, 1, figsize=(16, 9))  # 增加宽度
 
     n_frames = len(sequences["Mouth Width"])
     frames = np.arange(n_frames)
@@ -115,6 +122,11 @@ def plot_smile_peak_selection(
 
     # 上图: 嘴宽曲线 (关键帧选择依据)
     ax1 = axes[0]
+
+    # 标注 valid/invalid 区域
+    if valid_mask is not None:
+        add_valid_region_shading(ax1, valid_mask, time_sec)
+
     mouth_width = sequences["Mouth Width"]
     ax1.plot(time_sec, mouth_width, 'g-', label='Mouth Width', linewidth=2)
 
@@ -128,12 +140,22 @@ def plot_smile_peak_selection(
 
     ax1.set_xlabel(x_label, fontsize=11)
     ax1.set_ylabel('Mouth Width (pixels)', fontsize=11)
-    ax1.set_title(f'{action_name} Peak Selection: Maximum Mouth Width', fontsize=13, fontweight='bold')
+
+    # 在标题中显示患侧信息
+    title = f'{action_name} Peak Selection: Maximum Mouth Width'
+    if palsy_detection:
+        palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
+        title += f' | Detected: {palsy_text}'
+    ax1.set_title(title, fontsize=13, fontweight='bold')
     ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3)
 
     # 下图: 口角角度 (用于患侧判断)
     ax2 = axes[1]
+
+    if valid_mask is not None:
+        add_valid_region_shading(ax2, valid_mask, time_sec)
+
     ax2.plot(time_sec, sequences["AOE (Right)"], 'r-', label='AOE (Right)', linewidth=2)
     ax2.plot(time_sec, sequences["BOF (Left)"], 'b-', label='BOF (Left)', linewidth=2)
     ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7, label=f'Peak Frame {peak_idx}')
@@ -346,6 +368,9 @@ def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
     """可视化微笑指标"""
     img = frame.copy()
 
+    # ========== 在左上角绘制患侧标签 ==========
+    img = draw_palsy_side_label(img, palsy_detection, x=10, y=25)
+
     # 绘制嘴部轮廓
     draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 2)
 
@@ -368,10 +393,10 @@ def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
 
     # 信息面板
     panel_h = 300
-    cv2.rectangle(img, (5, 5), (400, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (400, panel_h), (255, 255, 255), 1)
+    cv2.rectangle(img, (5, 5), (400, panel_h + 50), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, 5), (400, panel_h + 50), (255, 255, 255), 1)
 
-    y = 25
+    y = 75
     cv2.putText(img, f"{result.action_name}", (10, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     y += 30
@@ -409,7 +434,7 @@ def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
 
     # 面瘫侧别检测结果
     palsy_side = palsy_detection.get("palsy_side", 0)
-    palsy_text = {0: "无/对称", 1: "左侧", 2: "右侧"}.get(palsy_side, "未知")
+    palsy_text = {0: "No", 1: "Left", 2: "Right"}.get(palsy_side, "Unknown")
     palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
     cv2.putText(img, f"Palsy Side: {palsy_text}", (10, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)
@@ -422,24 +447,10 @@ def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
     return img
 
 
-def process_smile(landmarks_seq: List, frames_seq: List, w: int, h: int,
-                  video_info: Dict[str, Any], output_dir: Path,
-                  baseline_result: Optional[ActionResult] = None,
-                  baseline_landmarks=None) -> Optional[ActionResult]:
-    """处理Smile动作"""
-    return process(
-        landmarks_seq, frames_seq, w, h, video_info, output_dir,
-        action_name="Smile",
-        action_name_cn="微笑",
-        baseline_result=baseline_result,
-        baseline_landmarks=baseline_landmarks
-    )
-
 def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
-                          video_info: Dict[str, Any], output_dir: Path,
-                          action_name: str, action_name_cn: str,
-                          baseline_result: Optional[ActionResult] = None,
-                          baseline_landmarks=None) -> Optional[ActionResult]:
+          video_info: Dict[str, Any], output_dir: Path,
+          baseline_result: Optional[ActionResult] = None,
+          baseline_landmarks=None) -> Optional[ActionResult]:
     """处理微笑类动作的通用函数"""
     if not landmarks_seq or not frames_seq:
         return None
@@ -457,8 +468,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     # 创建结果对象
     result = ActionResult(
-        action_name=action_name,
-        action_name_cn=action_name_cn,
+        action_name=ACTION_NAME,
+        action_name_cn=ACTION_NAME_CN,
         video_path=video_info.get("file_path", ""),
         total_frames=len(frames_seq),
         peak_frame_idx=peak_idx,
@@ -515,16 +526,18 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         result.action_specific["excursion"] = smile_metrics["excursion"]
 
     # 创建输出目录
-    action_dir = output_dir / action_name
+    action_dir = output_dir / ACTION_NAME
     action_dir.mkdir(parents=True, exist_ok=True)
 
-    # 绘制关键帧选择曲线
+    # 绘制关键帧选择曲线（添加患侧信息）
     plot_smile_peak_selection(
         sequences,
         video_info.get("fps", 30.0),
         peak_idx,
         action_dir / "peak_selection_curve.png",
-        action_name
+        ACTION_NAME,
+        valid_mask=None,  # smile 没有 valid 逻辑，传 None
+        palsy_detection=palsy_detection
     )
 
     # 保存原始帧
@@ -540,7 +553,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
     oral = smile_metrics.get("oral_angle", {})
-    print(f"    [OK] {action_name}: Width={smile_metrics['mouth_width']:.1f}px, Asym={oral.get('asymmetry', 0):.1f}°")
+    print(f"    [OK] {ACTION_NAME}: Width={smile_metrics['mouth_width']:.1f}px, Asym={oral.get('asymmetry', 0):.1f}°")
     print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
     print(f"         Voluntary Score: {result.voluntary_movement_score}/5")
 

@@ -29,6 +29,8 @@ from clinical_base import (
     ActionResult, draw_polygon, compute_scale_to_baseline,
 )
 
+from thresholds import THR
+
 ACTION_NAME = "ShrugNose"
 ACTION_NAME_CN = "皱鼻"
 
@@ -520,7 +522,7 @@ def visualize_shrug_nose(frame: np.ndarray, landmarks, w: int, h: int,
 
     # 面瘫侧别检测结果
     palsy_side = palsy_detection.get("palsy_side", 0)
-    palsy_text = {0: "无/对称", 1: "左侧", 2: "右侧"}.get(palsy_side, "未知")
+    palsy_text = {0: "No", 1: "Left", 2: "Right"}.get(palsy_side, "Unkown")
     palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
     cv2.putText(img, f"Palsy Side: {palsy_text}", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)

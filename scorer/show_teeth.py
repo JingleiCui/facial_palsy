@@ -36,6 +36,8 @@ from sunnybrook_scorer import (
     VoluntaryMovementItem, compute_voluntary_score_from_ratio
 )
 
+from thresholds import THR
+
 ACTION_NAME = "ShowTeeth"
 ACTION_NAME_CN = "露齿"
 

@@ -24,8 +24,11 @@ from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
     compute_palpebral_height, compute_mouth_metrics,
     compute_oral_angle, compute_icd, extract_common_indicators,
-    ActionResult, draw_polygon, compute_scale_to_baseline
+    ActionResult, draw_polygon, compute_scale_to_baseline,
+    add_valid_region_shading, get_palsy_side_text,
 )
+
+from thresholds import THR
 
 
 def find_peak_frame_blink(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
@@ -155,28 +158,40 @@ def plot_ear_curve(ear_seq: Dict[str, List[float]],
                    fps: float,
                    peak_idx: int,
                    output_path: Path,
-                   action_name: str) -> None:
+                   action_name: str,
+                   valid_mask: List[bool] = None,
+                   palsy_detection: Dict[str, Any] = None) -> None:
     """绘制EAR变化曲线"""
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    fig, axes = plt.subplots(2, 1, figsize=(16, 9))
 
     frames = np.arange(len(ear_seq["left"]))
     time_sec = frames / fps if fps > 0 else frames
 
     # 上图: EAR曲线
     ax1 = axes[0]
+    if valid_mask is not None:
+        add_valid_region_shading(ax1, valid_mask, time_sec)
+
     ax1.plot(time_sec, ear_seq["left"], 'b-', label='Left Eye EAR', linewidth=2)
     ax1.plot(time_sec, ear_seq["right"], 'r-', label='Right Eye EAR', linewidth=2)
     ax1.plot(time_sec, ear_seq["average"], 'g--', label='Average EAR', linewidth=1.5, alpha=0.7)
     ax1.axvline(x=time_sec[peak_idx], color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
     ax1.set_xlabel('Time (seconds)' if fps > 0 else 'Frame', fontsize=11)
     ax1.set_ylabel('Eye Aspect Ratio (EAR)', fontsize=11)
-    ax1.set_title(f'{action_name} - Eye Aspect Ratio Over Time', fontsize=13)
+    title = f'{action_name} - Eye Aspect Ratio Over Time'
+    if palsy_detection:
+        palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
+        title += f' | Detected: {palsy_text}'
+    ax1.set_title(title, fontsize=13)
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim(0, max(max(ear_seq["left"]), max(ear_seq["right"])) * 1.1)
 
     # 下图: 眼睛面积曲线
     ax2 = axes[1]
+    if valid_mask is not None:
+        add_valid_region_shading(ax2, valid_mask, time_sec)
+
     ax2.plot(time_sec, area_seq["left"], 'b-', label='Left Eye Area', linewidth=2)
     ax2.plot(time_sec, area_seq["right"], 'r-', label='Right Eye Area', linewidth=2)
     ax2.axvline(x=time_sec[peak_idx], color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')

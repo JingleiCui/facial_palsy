@@ -21,6 +21,8 @@ from typing import Dict, List, Optional, Any, Tuple
 import json
 import numpy as np
 
+from thresholds import THR
+
 from clinical_base import (
     LM, pt2d, pt3d, pts2d, dist, compute_ear, compute_eye_area,
     compute_mouth_metrics, compute_oral_angle,
@@ -28,6 +30,8 @@ from clinical_base import (
     ActionResult, draw_polygon, draw_landmarks,
     compute_scale_to_baseline,
     kabsch_rigid_transform, apply_rigid_transform,
+    add_valid_region_shading, get_palsy_side_text,
+    draw_palsy_side_label,
 )
 import matplotlib
 matplotlib.use("Agg")
@@ -181,32 +185,49 @@ def compute_cheek_depth_delta(landmarks, w: int, h: int, baseline_landmarks=None
     }
 
 
-def _save_cheek_depth_curve_png(png_path: Path,
+def _save_cheek_depth_curve_png(png_path,
                                 left_series: List[float],
                                 right_series: List[float],
                                 mean_series: List[float],
-                                peak_idx: int) -> None:
-    """输出左右/平均脸颊深度曲线，并标注峰值帧"""
+                                peak_idx: int,
+                                valid_mask: List[bool] = None,
+                                palsy_detection: Dict[str, Any] = None) -> None:
+    """输出左右/平均脸颊深度曲线，并标注峰值帧和valid区域"""
     if not left_series or not right_series or not mean_series:
         return
 
-    xs = list(range(len(mean_series)))
-    plt.figure()
-    plt.plot(xs, left_series, label="Left cheek (delta_z/ICD)")
-    plt.plot(xs, right_series, label="Right cheek (delta_z/ICD)")
-    plt.plot(xs, mean_series, label="Mean (delta_z/ICD)")
+    fig, ax = plt.subplots(figsize=(16, 6))  # 增加宽度
+
+    xs = np.array(list(range(len(mean_series))))
+
+    # 标注 valid/invalid 区域
+    if valid_mask is not None:
+        add_valid_region_shading(ax, valid_mask, xs)
+
+    ax.plot(xs, left_series, 'b-', label="Left cheek (delta_z/ICD)", linewidth=2)
+    ax.plot(xs, right_series, 'r-', label="Right cheek (delta_z/ICD)", linewidth=2)
+    ax.plot(xs, mean_series, 'g-', label="Mean (delta_z/ICD)", linewidth=2)
 
     peak_idx = int(max(0, min(peak_idx, len(xs) - 1)))
-    plt.axvline(peak_idx, linestyle="--")
-    plt.scatter([peak_idx], [mean_series[peak_idx]])
+    ax.axvline(peak_idx, linestyle="--", color='black', linewidth=2)
+    if mean_series[peak_idx] is not None and not np.isnan(mean_series[peak_idx]):
+        ax.scatter([peak_idx], [mean_series[peak_idx]], color='red', s=150,
+                   zorder=5, marker='*', edgecolors='black', linewidths=2)
 
-    plt.title("BlowCheek depth curve: (baseline_z - aligned_z) / ICD")
-    plt.xlabel("Frame")
-    plt.ylabel("Normalized depth delta (bigger = more bulge)")
-    plt.legend()
+    title = "BlowCheek depth curve: (baseline_z - aligned_z) / ICD"
+    if palsy_detection:
+        palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
+        title += f' | Detected: {palsy_text}'
+    ax.set_title(title, fontsize=13, fontweight='bold')
+    ax.set_xlabel("Frame", fontsize=11)
+    ax.set_ylabel("Normalized depth delta (bigger = more bulge)", fontsize=11)
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig(str(png_path), dpi=160)  # PNG，无质量压缩那种损失
+    plt.savefig(str(png_path), dpi=160)
     plt.close()
+
 
 def _inner_lip_area_norm(lm, w: int, h: int, icd: float) -> float:
     """
@@ -225,22 +246,34 @@ def find_peak_frame(
     w: int,
     h: int,
     baseline_landmarks=None,
-    seal_thr: float = 0.63,          # lip_seal_total / ICD  越小越闭合
-    mouth_thr: float = 0.125,        # mouth_height / ICD    越小越不张口
-    smooth_win: int = 7,
-    inner_area_inc_thr: float = 0.30,   #  你提出：内圈面积相对静息增幅>30% => 认为没闭嘴
-    inner_area_base_eps: float = 1e-5,  # baseline面积太小防止ratio爆炸
+    seal_thr: float = None,          # lip_seal_total / ICD  越小越闭合
+    mouth_thr: float = None,        # mouth_height / ICD    越小越不张口
+    smooth_win: int = None,
+    inner_area_inc_thr: float = None,    #  你提出：内圈面积相对静息增幅>30% => 认为没闭嘴
+    inner_area_base_eps: float = None,   # baseline面积太小防止ratio爆炸
 ) -> Tuple[int, Dict[str, Any]]:
     """
-    鼓腮关键帧选择（最新版）：
+    鼓腮关键帧选择：
     1) 计算左右脸颊“深度鼓起代理”曲线：delta = (baseline_z - aligned_z)/ICD
        - aligned_z：当前帧刚体对齐到baseline后，脸颊区域平均z
        - ICD归一化：跨人/跨距离更稳
     2) 门控过滤：闭唇(seal_norm<=thr) + 不张口(mouth_norm<=thr) + 嘴唇内圈面积增幅(<=thr)
-    3) 打分：score = 0.6*mean_delta + 0.4*min(L,R)（兼顾整体鼓起 & 单侧塌陷）
+    3) 打分：score = mean_delta
     4) 在valid帧里取 argmax(score) 作为 peak_idx
     5) 返回 peak_debug（用于画曲线、调参、解释）
     """
+    # ========== 使用统一阈值配置 ==========
+    if THR is not None:
+        if seal_thr is None:
+            seal_thr = THR.BLOW_CHEEK_SEAL
+        if mouth_thr is None:
+            mouth_thr = THR.BLOW_CHEEK_MOUTH
+        if smooth_win is None:
+            smooth_win = THR.BLOW_CHEEK_SMOOTH_WIN
+        if inner_area_inc_thr is None:
+            inner_area_inc_thr = THR.BLOW_CHEEK_INNER_AREA_INC
+        if inner_area_base_eps is None:
+            inner_area_base_eps = THR.BLOW_CHEEK_INNER_AREA_BASE_EPS
 
     n = len(landmarks_seq)
     if n == 0:
@@ -265,29 +298,6 @@ def find_peak_frame(
         except Exception:
             return None
 
-    # --------- Kabsch刚体对齐（当前 -> baseline） ----------
-    def _kabsch_rigid(P: np.ndarray, Q: np.ndarray):
-        """
-        求R,t，使 R@P + t ~= Q
-        P,Q: (N,3)
-        """
-        if P.shape[0] < 3:
-            return None, None
-        Pc = P.mean(axis=0)
-        Qc = Q.mean(axis=0)
-        X = P - Pc
-        Y = Q - Qc
-        H = X.T @ Y
-        U, S, Vt = np.linalg.svd(H)
-        R = Vt.T @ U.T
-        if np.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = Vt.T @ U.T
-        t = Qc - R @ Pc
-        return R, t
-
-    def _apply_rt(points: np.ndarray, R: np.ndarray, t: np.ndarray):
-        return (points @ R.T) + t
 
     # --------- 区域平均z：对齐到baseline后再算 ----------
     def _mean_region_z_aligned(curr_landmarks, indices: List[int], baseline_landmarks):
@@ -319,7 +329,7 @@ def find_peak_frame(
 
         P = np.asarray(P, dtype=np.float64)
         Q = np.asarray(Q, dtype=np.float64)
-        R, t = _kabsch_rigid(P, Q)
+        R, t = kabsch_rigid_transform(P, Q)
         if R is None:
             zs = []
             for idx in indices:
@@ -337,7 +347,7 @@ def find_peak_frame(
             return np.nan
 
         region = np.asarray(region, dtype=np.float64)
-        region_aligned = _apply_rt(region, R, t)
+        region_aligned = apply_rigid_transform(region, R, t)
         return float(np.mean(region_aligned[:, 2]))
 
     # --------- 嘴唇内圈面积（归一化到ICD^2） ----------
@@ -438,7 +448,7 @@ def find_peak_frame(
 
             if np.isfinite(left_delta[i]) and np.isfinite(right_delta[i]):
                 mean_delta[i] = 0.5 * (left_delta[i] + right_delta[i])
-                score_raw[i] = 0.6 * mean_delta[i] + 0.4 * min(left_delta[i], right_delta[i])
+                score_raw[i] = mean_delta[i]
 
     # =============== 平滑 score（避免抖动） ===============
     def _smooth_nan(x: np.ndarray, win: int):
@@ -806,9 +816,9 @@ def _get_blow_cheek_vis_indices() -> list:
 
 BLOW_CHEEK_VIS_INDICES = _get_blow_cheek_vis_indices()
 
-def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: int):
+def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: int, palsy_detection: Dict[str, Any] = None):
     img = frame.copy()
-
+    img = draw_palsy_side_label(img, palsy_detection, x=10, y=25)
     # 画全脸关键点（你原来就有）
     draw_landmarks(img, landmarks, w, h, BLOW_CHEEK_VIS_INDICES, radius=1)
 
@@ -847,15 +857,15 @@ def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: i
     rd = cheek.get("right_delta_norm", float("nan"))
     md = cheek.get("mean_delta_norm", float("nan"))
 
-    cv2.putText(img, f"CheekDepthΔ/ICD L/R: {ld:+.4f} / {rd:+.4f}", (30, 90),
+    cv2.putText(img, f"CheekDepthΔ/ICD L/R: {ld:+.4f} / {rd:+.4f}", (30, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(img, f"CheekDepthΔ/ICD Mean: {md:+.4f}", (30, 120),
+    cv2.putText(img, f"CheekDepthΔ/ICD Mean: {md:+.4f}", (30, 200),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(img, f"LipSealDist: {metrics.get('lip_seal_total_distance', 0):.2f}px", (30, 180),
+    cv2.putText(img, f"LipSealDist: {metrics.get('lip_seal_total_distance', 0):.2f}px", (30, 250),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
     oral = metrics.get("oral_angle", {})
-    cv2.putText(img, f"AOE/BOF: {oral.get('AOE', 0):.2f} / {oral.get('BOF', 0):.2f}", (30, 210),
+    cv2.putText(img, f"AOE/BOF: {oral.get('AOE', 0):.2f} / {oral.get('BOF', 0):.2f}", (30, 300),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
     return img
@@ -928,17 +938,23 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 保存原始帧
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
-    # 保存可视化
-    vis = visualize_blow_cheek(peak_frame, peak_landmarks, metrics, w, h)
-    cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
-
     # 保存左右脸颊深度曲线（可解释性）
     if peak_debug:
         left_series = peak_debug.get("left_delta_norm", [])
         right_series = peak_debug.get("right_delta_norm", [])
         mean_series = peak_debug.get("mean_delta_norm", [])
-        _save_cheek_depth_curve_png(action_dir / "cheek_depth_curve.png",
-                                    left_series, right_series, mean_series, peak_idx)
+        valid_mask = peak_debug.get("valid", None)
+
+        _save_cheek_depth_curve_png(
+            action_dir / "cheek_depth_curve.png",
+            left_series, right_series, mean_series, peak_idx,
+            valid_mask=valid_mask,
+            palsy_detection=palsy_detection
+        )
+
+        # 保存可视化（添加患侧信息）
+    vis = visualize_blow_cheek(peak_frame, peak_landmarks, metrics, w, h, palsy_detection)
+    cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 写入 debug，方便你回看为什么选中这帧
     if result.action_specific is None:

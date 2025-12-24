@@ -36,6 +36,8 @@ from clinical_base import (
     kabsch_rigid_transform, apply_rigid_transform,
 )
 
+from thresholds import THR
+
 ACTION_NAME = "LipPucker"
 ACTION_NAME_CN = "撅嘴"
 

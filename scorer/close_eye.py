@@ -34,8 +34,11 @@ from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
     compute_palpebral_height, compute_mouth_metrics,
     compute_icd, extract_common_indicators,
-    ActionResult, draw_polygon, compute_scale_to_baseline
+    ActionResult, draw_polygon, compute_scale_to_baseline,
+    draw_palsy_side_label,
 )
+
+from thresholds import THR
 
 
 def find_peak_frame_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
@@ -344,15 +347,23 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
 
 
 def plot_eye_curve(eye_seq: Dict, fps: float, peak_idx: int,
-                   output_path: Path, action_name: str) -> None:
+                   output_path: Path, action_name: str,
+                   valid_mask: List[bool] = None,
+                   palsy_detection: Dict[str, Any] = None) -> None:
     """绘制眼睛变化曲线"""
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    from clinical_base import add_valid_region_shading, get_palsy_side_text
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 9))  # 增加宽度
 
     frames = np.arange(len(eye_seq["ear"]["left"]))
     time_sec = frames / fps if fps > 0 else frames
 
     # 上图: EAR曲线
     ax1 = axes[0]
+
+    if valid_mask is not None:
+        add_valid_region_shading(ax1, valid_mask, time_sec)
+
     ax1.plot(time_sec, eye_seq["ear"]["left"], 'b-', label='Left Eye EAR', linewidth=2)
     ax1.plot(time_sec, eye_seq["ear"]["right"], 'r-', label='Right Eye EAR', linewidth=2)
     ax1.plot(time_sec, eye_seq["ear"]["average"], 'g--', label='Average EAR', linewidth=1.5, alpha=0.7)
@@ -360,12 +371,21 @@ def plot_eye_curve(eye_seq: Dict, fps: float, peak_idx: int,
     ax1.axhline(y=0.15, color='orange', linestyle=':', alpha=0.7, label='Closure Threshold')
     ax1.set_xlabel('Time (seconds)' if fps > 0 else 'Frame', fontsize=11)
     ax1.set_ylabel('Eye Aspect Ratio (EAR)', fontsize=11)
-    ax1.set_title(f'{action_name} - Eye Aspect Ratio Over Time', fontsize=13)
+
+    title = f'{action_name} - Eye Aspect Ratio Over Time'
+    if palsy_detection:
+        palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
+        title += f' | Detected: {palsy_text}'
+    ax1.set_title(title, fontsize=13)
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
 
     # 下图: 面积曲线
     ax2 = axes[1]
+
+    if valid_mask is not None:
+        add_valid_region_shading(ax2, valid_mask, time_sec)
+
     ax2.plot(time_sec, eye_seq["area"]["left"], 'b-', label='Left Eye Area', linewidth=2)
     ax2.plot(time_sec, eye_seq["area"]["right"], 'r-', label='Right Eye Area', linewidth=2)
     ax2.axvline(x=time_sec[peak_idx], color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
@@ -386,16 +406,20 @@ def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
     """可视化闭眼指标"""
     img = frame.copy()
 
+    # ========== 在左上角绘制患侧标签 ==========
+    palsy_detection = metrics.get("palsy_detection", {})
+    img = draw_palsy_side_label(img, palsy_detection, x=10, y=25)
+
     # 绘制眼部轮廓
     draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_L, (255, 0, 0), 2)
     draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_R, (0, 165, 255), 2)
 
     # 信息面板
     panel_h = 340
-    cv2.rectangle(img, (5, 5), (420, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (420, panel_h), (255, 255, 255), 1)
+    cv2.rectangle(img, (5, 5), (420, panel_h + 50), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, 5), (420, panel_h + 50), (255, 255, 255), 1)
 
-    y = 28
+    y = 78
     cv2.putText(img, f"{result.action_name}", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     y += 28
@@ -586,7 +610,9 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 绘制眼睛变化曲线
-    plot_eye_curve(eye_seq, fps, peak_idx, action_dir / "eye_curve.png", action_name)
+    plot_eye_curve(eye_seq, fps, peak_idx, action_dir / "eye_curve.png", action_name,
+                   valid_mask=None,  # close_eye 没有 valid 逻辑
+                   palsy_detection=palsy_detection)
 
     # 保存JSON
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:

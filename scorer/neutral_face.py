@@ -29,6 +29,8 @@ from sunnybrook_scorer import (
     RestingSymmetry, compute_resting_symmetry
 )
 
+from thresholds import THR
+
 ACTION_NAME = "NeutralFace"
 ACTION_NAME_CN = "静息面"
 
