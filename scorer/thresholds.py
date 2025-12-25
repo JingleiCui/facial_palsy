@@ -58,7 +58,7 @@ class Thresholds:
 
     # 唇封闭距离归一化阈值 (seal_total / ICD)
     # 值越小表示嘴唇闭合越紧
-    BLOW_CHEEK_SEAL: float = 0.80  # 原0.7, 放宽到0.8
+    BLOW_CHEEK_SEAL: float = 0.70  # 原0.7, 放宽到0.8
 
     # 嘴部高度归一化阈值 (mouth_height / ICD)
     # 值越小表示嘴巴张开越小
@@ -67,7 +67,7 @@ class Thresholds:
     # 嘴唇内圈面积增幅阈值
     # 计算方式: (current_area / baseline_area) - 1.0
     # 值越大表示嘴张开越多
-    BLOW_CHEEK_INNER_AREA_INC: float = 15.0
+    BLOW_CHEEK_INNER_AREA_INC: float =20.0
 
     # 嘴唇内圈面积基线最小值 (防止除零)
     BLOW_CHEEK_INNER_AREA_BASE_EPS: float = 1e-4  # 原1e-5, 增大防止噪声

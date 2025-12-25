@@ -100,98 +100,62 @@ def extract_eye_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, Dict[
 
 def detect_palsy_side_from_closure(left_ear: float, right_ear: float,
                                    baseline_left_ear: float = None,
-                                   baseline_right_ear: float = None,
-                                   closure_threshold: float = 0.15) -> Dict[str, Any]:
+                                   baseline_right_ear: float = None) -> Dict[str, Any]:
     """
-    从闭眼动作检测面瘫侧别
+    从闭眼动作检测面瘫侧别 - 改进版，减少阈值依赖
 
     原理: 面瘫侧的眼睛无法完全闭合，EAR值较大
-
-    Args:
-        left_ear: 左眼EAR值 (闭眼时)
-        right_ear: 右眼EAR值 (闭眼时)
-        baseline_left_ear: 基线左眼EAR值 (可选)
-        baseline_right_ear: 基线右眼EAR值 (可选)
-        closure_threshold: 闭合阈值，EAR低于此值认为完全闭合
-
-    Returns:
-        Dict包含:
-        - palsy_side: 面瘫侧别 (0=无/对称, 1=左, 2=右)
-        - confidence: 置信度 (0-1)
-        - left_closed: 左眼是否闭合
-        - right_closed: 右眼是否闭合
-        - interpretation: 解释文字
+    使用直接比较而非硬编码阈值
     """
-    left_closed = left_ear < closure_threshold
-    right_closed = right_ear < closure_threshold
-
     result = {
         "left_ear": left_ear,
         "right_ear": right_ear,
-        "left_closed": left_closed,
-        "right_closed": right_closed,
-        "closure_threshold": closure_threshold,
     }
 
     # 如果有基线，计算闭合比例
     if baseline_left_ear is not None and baseline_right_ear is not None:
+        # 闭合比例 = 当前EAR / 基线EAR，越小表示闭得越紧
         left_closure_ratio = left_ear / baseline_left_ear if baseline_left_ear > 1e-9 else 1.0
         right_closure_ratio = right_ear / baseline_right_ear if baseline_right_ear > 1e-9 else 1.0
         result["left_closure_ratio"] = left_closure_ratio
         result["right_closure_ratio"] = right_closure_ratio
-
-        # 闭合百分比 (1 - ratio) * 100%
         result["left_closure_percent"] = (1 - left_closure_ratio) * 100
         result["right_closure_percent"] = (1 - right_closure_ratio) * 100
 
-    # 判断面瘫侧别
-    if left_closed and right_closed:
-        # 两眼都能闭合 - 比较哪只眼闭合更不完全
-        ear_diff = abs(left_ear - right_ear)
-        max_ear = max(left_ear, right_ear)
-
-        relative_diff = ear_diff / max_ear if max_ear > 1e-9 else 0
-
-        if relative_diff < 0.15:
-            result["palsy_side"] = 0
-            result["confidence"] = 1.0 - relative_diff
-            result["interpretation"] = "双眼对称闭合"
-        elif left_ear > right_ear:
-            result["palsy_side"] = 1  # 左眼EAR更大 -> 左侧面瘫
-            result["confidence"] = min(1.0, relative_diff * 2)
-            result["interpretation"] = f"左眼闭合较弱 (EAR L={left_ear:.3f} > R={right_ear:.3f})"
+        # 使用闭合比例比较
+        max_ratio = max(left_closure_ratio, right_closure_ratio)
+        if max_ratio > 1e-9:
+            asymmetry = abs(left_closure_ratio - right_closure_ratio) / max_ratio
         else:
-            result["palsy_side"] = 2  # 右眼EAR更大 -> 右侧面瘫
-            result["confidence"] = min(1.0, relative_diff * 2)
-            result["interpretation"] = f"右眼闭合较弱 (EAR R={right_ear:.3f} > L={left_ear:.3f})"
-
-    elif left_closed and not right_closed:
-        # 只有左眼能闭合 -> 右侧面瘫
-        result["palsy_side"] = 2
-        result["confidence"] = min(1.0, (right_ear - closure_threshold) / closure_threshold)
-        result["interpretation"] = f"右眼无法闭合 (EAR={right_ear:.3f} > 阈值{closure_threshold})"
-
-    elif right_closed and not left_closed:
-        # 只有右眼能闭合 -> 左侧面瘫
-        result["palsy_side"] = 1
-        result["confidence"] = min(1.0, (left_ear - closure_threshold) / closure_threshold)
-        result["interpretation"] = f"左眼无法闭合 (EAR={left_ear:.3f} > 阈值{closure_threshold})"
-
+            asymmetry = 0
     else:
-        # 两眼都无法完全闭合
-        ear_diff = abs(left_ear - right_ear)
-        if ear_diff < 0.03:
-            result["palsy_side"] = 0
-            result["confidence"] = 0.5
-            result["interpretation"] = "双眼均无法完全闭合，可能为双侧面瘫或其他原因"
-        elif left_ear > right_ear:
-            result["palsy_side"] = 1
-            result["confidence"] = min(1.0, ear_diff / max(left_ear, right_ear))
-            result["interpretation"] = f"双眼均无法完全闭合，左眼更差 (L={left_ear:.3f} > R={right_ear:.3f})"
+        # 没有基线，直接比较EAR
+        max_ear = max(left_ear, right_ear)
+        if max_ear > 1e-9:
+            asymmetry = abs(left_ear - right_ear) / max_ear
         else:
-            result["palsy_side"] = 2
-            result["confidence"] = min(1.0, ear_diff / max(left_ear, right_ear))
-            result["interpretation"] = f"双眼均无法完全闭合，右眼更差 (R={right_ear:.3f} > L={left_ear:.3f})"
+            asymmetry = 0
+
+    result["asymmetry_ratio"] = asymmetry
+    result["confidence"] = min(1.0, asymmetry * 3)  # 约33%差异 -> 100%置信度
+
+    # 判断面瘫侧别：EAR大的一侧闭合不完全 -> 面瘫侧
+    if asymmetry < 0.10:  # 10%以内认为对称
+        result["palsy_side"] = 0
+        result["left_closed"] = True
+        result["right_closed"] = True
+        result["interpretation"] = f"双眼对称闭合 (差异{asymmetry * 100:.1f}%)"
+    elif left_ear > right_ear:
+        # 左眼EAR更大 -> 左眼闭合较差 -> 左侧面瘫
+        result["palsy_side"] = 1
+        result["left_closed"] = False
+        result["right_closed"] = True
+        result["interpretation"] = f"左眼闭合较差 (L_EAR={left_ear:.3f} > R_EAR={right_ear:.3f})"
+    else:
+        result["palsy_side"] = 2
+        result["left_closed"] = True
+        result["right_closed"] = False
+        result["interpretation"] = f"右眼闭合较差 (R_EAR={right_ear:.3f} > L_EAR={left_ear:.3f})"
 
     return result
 
@@ -403,90 +367,69 @@ def plot_eye_curve(eye_seq: Dict, fps: float, peak_idx: int,
 def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
                         result: ActionResult,
                         metrics: Dict[str, Any]) -> np.ndarray:
-    """可视化闭眼指标"""
+    """可视化闭眼指标 - 字体放大版"""
     img = frame.copy()
 
-    # ========== 在左上角绘制患侧标签 ==========
+    # 字体参数
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    FONT_SCALE_TITLE = 1.4
+    FONT_SCALE_NORMAL = 0.9
+    THICKNESS_TITLE = 3
+    THICKNESS_NORMAL = 2
+    LINE_HEIGHT = 45
+
+    # 患侧标签
     palsy_detection = metrics.get("palsy_detection", {})
-    img = draw_palsy_side_label(img, palsy_detection, x=10, y=25)
+    img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
 
     # 绘制眼部轮廓
-    draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_L, (255, 0, 0), 2)
-    draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_R, (0, 165, 255), 2)
+    draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_L, (255, 0, 0), 3)
+    draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_R, (0, 165, 255), 3)
 
     # 信息面板
-    panel_h = 340
-    cv2.rectangle(img, (5, 5), (420, panel_h + 50), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (420, panel_h + 50), (255, 255, 255), 1)
+    panel_w, panel_h = 700, 600
+    cv2.rectangle(img, (10, 100), (panel_w, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (10, 100), (panel_w, panel_h), (255, 255, 255), 2)
 
-    y = 78
-    cv2.putText(img, f"{result.action_name}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    y += 28
+    y = 160
+    cv2.putText(img, f"{result.action_name}", (25, y), FONT, FONT_SCALE_TITLE, (0, 255, 0), THICKNESS_TITLE)
+    y += LINE_HEIGHT + 15
 
-    cv2.putText(img, "=== Eye Aspect Ratio ===", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    y += 20
+    cv2.putText(img, "=== Eye Aspect Ratio ===", (25, y), FONT, FONT_SCALE_NORMAL, (0, 255, 255), THICKNESS_NORMAL)
+    y += LINE_HEIGHT
 
-    cv2.putText(img, f"Left EAR: {metrics['left_ear']:.4f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
-    y += 18
+    cv2.putText(img, f"Left EAR: {metrics['left_ear']:.4f}", (25, y), FONT, FONT_SCALE_NORMAL, (255, 0, 0),
+                THICKNESS_NORMAL)
+    y += LINE_HEIGHT
 
-    cv2.putText(img, f"Right EAR: {metrics['right_ear']:.4f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1)
-    y += 18
+    cv2.putText(img, f"Right EAR: {metrics['right_ear']:.4f}", (25, y), FONT, FONT_SCALE_NORMAL, (0, 165, 255),
+                THICKNESS_NORMAL)
+    y += LINE_HEIGHT
 
     ratio = metrics['ear_ratio']
     ratio_color = (0, 255, 0) if 0.85 <= ratio <= 1.15 else (0, 0, 255)
-    cv2.putText(img, f"EAR Ratio: {ratio:.3f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, ratio_color, 1)
-    y += 22
-
-    cv2.putText(img, "=== Eye Area ===", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    y += 20
-
-    cv2.putText(img, f"Left: {metrics['left_area']:.1f}px^2  Right: {metrics['right_area']:.1f}px^2", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 22
+    cv2.putText(img, f"EAR Ratio: {ratio:.3f}", (25, y), FONT, FONT_SCALE_NORMAL, ratio_color, THICKNESS_NORMAL)
+    y += LINE_HEIGHT + 10
 
     if "left_closure_percent" in metrics:
-        cv2.putText(img, "=== Closure from Baseline ===", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-        y += 20
-
-        cv2.putText(img, f"Left Closure: {metrics['left_closure_percent']:.1f}%", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 18
-
-        cv2.putText(img, f"Right Closure: {metrics['right_closure_percent']:.1f}%", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 22
-
-    # 面瘫侧别检测结果
-    palsy_detection = metrics.get("palsy_detection", {})
-    if palsy_detection:
-        cv2.putText(img, "=== Palsy Detection ===", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-        y += 20
-
-        left_closed = palsy_detection.get("left_closed", False)
-        right_closed = palsy_detection.get("right_closed", False)
+        cv2.putText(img, "=== Closure from Baseline ===", (25, y), FONT, FONT_SCALE_NORMAL, (0, 255, 255),
+                    THICKNESS_NORMAL)
+        y += LINE_HEIGHT
         cv2.putText(img,
-                    f"Left Closed: {'Yes' if left_closed else 'No'}  Right Closed: {'Yes' if right_closed else 'No'}",
-                    (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 18
+                    f"Left: {metrics['left_closure_percent']:.1f}%  Right: {metrics['right_closure_percent']:.1f}%",
+                    (25, y), FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT + 10
 
+    # 面瘫侧别
+    if palsy_detection:
         palsy_side = palsy_detection.get("palsy_side", 0)
-        palsy_text = {0: "无/对称", 1: "左侧", 2: "右侧"}.get(palsy_side, "未知")
+        palsy_text = {0: "Symmetric", 1: "Left Palsy", 2: "Right Palsy"}.get(palsy_side, "Unknown")
         palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
-        cv2.putText(img, f"Palsy Side: {palsy_text}", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)
-        y += 25
+        cv2.putText(img, f"Palsy: {palsy_text}", (25, y), FONT, FONT_SCALE_NORMAL, palsy_color, THICKNESS_NORMAL)
+        y += LINE_HEIGHT
 
-    # Voluntary Score
-    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (25, y),
+                FONT, FONT_SCALE_TITLE, (0, 255, 255), THICKNESS_TITLE)
 
     return img
 

@@ -271,56 +271,37 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
     从皱鼻动作检测面瘫侧别
 
-    原理: 面瘫侧的鼻翼无法充分上提，鼻翼-内眦距离变化小
-
-    Returns:
-        Dict包含:
-        - palsy_side: 0=无/对称, 1=左, 2=右
-        - confidence: 置信度
-        - interpretation: 解释
+    原理: 皱鼻时鼻翼上提，面瘫侧鼻翼运动弱
     """
     result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
 
-    if "left_change" not in metrics or "right_change" not in metrics:
-        result["interpretation"] = "无基线对比数据"
+    ala_metrics = metrics.get("ala_canthus_metrics", {})
+    left_change = ala_metrics.get("left_change_percent", 0)
+    right_change = ala_metrics.get("right_change_percent", 0)
+
+    # 皱鼻时距离应该减小（负值）
+    # 使用绝对变化量
+    left_abs = abs(left_change)
+    right_abs = abs(right_change)
+    max_change = max(left_abs, right_abs)
+
+    if max_change < 2:  # 变化太小
+        result["interpretation"] = "皱鼻幅度过小，无法判断"
         return result
 
-    left_change = metrics["left_change"]
-    right_change = metrics["right_change"]
+    asymmetry = abs(left_abs - right_abs) / max_change
+    result["confidence"] = min(1.0, asymmetry * 2)
+    result["asymmetry_ratio"] = asymmetry
 
-    # 皱鼻时距离应该变小，所以change应该是负值
-    # 取绝对值表示收缩幅度
-    left_contraction = -left_change  # 正值表示收缩
-    right_contraction = -right_change
-
-    max_contraction = max(left_contraction, right_contraction)
-    min_contraction = min(left_contraction, right_contraction)
-
-    # 判断是否有明显运动
-    if max_contraction < 3:  # 像素阈值
-        result["interpretation"] = "皱鼻运动幅度过小，无法判断"
-        return result
-
-    # 计算不对称性
-    if max_contraction > 1e-9:
-        asymmetry_ratio = (max_contraction - min_contraction) / max_contraction
-    else:
-        asymmetry_ratio = 0
-
-    if asymmetry_ratio < 0.15:
+    if asymmetry < 0.15:
         result["palsy_side"] = 0
-        result["confidence"] = 1.0 - asymmetry_ratio
-        result["interpretation"] = f"双侧皱鼻对称 (不对称比={asymmetry_ratio:.1%})"
-    elif left_contraction < right_contraction:
-        result["palsy_side"] = 1  # 左侧收缩弱 -> 左侧面瘫
-        result["confidence"] = min(1.0, asymmetry_ratio)
-        result[
-            "interpretation"] = f"左侧鼻翼收缩较弱 (L收缩={left_contraction:.1f}px < R收缩={right_contraction:.1f}px)"
+        result["interpretation"] = f"双侧皱鼻对称 (L={left_change:.1f}%, R={right_change:.1f}%)"
+    elif left_abs < right_abs:
+        result["palsy_side"] = 1
+        result["interpretation"] = f"左侧皱鼻弱 (L={left_change:.1f}% < R={right_change:.1f}%)"
     else:
-        result["palsy_side"] = 2  # 右侧收缩弱 -> 右侧面瘫
-        result["confidence"] = min(1.0, asymmetry_ratio)
-        result[
-            "interpretation"] = f"右侧鼻翼收缩较弱 (R收缩={right_contraction:.1f}px < L收缩={left_contraction:.1f}px)"
+        result["palsy_side"] = 2
+        result["interpretation"] = f"右侧皱鼻弱 (R={right_change:.1f}% < L={left_change:.1f}%)"
 
     return result
 

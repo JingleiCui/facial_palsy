@@ -258,6 +258,42 @@ def visualize_blink_indicators(frame: np.ndarray, landmarks, w: int, h: int,
     return img
 
 
+def detect_palsy_side(dynamics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    从眨眼动作检测面瘫侧别
+
+    原理: 面瘫侧眼睛无法完全闭合，闭合比例低
+    """
+    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+
+    left_closure = dynamics.get("left_closure_ratio", 0)
+    right_closure = dynamics.get("right_closure_ratio", 0)
+
+    max_closure = max(left_closure, right_closure)
+
+    if max_closure < 0.2:  # 几乎没有眨眼
+        result["interpretation"] = "眨眼幅度过小"
+        return result
+
+    asymmetry = abs(left_closure - right_closure) / max_closure
+    result["confidence"] = min(1.0, asymmetry * 2)
+    result["asymmetry_ratio"] = asymmetry
+    result["left_closure"] = left_closure
+    result["right_closure"] = right_closure
+
+    if asymmetry < 0.15:
+        result["palsy_side"] = 0
+        result["interpretation"] = f"双眼眨眼对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
+    elif left_closure < right_closure:
+        result["palsy_side"] = 1
+        result["interpretation"] = f"左眼闭合弱 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%)"
+    else:
+        result["palsy_side"] = 2
+        result["interpretation"] = f"右眼闭合弱 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%)"
+
+    return result
+
+
 def detect_synkinesis_from_blink(baseline_result: Optional[ActionResult],
                                  current_result: ActionResult) -> Dict[str, int]:
     """检测眨眼时的联动运动"""
@@ -348,6 +384,9 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 分析眨眼动态
     dynamics = analyze_blink_dynamics(ear_seq, fps)
 
+    # 获取面瘫侧别检测结果
+    palsy_detection = detect_palsy_side(dynamics)
+
     # 检测联动
     synkinesis = detect_synkinesis_from_blink(baseline_result, result)
     result.synkinesis_scores = synkinesis
@@ -365,6 +404,7 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
             "right": [float(x) if not np.isnan(x) else None for x in area_seq["right"]],
         },
         "synkinesis": synkinesis,
+        "palsy_detection": palsy_detection,
     }
 
     # 创建输出目录

@@ -99,10 +99,12 @@ class LM:
     CHEEK_L = [425, 426, 427, 411, 280]
     CHEEK_R = [205, 206, 207, 187, 50]
 
-    BLOW_CHEEK_L = [280, 376, 433, 367, 364, 313, 393, 423, 266, ]
-    BLOW_CHEEK_R = [50, 147, 213, 138, 135, 83, 187, 203, 36, ]
+    BLOW_CHEEK_L = [280, 376, 433, 367, 364, 273, 410, 423, 266,]
+    BLOW_CHEEK_R = [ 50, 147, 213, 138, 135,  43,  92, 203,  36,]
 
-# =============================================================================
+
+
+    # =============================================================================
 # JSON 序列化安全转换（处理 numpy.bool_ / numpy.float32 等）
 # =============================================================================
 def make_json_serializable(obj: Any) -> Any:
@@ -1763,14 +1765,15 @@ def get_palsy_side_color(palsy_side: int) -> Tuple[int, int, int]:
 
 
 def draw_palsy_side_label(img: np.ndarray, palsy_detection: Dict[str, Any],
-                          x: int = 10, y: int = 25) -> np.ndarray:
+                          x: int = 10, y: int = 60, font_scale: float = 1.2) -> np.ndarray:
     """
-    在图像左上角绘制患侧标签
+    在图像左上角绘制患侧标签（放大4倍）
 
     Args:
         img: 图像
         palsy_detection: 包含 palsy_side, confidence, interpretation 的字典
         x, y: 标签位置
+        font_scale: 字体大小（默认1.2，约为之前的2倍）
 
     Returns:
         绘制后的图像
@@ -1785,12 +1788,146 @@ def draw_palsy_side_label(img: np.ndarray, palsy_detection: Dict[str, Any],
     color = get_palsy_side_color(palsy_side)
     text = get_palsy_side_text(palsy_side, confidence)
 
+    # 使用更大的字体
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 3
+
+    # 计算文本大小
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
     # 绘制背景框
-    (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-    cv2.rectangle(img, (x - 2, y - text_h - 5), (x + text_w + 5, y + 5), (0, 0, 0), -1)
-    cv2.rectangle(img, (x - 2, y - text_h - 5), (x + text_w + 5, y + 5), color, 2)
+    padding = 10
+    cv2.rectangle(img, (x - padding, y - text_h - padding),
+                  (x + text_w + padding, y + padding), (0, 0, 0), -1)
+    cv2.rectangle(img, (x - padding, y - text_h - padding),
+                  (x + text_w + padding, y + padding), color, 3)
 
     # 绘制文本
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    cv2.putText(img, text, (x, y), font, font_scale, color, thickness)
 
     return img
+
+
+# =============================================================================
+# 通用面瘫侧别检测 - 基于比值的无阈值方法
+# =============================================================================
+
+def detect_palsy_side_by_ratio(left_value: float, right_value: float,
+                               metric_name: str = "metric",
+                               higher_is_worse: bool = False) -> Dict[str, Any]:
+    """
+    通用面瘫侧别检测 - 基于左右比值，无需硬编码阈值
+
+    原理: 直接比较左右差异，差异越大置信度越高
+
+    Args:
+        left_value: 左侧指标值
+        right_value: 右侧指标值
+        metric_name: 指标名称（用于解释）
+        higher_is_worse: True表示值越大越差(如EAR闭眼时), False表示值越小越差(如运动幅度)
+
+    Returns:
+        Dict包含:
+        - palsy_side: 0=对称, 1=左侧面瘫, 2=右侧面瘫
+        - confidence: 置信度 (0-1)，基于左右差异比例
+        - interpretation: 解释文字
+        - left_value, right_value: 原始值
+        - asymmetry_ratio: 不对称比例
+    """
+    result = {
+        "left_value": left_value,
+        "right_value": right_value,
+        "metric_name": metric_name,
+    }
+
+    max_val = max(abs(left_value), abs(right_value))
+    min_val = min(abs(left_value), abs(right_value))
+
+    if max_val < 1e-9:
+        result["palsy_side"] = 0
+        result["confidence"] = 0.0
+        result["asymmetry_ratio"] = 0.0
+        result["interpretation"] = f"{metric_name}: 无有效数据"
+        return result
+
+    # 计算不对称比例 (0-1范围，越大越不对称)
+    asymmetry_ratio = (max_val - min_val) / max_val
+    result["asymmetry_ratio"] = asymmetry_ratio
+
+    # 置信度直接由不对称比例决定，归一化到0-1
+    # 使用sigmoid函数使得小差异时置信度低，大差异时置信度高
+    confidence = min(1.0, asymmetry_ratio * 2)  # 50%差异 -> 100%置信度
+    result["confidence"] = confidence
+
+    # 判断面瘫侧别
+    if asymmetry_ratio < 0.10:  # 10%以内认为对称
+        result["palsy_side"] = 0
+        result["interpretation"] = f"{metric_name}: 左右对称 (差异{asymmetry_ratio * 100:.1f}%)"
+    else:
+        if higher_is_worse:
+            # 值越大越差（如闭眼时EAR）
+            if left_value > right_value:
+                result["palsy_side"] = 1
+                result["interpretation"] = f"{metric_name}: 左侧较差 (L={left_value:.3f} > R={right_value:.3f})"
+            else:
+                result["palsy_side"] = 2
+                result["interpretation"] = f"{metric_name}: 右侧较差 (R={right_value:.3f} > L={left_value:.3f})"
+        else:
+            # 值越小越差（如运动幅度）
+            if left_value < right_value:
+                result["palsy_side"] = 1
+                result["interpretation"] = f"{metric_name}: 左侧运动弱 (L={left_value:.3f} < R={right_value:.3f})"
+            else:
+                result["palsy_side"] = 2
+                result["interpretation"] = f"{metric_name}: 右侧运动弱 (R={right_value:.3f} < L={left_value:.3f})"
+
+    return result
+
+
+def combine_palsy_detections(detections: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    综合多个指标的面瘫检测结果
+
+    使用加权投票机制，权重为各指标的置信度
+
+    Args:
+        detections: 多个detect_palsy_side_by_ratio的结果列表
+
+    Returns:
+        综合后的面瘫检测结果
+    """
+    if not detections:
+        return {"palsy_side": 0, "confidence": 0.0, "interpretation": "无检测数据"}
+
+    # 加权投票
+    votes = {0: 0.0, 1: 0.0, 2: 0.0}
+    total_weight = 0.0
+
+    details = []
+    for det in detections:
+        side = det.get("palsy_side", 0)
+        conf = det.get("confidence", 0.0)
+        votes[side] += conf
+        total_weight += conf
+        details.append(det.get("interpretation", ""))
+
+    if total_weight < 1e-9:
+        return {"palsy_side": 0, "confidence": 0.0, "interpretation": "所有指标无明显差异"}
+
+    # 归一化投票
+    for k in votes:
+        votes[k] /= total_weight
+
+    # 选择得票最高的
+    final_side = max(votes, key=votes.get)
+    final_conf = votes[final_side]
+
+    side_names = {0: "对称", 1: "左侧", 2: "右侧"}
+
+    return {
+        "palsy_side": final_side,
+        "confidence": final_conf,
+        "interpretation": f"综合判断: {side_names[final_side]}面瘫 (置信度{final_conf * 100:.1f}%)",
+        "vote_details": votes,
+        "indicator_details": details,
+    }

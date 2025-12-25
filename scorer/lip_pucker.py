@@ -267,68 +267,57 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从撅嘴动作检测面瘫侧别
+    从撅嘴动作检测面瘫侧别 - 改进版
 
-    原理:
-    1. 面瘫侧嘴角运动幅度小
-    2. 口角角度不对称
-
-    Returns:
-        Dict包含:
-        - palsy_side: 0=无/对称, 1=左, 2=右
-        - confidence: 置信度
-        - interpretation: 解释
+    原理: 撅嘴时两侧嘴角应均匀向中间收缩
+    面瘫侧收缩能力差
     """
     result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
 
-    # 使用运动幅度作为主要指标
-    if "left_excursion" in metrics and "right_excursion" in metrics:
-        left_exc = metrics["left_excursion"]
-        right_exc = metrics["right_excursion"]
+    oral = metrics.get("oral_angle", {})
+    aoe = oral.get("AOE", 0)
+    bof = oral.get("BOF", 0)
+    corner_diff = metrics.get("corner_height_diff", 0)
 
-        if max(left_exc, right_exc) < 2:  # 运动幅度太小
-            # 检查口角角度
-            oral = metrics.get("oral_angle", {})
-            asym = oral.get("asymmetry", 0)
-            if asym < 3:
-                result["interpretation"] = "双侧对称"
-            else:
-                result["interpretation"] = "运动幅度过小，难以判断"
+    # 撅嘴时的嘴角高度差异是关键指标
+    # 面瘫侧嘴角位置会偏低
+
+    if "left_corner_displacement" in metrics and "right_corner_displacement" in metrics:
+        # 有运动数据
+        left_disp = metrics["left_corner_displacement"]
+        right_disp = metrics["right_corner_displacement"]
+        max_disp = max(abs(left_disp), abs(right_disp))
+
+        if max_disp < 2:
+            result["interpretation"] = "撅嘴幅度过小"
             return result
 
-        exc_ratio = metrics["excursion_ratio"]
+        asymmetry = abs(left_disp - right_disp) / max_disp
+        result["confidence"] = min(1.0, asymmetry * 2)
 
-        if abs(exc_ratio - 1.0) < 0.15:
+        if asymmetry < 0.15:
             result["palsy_side"] = 0
-            result["confidence"] = 1.0 - abs(exc_ratio - 1.0)
-            result["interpretation"] = f"双侧运动对称 (比值={exc_ratio:.2f})"
-        elif left_exc < right_exc:
+            result["interpretation"] = f"双侧对称 (差异{asymmetry * 100:.1f}%)"
+        elif abs(left_disp) < abs(right_disp):
             result["palsy_side"] = 1
-            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
-            result["interpretation"] = f"左侧运动较弱 (L={left_exc:.1f}px < R={right_exc:.1f}px)"
+            result["interpretation"] = f"左侧运动弱 (L={left_disp:.1f} < R={right_disp:.1f})"
         else:
             result["palsy_side"] = 2
-            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
-            result["interpretation"] = f"右侧运动较弱 (R={right_exc:.1f}px < L={left_exc:.1f}px)"
+            result["interpretation"] = f"右侧运动弱 (R={right_disp:.1f} < L={left_disp:.1f})"
     else:
-        # 没有基线，使用口角对称性
-        oral = metrics.get("oral_angle", {})
-        asym = oral.get("asymmetry", 0)
-        aoe = oral.get("AOE", 0)
-        bof = oral.get("BOF", 0)
+        # 使用口角角度
+        angle_diff = abs(aoe - bof)
+        result["confidence"] = min(1.0, angle_diff / 15)
 
-        if asym < 3:
+        if angle_diff < 3:
             result["palsy_side"] = 0
-            result["confidence"] = 1.0 - asym / 10
-            result["interpretation"] = f"口角对称 (不对称度={asym:.1f}°)"
+            result["interpretation"] = f"口角对称 (差{angle_diff:.1f}°)"
         elif aoe < bof:
             result["palsy_side"] = 2
-            result["confidence"] = min(1.0, asym / 15)
-            result["interpretation"] = f"右口角位置较低 (AOE={aoe:+.1f}°)"
+            result["interpretation"] = f"右口角下垂 (AOE={aoe:+.1f}°)"
         else:
             result["palsy_side"] = 1
-            result["confidence"] = min(1.0, asym / 15)
-            result["interpretation"] = f"左口角位置较低 (BOF={bof:+.1f}°)"
+            result["interpretation"] = f"左口角下垂 (BOF={bof:+.1f}°)"
 
     return result
 
@@ -498,7 +487,7 @@ def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
 
     # 面瘫侧别检测结果
     palsy_side = palsy_detection.get("palsy_side", 0)
-    palsy_text = {0: "无/对称", 1: "左侧", 2: "右侧"}.get(palsy_side, "未知")
+    palsy_text = {0: "Symmetry", 1: "Left", 2: "Right"}.get(palsy_side, "Unkown")
     palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
     cv2.putText(img, f"Palsy Side: {palsy_text}", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)

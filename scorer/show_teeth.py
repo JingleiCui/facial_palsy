@@ -29,7 +29,7 @@ from clinical_base import (
     compute_mouth_metrics, compute_oral_angle,
     compute_icd, extract_common_indicators,
     ActionResult, OralAngleMeasure, draw_polygon,
-    compute_scale_to_baseline,
+    compute_scale_to_baseline, draw_palsy_side_label,
 )
 
 from sunnybrook_scorer import (
@@ -247,6 +247,60 @@ def compute_show_teeth_metrics(landmarks, w: int, h: int,
     return metrics
 
 
+def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    从露齿动作检测面瘫侧别
+
+    原理: 与微笑类似
+    1. 面瘫侧口角运动幅度小
+    2. 面瘫侧口角角度低
+    """
+    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+
+    oral = metrics.get("oral_angle", {})
+    aoe = oral.get("AOE", 0)
+    bof = oral.get("BOF", 0)
+
+    if "excursion" in metrics:
+        exc = metrics["excursion"]
+        left_exc = exc["left_total"]
+        right_exc = exc["right_total"]
+        max_exc = max(left_exc, right_exc)
+
+        if max_exc < 1:
+            result["interpretation"] = "露齿运动幅度过小"
+            return result
+
+        asymmetry = abs(left_exc - right_exc) / max_exc
+        result["confidence"] = min(1.0, asymmetry * 2.5)
+        result["asymmetry_ratio"] = asymmetry
+
+        if asymmetry < 0.10:
+            result["palsy_side"] = 0
+            result["interpretation"] = f"双侧对称 (差异{asymmetry * 100:.1f}%)"
+        elif left_exc < right_exc:
+            result["palsy_side"] = 1
+            result["interpretation"] = f"左侧运动弱 (L={left_exc:.1f} < R={right_exc:.1f})"
+        else:
+            result["palsy_side"] = 2
+            result["interpretation"] = f"右侧运动弱 (R={right_exc:.1f} < L={left_exc:.1f})"
+    else:
+        angle_diff = abs(aoe - bof)
+        result["confidence"] = min(1.0, angle_diff / 15)
+
+        if angle_diff < 3:
+            result["palsy_side"] = 0
+            result["interpretation"] = f"口角对称 (差{angle_diff:.1f}°)"
+        elif aoe < bof:
+            result["palsy_side"] = 2
+            result["interpretation"] = f"右口角下垂 (AOE={aoe:+.1f}°)"
+        else:
+            result["palsy_side"] = 1
+            result["interpretation"] = f"左口角下垂 (BOF={bof:+.1f}°)"
+
+    return result
+
+
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
     """
     计算Voluntary Movement评分
@@ -328,111 +382,75 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
 
 def visualize_show_teeth(frame: np.ndarray, landmarks, w: int, h: int,
                          result: ActionResult,
-                         metrics: Dict[str, Any]) -> np.ndarray:
-    """可视化露齿指标"""
+                         metrics: Dict[str, Any],
+                         palsy_detection: Dict[str, Any] = None) -> np.ndarray:
+    """可视化露齿指标 - 字体放大版"""
     img = frame.copy()
 
+    # 字体参数
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    FONT_SCALE_TITLE = 1.4
+    FONT_SCALE_NORMAL = 0.9
+    THICKNESS_TITLE = 3
+    THICKNESS_NORMAL = 2
+    LINE_HEIGHT = 45
+
+    # 患侧标签
+    if palsy_detection:
+        img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
+
     # 绘制嘴部轮廓
-    draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 2)
-    draw_polygon(img, landmarks, w, h, LM.INNER_LIP, (0, 200, 200), 1)
+    draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 3)
+    draw_polygon(img, landmarks, w, h, LM.INNER_LIP, (0, 200, 200), 2)
 
     # 绘制嘴角点
     if result.oral_angle:
         oral = result.oral_angle
-        cv2.circle(img, (int(oral.A[0]), int(oral.A[1])), 6, (0, 0, 255), -1)  # 右嘴角 红色
-        cv2.circle(img, (int(oral.B[0]), int(oral.B[1])), 6, (255, 0, 0), -1)  # 左嘴角 蓝色
-        cv2.circle(img, (int(oral.O[0]), int(oral.O[1])), 4, (255, 255, 255), -1)  # 中心点 白色
-
-        # 绘制EF水平参考线
-        cv2.line(img, (int(oral.E[0]), int(oral.E[1])),
-                 (int(oral.F[0]), int(oral.F[1])), (0, 255, 0), 2)
-
-        # 绘制O到A和O到B的连线
-        cv2.line(img, (int(oral.O[0]), int(oral.O[1])),
-                 (int(oral.A[0]), int(oral.A[1])), (0, 0, 255), 2)
-        cv2.line(img, (int(oral.O[0]), int(oral.O[1])),
-                 (int(oral.B[0]), int(oral.B[1])), (255, 0, 0), 2)
-    # 鼻唇沟（NLF）几何指标已禁用：目前实现为“鼻翼-嘴角连线”，不等价于真实鼻唇沟纹理/沟壑。
+        cv2.circle(img, (int(oral.A[0]), int(oral.A[1])), 10, (0, 0, 255), -1)
+        cv2.circle(img, (int(oral.B[0]), int(oral.B[1])), 10, (255, 0, 0), -1)
 
     # 信息面板
-    panel_h = 300
-    cv2.rectangle(img, (5, 5), (400, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (400, panel_h), (255, 255, 255), 1)
+    panel_w, panel_h = 700, 550
+    cv2.rectangle(img, (10, 100), (panel_w, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (10, 100), (panel_w, panel_h), (255, 255, 255), 2)
 
-    y = 28
-    cv2.putText(img, f"{ACTION_NAME}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    y += 28
+    y = 160
+    cv2.putText(img, f"{ACTION_NAME}", (25, y), FONT, FONT_SCALE_TITLE, (0, 255, 0), THICKNESS_TITLE)
+    y += LINE_HEIGHT + 10
 
-    cv2.putText(img, "=== Mouth Metrics ===", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    y += 20
+    cv2.putText(img, f"Width: {metrics['mouth_width']:.1f}px  Height: {metrics['mouth_height']:.1f}px", (25, y),
+                FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+    y += LINE_HEIGHT
 
-    cv2.putText(img, f"Width: {metrics['mouth_width']:.1f}px  Height: {metrics['mouth_height']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 18
-
-    cv2.putText(img, f"Opening Ratio: {metrics['mouth_opening_ratio']:.3f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 22
-
-    # 口角角度
     oral_angle = metrics.get("oral_angle", {})
-    cv2.putText(img, f"AOE(R): {oral_angle.get('AOE', 0):+.1f}  BOF(L): {oral_angle.get('BOF', 0):+.1f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 18
+    cv2.putText(img, f"AOE(R): {oral_angle.get('AOE', 0):+.1f}  BOF(L): {oral_angle.get('BOF', 0):+.1f}", (25, y),
+                FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+    y += LINE_HEIGHT
 
     asym = oral_angle.get('asymmetry', 0)
     asym_color = (0, 255, 0) if asym < 5 else ((0, 165, 255) if asym < 10 else (0, 0, 255))
-    cv2.putText(img, f"Asymmetry: {asym:.1f} deg", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, asym_color, 1)
-    y += 22
-    # NLF（禁用）
-    cv2.putText(img, "NLF: disabled", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-    y += 18
+    cv2.putText(img, f"Asymmetry: {asym:.1f} deg", (25, y), FONT, FONT_SCALE_NORMAL, asym_color, THICKNESS_NORMAL)
+    y += LINE_HEIGHT + 10
 
-    # 露齿/张口幅度（内唇缘开口面积）
-    cv2.putText(img, f"Inner Mouth Area: {metrics.get('inner_mouth_area', 0.0):.1f}px^2", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 22
-
-    # 运动幅度
     if "excursion" in metrics:
         exc = metrics["excursion"]
-        cv2.putText(img, "=== Excursion ===", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-        y += 20
+        cv2.putText(img, f"Excursion L: {exc['left_total']:.1f}px  R: {exc['right_total']:.1f}px", (25, y),
+                    FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT
+        cv2.putText(img, f"Ratio: {exc['excursion_ratio']:.3f}", (25, y),
+                    FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT + 10
 
-        cv2.putText(img, f"L: {exc['left_total']:.1f}px  R: {exc['right_total']:.1f}px", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 18
+    # 面瘫侧别
+    if palsy_detection:
+        palsy_side = palsy_detection.get("palsy_side", 0)
+        palsy_text = {0: "Symmetric", 1: "Left Palsy", 2: "Right Palsy"}.get(palsy_side, "Unknown")
+        palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
+        cv2.putText(img, f"Palsy: {palsy_text}", (25, y), FONT, FONT_SCALE_NORMAL, palsy_color, THICKNESS_NORMAL)
+        y += LINE_HEIGHT
 
-        exc_ratio = exc['excursion_ratio']
-        exc_color = (0, 255, 0) if 0.85 <= exc_ratio <= 1.15 else (0, 0, 255)
-        cv2.putText(img, f"Ratio: {exc_ratio:.3f}", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, exc_color, 1)
-        y += 18
-
-        cv2.putText(img, f"Width Change: {exc['width_change']:+.1f}px", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 18
-
-        if "lip_lift" in exc:
-            cv2.putText(img, f"Lip Lift: {exc['lip_lift']:+.1f}px", (15, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-            y += 22
-
-    # Voluntary Score
-    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-    # 图例
-    legend_y = panel_h + 15
-    cv2.circle(img, (20, legend_y), 5, (0, 0, 255), -1)
-    cv2.putText(img, "Right corner (A)", (30, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-    cv2.circle(img, (160, legend_y), 5, (255, 0, 0), -1)
-    cv2.putText(img, "Left corner (B)", (170, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (25, y),
+                FONT, FONT_SCALE_TITLE, (0, 255, 255), THICKNESS_TITLE)
 
     return img
 
@@ -473,6 +491,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 计算露齿特有指标
     metrics = compute_show_teeth_metrics(peak_landmarks, w, h, baseline_landmarks)
 
+    # 检测面瘫侧别
+    palsy_detection = detect_palsy_side(metrics)
+
     # 计算Voluntary Movement评分
     score, interpretation = compute_voluntary_score(metrics, baseline_landmarks)
     result.voluntary_movement_score = score
@@ -484,6 +505,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 存储动作特有指标
     result.action_specific = {
         "show_teeth_metrics": metrics,
+        "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
     }
@@ -496,7 +518,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
     # 保存可视化
-    vis = visualize_show_teeth(peak_frame, peak_landmarks, w, h, result, metrics)
+    vis = visualize_show_teeth(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 绘制关键帧选择曲线
@@ -511,6 +533,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
+    print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
     oral = metrics.get("oral_angle", {})
     print(f"    [OK] {ACTION_NAME}: Width={metrics['mouth_width']:.1f}px, Asym={oral.get('asymmetry', 0):.1f}°")
     if "excursion" in metrics:

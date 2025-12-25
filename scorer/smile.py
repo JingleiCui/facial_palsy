@@ -265,63 +265,83 @@ def compute_smile_metrics(landmarks, w: int, h: int,
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从微笑动作检测面瘫侧别
+    从微笑动作检测面瘫侧别 - 改进版，减少阈值依赖
 
     原理:
     1. 面瘫侧口角运动幅度小
     2. 面瘫侧口角角度低(下垂)
 
-    Returns:
-        Dict包含:
-        - palsy_side: 0=无/对称, 1=左, 2=右
-        - confidence: 置信度
-        - interpretation: 解释
+    使用直接比较而非硬编码阈值
     """
     result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
 
     oral = metrics.get("oral_angle", {})
     aoe = oral.get("AOE", 0)  # 右侧口角角度
     bof = oral.get("BOF", 0)  # 左侧口角角度
-    asymmetry = oral.get("asymmetry", 0)
 
-    # 使用运动幅度作为主要指标
+    # 使用运动幅度作为主要指标（如果有基线）
     if "excursion" in metrics:
         exc = metrics["excursion"]
         left_exc = exc["left_total"]
         right_exc = exc["right_total"]
+        max_exc = max(left_exc, right_exc)
 
-        if max(left_exc, right_exc) < 3:  # 运动幅度太小
-            result["interpretation"] = "微笑运动幅度过小"
+        if max_exc < 1:  # 运动幅度极小
+            result["interpretation"] = "微笑运动幅度过小，无法判断"
             return result
 
-        exc_ratio = exc["excursion_ratio"]
+        # 计算不对称比例（无需预设阈值）
+        asymmetry = abs(left_exc - right_exc) / max_exc
 
-        if abs(exc_ratio - 1.0) < 0.15:
-            result["palsy_side"] = 0
-            result["confidence"] = 1.0 - abs(exc_ratio - 1.0)
-            result["interpretation"] = f"双侧运动对称 (比值={exc_ratio:.2f})"
-        elif left_exc < right_exc:
-            result["palsy_side"] = 1
-            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
-            result["interpretation"] = f"左侧运动较弱 (L={left_exc:.1f}px < R={right_exc:.1f}px)"
+        # 置信度由不对称程度决定
+        result["confidence"] = min(1.0, asymmetry * 2.5)
+        result["asymmetry_ratio"] = asymmetry
+        result["left_excursion"] = left_exc
+        result["right_excursion"] = right_exc
+
+        # 比较左右运动幅度
+        if left_exc < right_exc:
+            # 左侧运动弱
+            if asymmetry >= 0.10:  # 10%以上差异才判定
+                result["palsy_side"] = 1
+                result[
+                    "interpretation"] = f"左侧运动弱 (L={left_exc:.1f} < R={right_exc:.1f}, 差异{asymmetry * 100:.1f}%)"
+            else:
+                result["palsy_side"] = 0
+                result["interpretation"] = f"双侧对称 (差异{asymmetry * 100:.1f}%)"
         else:
-            result["palsy_side"] = 2
-            result["confidence"] = min(1.0, abs(exc_ratio - 1.0))
-            result["interpretation"] = f"右侧运动较弱 (R={right_exc:.1f}px < L={left_exc:.1f}px)"
+            if asymmetry >= 0.10:
+                result["palsy_side"] = 2
+                result[
+                    "interpretation"] = f"右侧运动弱 (R={right_exc:.1f} < L={left_exc:.1f}, 差异{asymmetry * 100:.1f}%)"
+            else:
+                result["palsy_side"] = 0
+                result["interpretation"] = f"双侧对称 (差异{asymmetry * 100:.1f}%)"
     else:
-        # 没有基线，使用口角角度
-        if asymmetry < 3:
-            result["palsy_side"] = 0
-            result["confidence"] = 1.0 - asymmetry / 10
-            result["interpretation"] = f"口角对称 (不对称度={asymmetry:.1f}°)"
-        elif aoe < bof:
-            result["palsy_side"] = 2
-            result["confidence"] = min(1.0, asymmetry / 15)
-            result["interpretation"] = f"右口角位置较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
+        # 没有基线，使用口角角度直接比较
+        angle_diff = abs(aoe - bof)
+        max_angle = max(abs(aoe), abs(bof), 1)  # 避免除零
+        asymmetry = angle_diff / max_angle
+
+        result["confidence"] = min(1.0, asymmetry)
+        result["angle_diff"] = angle_diff
+
+        # 口角角度：越正值表示越上扬，越负值表示越下垂
+        # 面瘫侧口角会下垂（角度更小/更负）
+        if aoe < bof:
+            if angle_diff >= 3:  # 3度以上才判定
+                result["palsy_side"] = 2  # 右口角更低 -> 右侧面瘫
+                result["interpretation"] = f"右口角下垂 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
+            else:
+                result["palsy_side"] = 0
+                result["interpretation"] = f"口角对称 (差{angle_diff:.1f}°)"
         else:
-            result["palsy_side"] = 1
-            result["confidence"] = min(1.0, asymmetry / 15)
-            result["interpretation"] = f"左口角位置较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
+            if angle_diff >= 3:
+                result["palsy_side"] = 1  # 左口角更低 -> 左侧面瘫
+                result["interpretation"] = f"左口角下垂 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
+            else:
+                result["palsy_side"] = 0
+                result["interpretation"] = f"口角对称 (差{angle_diff:.1f}°)"
 
     return result
 
@@ -365,84 +385,86 @@ def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
                                result: ActionResult,
                                smile_metrics: Dict[str, Any],
                                palsy_detection: Dict[str, Any]) -> np.ndarray:
-    """可视化微笑指标"""
+    """可视化微笑指标 - 字体放大版"""
     img = frame.copy()
 
+    # 字体参数（放大4倍）
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    FONT_SCALE_TITLE = 1.4  # 标题字号
+    FONT_SCALE_LARGE = 1.0  # 大字号
+    FONT_SCALE_NORMAL = 0.9  # 普通字号
+    THICKNESS_TITLE = 3
+    THICKNESS_NORMAL = 2
+    LINE_HEIGHT = 50  # 行高
+
     # ========== 在左上角绘制患侧标签 ==========
-    img = draw_palsy_side_label(img, palsy_detection, x=10, y=25)
+    img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
 
     # 绘制嘴部轮廓
-    draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 2)
+    draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 3)
 
     # 绘制嘴角点
     if result.oral_angle:
         oral = result.oral_angle
-        cv2.circle(img, (int(oral.A[0]), int(oral.A[1])), 6, (0, 0, 255), -1)
-        cv2.circle(img, (int(oral.B[0]), int(oral.B[1])), 6, (255, 0, 0), -1)
-        cv2.circle(img, (int(oral.O[0]), int(oral.O[1])), 4, (255, 255, 255), -1)
-
-        # 绘制EF水平参考线
+        cv2.circle(img, (int(oral.A[0]), int(oral.A[1])), 10, (0, 0, 255), -1)
+        cv2.circle(img, (int(oral.B[0]), int(oral.B[1])), 10, (255, 0, 0), -1)
+        cv2.circle(img, (int(oral.O[0]), int(oral.O[1])), 8, (255, 255, 255), -1)
         cv2.line(img, (int(oral.E[0]), int(oral.E[1])),
-                 (int(oral.F[0]), int(oral.F[1])), (0, 255, 0), 2)
-
-        # 绘制O到A和O到B的连线
+                 (int(oral.F[0]), int(oral.F[1])), (0, 255, 0), 3)
         cv2.line(img, (int(oral.O[0]), int(oral.O[1])),
-                 (int(oral.A[0]), int(oral.A[1])), (0, 0, 255), 2)
+                 (int(oral.A[0]), int(oral.A[1])), (0, 0, 255), 3)
         cv2.line(img, (int(oral.O[0]), int(oral.O[1])),
-                 (int(oral.B[0]), int(oral.B[1])), (255, 0, 0), 2)
+                 (int(oral.B[0]), int(oral.B[1])), (255, 0, 0), 3)
 
     # 信息面板
-    panel_h = 300
-    cv2.rectangle(img, (5, 5), (400, panel_h + 50), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (400, panel_h + 50), (255, 255, 255), 1)
+    panel_w, panel_h = 700, 550
+    cv2.rectangle(img, (10, 100), (panel_w, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (10, 100), (panel_w, panel_h), (255, 255, 255), 2)
 
-    y = 75
-    cv2.putText(img, f"{result.action_name}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    y += 30
+    y = 160
+    cv2.putText(img, f"{result.action_name}", (25, y),
+                FONT, FONT_SCALE_TITLE, (0, 255, 0), THICKNESS_TITLE)
+    y += LINE_HEIGHT + 10
 
-    cv2.putText(img, f"Mouth Width: {smile_metrics['mouth_width']:.1f}px", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    y += 22
+    cv2.putText(img, f"Mouth Width: {smile_metrics['mouth_width']:.1f}px", (25, y),
+                FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+    y += LINE_HEIGHT
 
     oral_angle = smile_metrics.get("oral_angle", {})
-    cv2.putText(img, f"AOE(R): {oral_angle.get('AOE', 0):+.1f}  BOF(L): {oral_angle.get('BOF', 0):+.1f}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    y += 22
+    cv2.putText(img, f"AOE(R): {oral_angle.get('AOE', 0):+.1f}  BOF(L): {oral_angle.get('BOF', 0):+.1f}", (25, y),
+                FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+    y += LINE_HEIGHT
 
     asym = oral_angle.get('asymmetry', 0)
     asym_color = (0, 255, 0) if asym < 5 else ((0, 165, 255) if asym < 10 else (0, 0, 255))
-    cv2.putText(img, f"Asymmetry: {asym:.1f} deg", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, asym_color, 1)
-    y += 25
+    cv2.putText(img, f"Asymmetry: {asym:.1f} deg", (25, y),
+                FONT, FONT_SCALE_NORMAL, asym_color, THICKNESS_NORMAL)
+    y += LINE_HEIGHT + 10
 
     # 运动幅度
     if "excursion" in smile_metrics:
         exc = smile_metrics["excursion"]
-        cv2.putText(img, "=== Excursion ===", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        y += 22
-        cv2.putText(img, f"L: {exc['left_total']:.1f}px  R: {exc['right_total']:.1f}px", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 18
-        cv2.putText(img, f"Ratio: {exc['excursion_ratio']:.3f}", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 18
-        cv2.putText(img, f"Width Change: {exc['width_change']:+.1f}px", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 22
+        cv2.putText(img, "=== Excursion ===", (25, y),
+                    FONT, FONT_SCALE_NORMAL, (0, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT
+        cv2.putText(img, f"L: {exc['left_total']:.1f}px  R: {exc['right_total']:.1f}px", (25, y),
+                    FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT
+        cv2.putText(img, f"Ratio: {exc['excursion_ratio']:.3f}", (25, y),
+                    FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT
 
     # 面瘫侧别检测结果
     palsy_side = palsy_detection.get("palsy_side", 0)
-    palsy_text = {0: "No", 1: "Left", 2: "Right"}.get(palsy_side, "Unknown")
+    palsy_text = {0: "Symmetric", 1: "Left Palsy", 2: "Right Palsy"}.get(palsy_side, "Unknown")
     palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
-    cv2.putText(img, f"Palsy Side: {palsy_text}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)
-    y += 25
+    cv2.putText(img, f"Palsy: {palsy_text}", (25, y),
+                FONT, FONT_SCALE_LARGE, palsy_color, THICKNESS_NORMAL)
+    y += LINE_HEIGHT + 10
 
     # Voluntary Score
-    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (25, y),
+                FONT, FONT_SCALE_LARGE, (0, 255, 255), THICKNESS_TITLE)
 
     return img
 

@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from clinical_base import (
     LM, LandmarkExtractor, ActionResult,
     db_fetch_examinations, db_fetch_videos_for_exam, db_fetch_labels,
-    compute_ear, extract_common_indicators
+    compute_ear, extract_common_indicators,
 )
 
 from sunnybrook_scorer import (
@@ -63,6 +63,15 @@ MEDIAPIPE_MODEL_PATH = r"/Users/cuijinglei/PycharmProjects/medicalProject/models
 OUTPUT_DIR = r"/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading"
 PATIENT_LIMIT = None
 TARGET_EXAM_ID = None
+
+# =============================================================================
+# 调试筛选：只分析特定患者/特定检查（其余跳过）
+# =============================================================================
+# 1) 只跑指定患者（常用）
+TARGET_PATIENT_IDS = [] # "XW000264", "XW000304", "XW000312"]
+
+# 2) 只跑指定检查ID（优先级更高）
+TARGET_EXAM_IDS = []
 
 # =============================================================================
 # 并行配置（多CPU加速）
@@ -764,51 +773,6 @@ def infer_palsy_and_side(action_results: Dict[str, ActionResult]) -> Dict[str, A
     }
 
 
-def generate_evidence_overlay_images(output_dir: Path, action_results: Dict[str, ActionResult],
-                                     prediction: Dict[str, Any]) -> None:
-    """为每个动作生成证据叠加图（在peak_indicators.jpg上叠加投票信息）"""
-    if not prediction:
-        return
-
-    votes = prediction.get("votes", [])
-    vote_by_action = {}
-    for v in votes:
-        act = v.get("action")
-        if act:
-            if act not in vote_by_action:
-                vote_by_action[act] = []
-            vote_by_action[act].append(v)
-
-    for action_name, result in action_results.items():
-        action_dir = output_dir / action_name
-        indicator_path = action_dir / "peak_indicators.jpg"
-        if not indicator_path.exists():
-            continue
-
-        img = cv2.imread(str(indicator_path))
-        if img is None:
-            continue
-
-        h, w = img.shape[:2]
-
-        # 绘制投票信息
-        act_votes = vote_by_action.get(action_name, [])
-        if act_votes:
-            y = h - 20 - len(act_votes) * 22
-            for v in act_votes:
-                side_text = v.get("side_text", "中立")
-                region = v.get("region", "")
-                strength = float(v.get("strength", 0))
-                reason = v.get("reason", "")
-
-                color = (0, 255, 0) if side_text == "中立" else ((255, 0, 0) if v.get("side") == 1 else (0, 0, 255))
-                text = f"Vote: {side_text} ({region}) str={strength:.2f}"
-                cv2.putText(img, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-                y += 22
-
-        cv2.imwrite(str(action_dir / "peak_evidence.jpg"), img)
-
-
 def generate_html_report(exam_id: str, patient_id: str,
                          action_results: Dict[str, ActionResult],
                          sunnybrook: Optional[SunnybrookScore],
@@ -1104,7 +1068,6 @@ def generate_html_report(exam_id: str, patient_id: str,
         eye_curve = _img_tag("eye_curve.png", "眼睛曲线")
         cheek_curve = _img_tag("cheek_curve.png", "鼓腮曲线")
         brow_curve = _img_tag("brow_curve.png", "眉眼距曲线")
-        ev_img = _img_tag("peak_evidence.jpg", "证据叠加图")
 
         oral_asym = result.oral_angle.angle_asymmetry if result.oral_angle else 0.0
 
@@ -1131,7 +1094,6 @@ def generate_html_report(exam_id: str, patient_id: str,
         <div class="images">
             {raw_img}
             {ind_img}
-            {ev_img}
             {brow_curve}
             {ear_curve}
             {eye_curve}
@@ -1242,7 +1204,6 @@ def process_examination(examination: Dict[str, Any], db_path: str,
     sunnybrook = calculate_sunnybrook_from_results(action_results)
 
     prediction = infer_palsy_and_side(action_results)
-    generate_evidence_overlay_images(exam_output_dir, action_results, prediction)
 
     # summary 里也建议存一份
     summary = {
@@ -1312,6 +1273,18 @@ def main():
 
     print(f"\n获取检查记录...")
     examinations = db_fetch_examinations(DATABASE_PATH, TARGET_EXAM_ID, PATIENT_LIMIT)
+    # ===== 调试过滤：只跑指定 exam / patient =====
+    if TARGET_EXAM_IDS:
+        allow = set(TARGET_EXAM_IDS)
+        before = len(examinations)
+        examinations = [e for e in examinations if e.get("examination_id") in allow]
+        print(f"[DEBUG] 仅分析指定检查ID：{sorted(allow)} | {before} -> {len(examinations)}")
+    elif TARGET_PATIENT_IDS:
+        allow = set(TARGET_PATIENT_IDS)
+        before = len(examinations)
+        examinations = [e for e in examinations if e.get("patient_id") in allow]
+        print(f"[DEBUG] 仅分析指定患者：{sorted(allow)} | {before} -> {len(examinations)}")
+
     print(f"找到 {len(examinations)} 个检查记录")
 
     if not examinations:

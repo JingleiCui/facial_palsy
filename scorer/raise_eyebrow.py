@@ -370,6 +370,7 @@ def save_brow_curve_plot(peak_debug: Dict[str, Any], save_path: Path):
     plt.savefig(str(save_path))
     plt.close()
 
+
 def compute_raise_eyebrow_metrics(landmarks, w: int, h: int,
                                   baseline_landmarks=None) -> Dict[str, Any]:
     """计算抬眉特有指标"""
@@ -427,6 +428,58 @@ def compute_raise_eyebrow_metrics(landmarks, w: int, h: int,
             metrics["right_change_percent"] = 0
 
     return metrics
+
+
+def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    从抬眉动作检测面瘫侧别
+
+    原理: 面瘫侧眉毛无法上抬，眉眼距变化小
+    """
+    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+
+    # 优先使用眉眼距变化
+    left_change = metrics.get("left_change", 0)
+    right_change = metrics.get("right_change", 0)
+
+    # 也检查静态眉眼距比
+    bed_ratio = metrics.get("brow_eye_distance_ratio", 1.0)
+
+    max_change = max(abs(left_change), abs(right_change))
+
+    if max_change < 2:  # 运动幅度过小
+        # 检查静态比例
+        asymmetry = abs(bed_ratio - 1.0)
+        if asymmetry < 0.10:
+            result["interpretation"] = "眉眼距对称，运动幅度小"
+        else:
+            if bed_ratio > 1.0:
+                result["palsy_side"] = 2
+                result["interpretation"] = f"右侧眉眼距较小 (比值={bed_ratio:.3f})"
+            else:
+                result["palsy_side"] = 1
+                result["interpretation"] = f"左侧眉眼距较小 (比值={bed_ratio:.3f})"
+            result["confidence"] = min(1.0, asymmetry * 2)
+        return result
+
+    # 使用变化量比较
+    asymmetry = abs(left_change - right_change) / max_change
+    result["confidence"] = min(1.0, asymmetry * 2)
+    result["asymmetry_ratio"] = asymmetry
+    result["left_change"] = left_change
+    result["right_change"] = right_change
+
+    if asymmetry < 0.15:
+        result["palsy_side"] = 0
+        result["interpretation"] = f"双侧抬眉对称 (L变化={left_change:.1f}px, R变化={right_change:.1f}px)"
+    elif left_change < right_change:
+        result["palsy_side"] = 1
+        result["interpretation"] = f"左侧抬眉弱 (L={left_change:.1f}px < R={right_change:.1f}px)"
+    else:
+        result["palsy_side"] = 2
+        result["interpretation"] = f"右侧抬眉弱 (R={right_change:.1f}px < L={left_change:.1f}px)"
+
+    return result
 
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
@@ -528,7 +581,7 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
     return synkinesis
 
 
-def visualize_brow_eye_distance(frame: np.ndarray, landmarks, w: int, h: int,
+def visualize_raise_eyebrow(frame: np.ndarray, landmarks, w: int, h: int,
                                 result: ActionResult,
                                 metrics: Dict[str, Any],
                                 baseline_metrics: Optional[Dict[str, Any]] = None) -> np.ndarray:
@@ -593,64 +646,64 @@ def visualize_brow_eye_distance(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.rectangle(img, (5, 5), (380, panel_h), (0, 0, 0), -1)
     cv2.rectangle(img, (5, 5), (380, panel_h), (255, 255, 255), 1)
 
-    y = 28
+    y = 50
     cv2.putText(img, f"{ACTION_NAME}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    y += 28
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 2)
+    y += 50
 
     cv2.putText(img, "=== Brow-Eye Distance ===", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    y += 20
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 1)
+    y += 50
 
     cv2.putText(img, f"Left: {metrics['left_brow_eye_distance']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 18
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
+    y += 30
 
     cv2.putText(img, f"Right: {metrics['right_brow_eye_distance']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 18
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
+    y += 30
 
     ratio = metrics['brow_eye_distance_ratio']
     ratio_color = (0, 255, 0) if 0.9 <= ratio <= 1.1 else (0, 165, 255) if 0.8 <= ratio <= 1.2 else (0, 0, 255)
     cv2.putText(img, f"Ratio: {ratio:.3f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, ratio_color, 1)
-    y += 25
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, ratio_color, 1)
+    y += 50
 
     if "left_change" in metrics:
         cv2.putText(img, "=== Distance Change ===", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-        y += 20
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 1)
+        y += 50
 
         left_change = metrics["left_change"]
         right_change = metrics["right_change"]
 
         cv2.putText(img, f"Left: {left_change:+.1f}px ({metrics.get('left_change_percent', 0):+.1f}%)", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 18
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
+        y += 50
 
         cv2.putText(img, f"Right: {right_change:+.1f}px ({metrics.get('right_change_percent', 0):+.1f}%)",
                     (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 18
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
+        y += 50
 
         change_ratio = metrics.get("change_ratio", 1.0)
         if not np.isinf(change_ratio):
             cv2.putText(img, f"Change Ratio: {change_ratio:.3f}", (15, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 25
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
+        y += 80
 
     # Voluntary Score
     cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
 
     # 图例
-    legend_y = panel_h + 15
+    legend_y = panel_h + 50
     cv2.circle(img, (20, legend_y), 5, (0, 0, 255), -1)
-    cv2.putText(img, "Brow Centroid", (35, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    cv2.putText(img, "Brow Centroid", (35, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
     cv2.circle(img, (150, legend_y), 5, (255, 0, 0), -1)
-    cv2.putText(img, "Eye Inner", (165, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    cv2.putText(img, "Eye Inner", (165, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
     cv2.line(img, (260, legend_y), (290, legend_y), (0, 255, 255), 2)
-    cv2.putText(img, "BED", (295, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    cv2.putText(img, "BED", (295, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
 
     return img
 
@@ -705,6 +758,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 计算抬眉特有指标
     metrics = compute_raise_eyebrow_metrics(peak_landmarks, w, h, baseline_landmarks)
 
+    # 检测面瘫侧别
+    palsy_detection = detect_palsy_side(metrics)
+
     # 计算Voluntary Movement评分
     score, interpretation = compute_voluntary_score(metrics, baseline_landmarks)
     result.voluntary_movement_score = score
@@ -722,6 +778,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         },
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
+        "palsy_detection": palsy_detection,
     }
 
     if "left_change" in metrics:
@@ -756,7 +813,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     if baseline_landmarks is not None:
         baseline_metrics = compute_raise_eyebrow_metrics(baseline_landmarks, w, h, None)
 
-    vis = visualize_brow_eye_distance(peak_frame, peak_landmarks, w, h, result, metrics, baseline_metrics)
+    vis = visualize_raise_eyebrow(peak_frame, peak_landmarks, w, h, result, metrics, baseline_metrics)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 保存JSON

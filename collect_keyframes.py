@@ -49,11 +49,15 @@ def collect_one_exam(exam_dir: Path):
     exam_dir:
       clinical_grading/<exam_id>/report.html
       clinical_grading/<exam_id>/<ActionName>/peak_raw.jpg
+      clinical_grading/<exam_id>/<ActionName>/peak_indicators.jpg
     """
     exam_id = exam_dir.name
 
     copied = 0
     skipped = 0
+
+    exts = ("jpg", "jpeg", "png", "webp")
+    targets = ("peak_raw", "peak_indicators")   # ✅ 同时拷贝这两个
 
     # 遍历 exam_dir 下的子目录（动作名目录）
     for action_dir in exam_dir.iterdir():
@@ -61,31 +65,29 @@ def collect_one_exam(exam_dir: Path):
             continue
 
         action_name = action_dir.name
-
-        # peak_raw 可能是 jpg/png/jpeg
-        peak_files = []
-        for ext in ("jpg", "jpeg", "png", "webp"):
-            f = action_dir / f"peak_raw.{ext}"
-            if f.exists():
-                peak_files.append(f)
-
-        if not peak_files:
-            continue
-
-        # 理论上只会有一个，取第一个
-        src_peak = peak_files[0]
         dst_action_dir = DST_ROOT / action_name
         dst_action_dir.mkdir(parents=True, exist_ok=True)
 
-        dst_name = f"{exam_id}_{action_name}_peak_raw{src_peak.suffix.lower()}"
-        dst_path = dst_action_dir / dst_name
+        for base in targets:
+            src_file = None
+            for ext in exts:
+                f = action_dir / f"{base}.{ext}"
+                if f.exists():
+                    src_file = f
+                    break
 
-        try:
-            shutil.copy2(src_peak, dst_path)
-            copied += 1
-        except Exception as e:
-            print(f"[ERROR] copy failed: {src_peak} -> {dst_path} | {e}")
-            skipped += 1
+            if src_file is None:
+                continue
+
+            dst_name = f"{exam_id}_{action_name}_{base}{src_file.suffix.lower()}"
+            dst_path = dst_action_dir / dst_name
+
+            try:
+                shutil.copy2(src_file, dst_path)
+                copied += 1
+            except Exception as e:
+                print(f"[ERROR] copy failed: {src_file} -> {dst_path} | {e}")
+                skipped += 1
 
     return copied, skipped
 
