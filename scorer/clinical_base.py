@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
 
+
 # =============================================================================
 # Landmark 索引定义 (MediaPipe 478点)
 # =============================================================================
@@ -76,6 +77,19 @@ class LM:
     INNER_LIP = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308,
                  415, 310, 311, 312, 13, 82, 81, 80, 191]
 
+    # ========== 嘴唇左右区域（用于面中线对称性分析）==========
+    # 患者左侧嘴唇（图像右侧，x值较大）
+    UPPER_LIP_L = [267, 269, 270, 409, 291, 308, 415, 310, 311, 312]
+    LOWER_LIP_L = [317, 402, 318, 324, 308, 291, 375, 321, 405, 314]
+    LIP_L = [267, 269, 270, 409, 291, 308, 415, 310, 311, 312,
+             317, 402, 318, 324, 375, 321, 405, 314]  # 合并去重
+
+    # 患者右侧嘴唇（图像左侧，x值较小）
+    UPPER_LIP_R = [37, 39, 40, 185, 61, 78, 191, 80, 81, 82]
+    LOWER_LIP_R = [87, 178, 88, 95, 78, 61, 146, 91, 181, 84]
+    LIP_R = [37, 39, 40, 185, 61, 78, 191, 80, 81, 82,
+             87, 178, 88, 95, 146, 91, 181, 84]  # 合并去重
+
     # ========== 口角角度 ==========
     ORAL_CORNER_R = 78  # A点: 右嘴角
     ORAL_CORNER_L = 308  # B点: 左嘴角
@@ -99,12 +113,12 @@ class LM:
     CHEEK_L = [425, 426, 427, 411, 280]
     CHEEK_R = [205, 206, 207, 187, 50]
 
-    BLOW_CHEEK_L = [280, 376, 433, 367, 364, 273, 410, 423, 266,]
-    BLOW_CHEEK_R = [ 50, 147, 213, 138, 135,  43,  92, 203,  36,]
-
-
+    BLOW_CHEEK_L = [280, 376, 433, 367, 364, 273, 410, 423, 266, ]
+    BLOW_CHEEK_R = [50, 147, 213, 138, 135, 43, 92, 203, 36, ]
 
     # =============================================================================
+
+
 # JSON 序列化安全转换（处理 numpy.bool_ / numpy.float32 等）
 # =============================================================================
 def make_json_serializable(obj: Any) -> Any:
@@ -620,8 +634,8 @@ def compute_brow_eye_distance(landmarks, w: int, h: int, left: bool = True) -> D
     distance = abs(vx * (cy - y1) - vy * (cx - x1)) / (denom ** 0.5)
 
     # 眉毛左右极值点（用于“画眼水平线的端点对齐范围”）
-    brow_extreme_left = pt2d(landmarks[300], w, h)   # 眉毛最左点
-    brow_extreme_right = pt2d(landmarks[70], w, h)   # 眉毛最右点
+    brow_extreme_left = pt2d(landmarks[300], w, h)  # 眉毛最左点
+    brow_extreme_right = pt2d(landmarks[70], w, h)  # 眉毛最右点
 
     def _point_on_eye_line_aligned_to_anchor(anchor_xy):
         ax, ay = float(anchor_xy[0]), float(anchor_xy[1])
@@ -1016,6 +1030,7 @@ class LazyVideoFrames:
     只缓存第一帧（用于 w/h），其它帧按需从磁盘读取。
     用法保持和 list 一样：frames_seq[i]、len(frames_seq)
     """
+
     def __init__(self, video_path: str, start_frame: int, count: int, first_frame=None):
         self.video_path = video_path
         self.start_frame = int(start_frame)
@@ -1053,6 +1068,7 @@ class LazyVideoFrames:
         if not ok:
             return None
         return frame
+
 
 # =============================================================================
 # Landmark提取器
@@ -1377,6 +1393,7 @@ def extract_common_indicators(landmarks, w: int, h: int, result: ActionResult,
     result.left_nlf_length = compute_nlf_length(landmarks, w, h, left=True)
     result.right_nlf_length = compute_nlf_length(landmarks, w, h, left=False)
     result.nlf_ratio = result.left_nlf_length / result.right_nlf_length if result.right_nlf_length > 1e-9 else 1.0
+
 
 # =============================================================================
 # 鼻翼到内眦距离计算 (用于ShrugNose)
@@ -1930,4 +1947,161 @@ def combine_palsy_detections(detections: List[Dict[str, Any]]) -> Dict[str, Any]
         "interpretation": f"综合判断: {side_names[final_side]}面瘫 (置信度{final_conf * 100:.1f}%)",
         "vote_details": votes,
         "indicator_details": details,
+    }
+
+
+# =============================================================================
+# 嘴唇区域面中线对称性分析（用于面瘫侧别判断）
+# =============================================================================
+
+def compute_lip_region_centroid(landmarks, w: int, h: int, left: bool = True) -> Tuple[float, float]:
+    """
+    计算左侧或右侧嘴唇区域的质心
+
+    Args:
+        landmarks: 关键点
+        w, h: 图像宽高
+        left: True=患者左侧嘴唇, False=患者右侧嘴唇
+
+    Returns:
+        (cx, cy): 质心坐标
+    """
+    indices = LM.LIP_L if left else LM.LIP_R
+    points = pts2d(landmarks, indices, w, h)
+    return compute_centroid(points)
+
+
+def compute_lip_midline_symmetry(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    计算嘴唇相对于面中线的对称性
+
+    核心原理:
+    - 面中线: 双内眦中点的x坐标
+    - 左侧嘴唇区域质心到面中线的水平距离
+    - 右侧嘴唇区域质心到面中线的水平距离
+    - 如果嘴唇被拉向一侧，该侧距离会增大，另一侧减小
+
+    判断逻辑:
+    - 嘴唇偏向健侧（被健侧肌肉拉动）
+    - 所以：偏向的那侧是健侧，另一侧是面瘫侧
+
+    Returns:
+        Dict包含:
+        - midline_x: 面中线x坐标
+        - left_centroid: 左侧嘴唇质心 (x, y)
+        - right_centroid: 右侧嘴唇质心 (x, y)
+        - left_to_midline: 左侧嘴唇质心到中线的水平距离（正值）
+        - right_to_midline: 右侧嘴唇质心到中线的水平距离（正值）
+        - lip_offset: 嘴唇整体偏移 = (左侧距离 - 右侧距离)
+                      正值表示偏向左侧（患者左侧），负值表示偏向右侧（患者右侧）
+        - symmetry_ratio: 对称比 = min(L,R) / max(L,R)，越接近1越对称
+        - asymmetry_ratio: 不对称比 = |L-R| / max(L,R)
+        - palsy_side_suggestion: 根据偏移建议的面瘫侧 (0=对称, 1=左侧面瘫, 2=右侧面瘫)
+    """
+    # 面中线（双内眦中点）
+    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+    midline_x = (left_canthus[0] + right_canthus[0]) / 2
+
+    # 左右嘴唇质心
+    left_centroid = compute_lip_region_centroid(landmarks, w, h, left=True)
+    right_centroid = compute_lip_region_centroid(landmarks, w, h, left=False)
+
+    # 到面中线的水平距离
+    # 患者左侧嘴唇在图像右侧，x > midline_x
+    # 患者右侧嘴唇在图像左侧，x < midline_x
+    left_to_midline = abs(left_centroid[0] - midline_x)
+    right_to_midline = abs(right_centroid[0] - midline_x)
+
+    # 嘴唇整体偏移
+    # 如果左侧距离 > 右侧距离，说明嘴唇偏向左侧（患者左侧）
+    lip_offset = left_to_midline - right_to_midline
+
+    # 对称比和不对称比
+    max_dist = max(left_to_midline, right_to_midline)
+    min_dist = min(left_to_midline, right_to_midline)
+    symmetry_ratio = min_dist / max_dist if max_dist > 1e-6 else 1.0
+    asymmetry_ratio = abs(lip_offset) / max_dist if max_dist > 1e-6 else 0
+
+    # 面瘫侧建议
+    # 嘴唇偏向健侧，所以偏向的那侧是健侧，另一侧是面瘫侧
+    if asymmetry_ratio < 0.08:  # 偏移小于8%认为对称
+        palsy_side_suggestion = 0
+    elif lip_offset > 0:
+        # 嘴唇偏向左侧（患者左侧）= 被左侧拉 = 左侧是健侧 = 右侧面瘫
+        palsy_side_suggestion = 2
+    else:
+        # 嘴唇偏向右侧（患者右侧）= 被右侧拉 = 右侧是健侧 = 左侧面瘫
+        palsy_side_suggestion = 1
+
+    return {
+        "midline_x": float(midline_x),
+        "left_centroid": (float(left_centroid[0]), float(left_centroid[1])),
+        "right_centroid": (float(right_centroid[0]), float(right_centroid[1])),
+        "left_to_midline": float(left_to_midline),
+        "right_to_midline": float(right_to_midline),
+        "lip_offset": float(lip_offset),
+        "symmetry_ratio": float(symmetry_ratio),
+        "asymmetry_ratio": float(asymmetry_ratio),
+        "palsy_side_suggestion": palsy_side_suggestion,
+    }
+
+
+def compute_nose_midline_symmetry(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    计算鼻翼-内眦距离相对于面中线的对称性（用于ShrugNose面瘫侧判断）
+
+    核心原理:
+    - 皱鼻时，鼻翼向上向内收缩，鼻翼-内眦距离减小
+    - 面瘫侧鼻翼运动弱，鼻翼-内眦距离变化小（距离更大）
+    - 在峰值帧直接比较左右鼻翼到各自内眦的距离
+
+    判断逻辑:
+    - 皱鼻时距离应该变小
+    - 距离大的一侧是面瘫侧（收缩弱）
+
+    Returns:
+        Dict包含:
+        - left_ala_canthus_dist: 左鼻翼到左内眦距离
+        - right_ala_canthus_dist: 右鼻翼到右内眦距离
+        - distance_diff: 左 - 右 距离差
+        - asymmetry_ratio: 不对称比 = |L-R| / max(L,R)
+        - symmetry_ratio: 对称比 = min(L,R) / max(L,R)
+        - palsy_side_suggestion: 距离更大的一侧是面瘫侧（收缩弱）
+    """
+    # 鼻翼和内眦位置
+    left_ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
+    right_ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
+    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+
+    # 鼻翼到内眦距离
+    left_dist = dist(left_ala, left_canthus)
+    right_dist = dist(right_ala, right_canthus)
+
+    # 距离差和对称比
+    distance_diff = left_dist - right_dist
+    max_dist = max(left_dist, right_dist)
+    min_dist = min(left_dist, right_dist)
+    asymmetry_ratio = abs(distance_diff) / max_dist if max_dist > 1e-6 else 0
+    symmetry_ratio = min_dist / max_dist if max_dist > 1e-6 else 1.0
+
+    # 面瘫侧建议
+    # 皱鼻时距离应该变小，距离大的一侧是面瘫侧（收缩弱）
+    if asymmetry_ratio < 0.08:  # 8%以内认为对称
+        palsy_side_suggestion = 0
+    elif left_dist > right_dist:
+        # 左侧距离大 = 左侧收缩弱 = 左侧面瘫
+        palsy_side_suggestion = 1
+    else:
+        # 右侧距离大 = 右侧收缩弱 = 右侧面瘫
+        palsy_side_suggestion = 2
+
+    return {
+        "left_ala_canthus_dist": float(left_dist),
+        "right_ala_canthus_dist": float(right_dist),
+        "distance_diff": float(distance_diff),
+        "asymmetry_ratio": float(asymmetry_ratio),
+        "symmetry_ratio": float(symmetry_ratio),
+        "palsy_side_suggestion": palsy_side_suggestion,
     }

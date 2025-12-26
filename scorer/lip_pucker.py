@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import json
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -34,6 +35,7 @@ from clinical_base import (
     compute_icd, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
     kabsch_rigid_transform, apply_rigid_transform,
+    compute_lip_midline_symmetry,
 )
 
 from thresholds import THR
@@ -103,6 +105,7 @@ def _save_lip_z_curve_png(png_path, z_delta_norm, peak_idx: int):
     plt.savefig(str(png_path), dpi=150)
     plt.close()
 
+
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
                     baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
     """
@@ -133,8 +136,8 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
     base_icd = max(base_icd, 1e-6)
 
     # 门控阈值（你可以按数据再调）
-    mouth_h_thr = 0.32      # mouth_height / ICD 过大 => 张口
-    seal_thr = 0.3         # lip_seal_total / ICD 过大 => 唇不闭合
+    mouth_h_thr = 0.32  # mouth_height / ICD 过大 => 张口
+    seal_thr = 0.3  # lip_seal_total / ICD 过大 => 唇不闭合
 
     best_score = -1e18
     best_idx = 0
@@ -202,7 +205,7 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
 def compute_lip_pucker_metrics(landmarks, w: int, h: int,
                                baseline_landmarks=None) -> Dict[str, Any]:
     """
-    计算撅嘴特有指标 - 增加嘴角位移和面中线对称性
+    计算撅嘴特有指标 - 增加面中线对称性和运动变化量
     """
     mouth = compute_mouth_metrics(landmarks, w, h)
     oral = compute_oral_angle(landmarks, w, h)
@@ -211,23 +214,23 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
     left_corner = mouth["left_corner"]
     right_corner = mouth["right_corner"]
 
-    # 嘴角高度对称性
-    avg_y = (left_corner[1] + right_corner[1]) / 2
-    left_height_diff = avg_y - left_corner[1]  # 正值=左嘴角更高
-    right_height_diff = avg_y - right_corner[1]  # 正值=右嘴角更高
-
     # 面中线参考
     left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
     right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
     midline_x = (left_canthus[0] + right_canthus[0]) / 2
 
-    # 嘴角相对于面中线的水平距离
-    left_to_midline = midline_x - left_corner[0]
-    right_to_midline = right_corner[0] - midline_x
+    # 左右嘴角到面中线的距离（保留用于参考）
+    left_to_midline = abs(midline_x - left_corner[0])
+    right_to_midline = abs(right_corner[0] - midline_x)
 
     # 嘴唇中心相对于面中线的偏移
     mouth_center_x = (left_corner[0] + right_corner[0]) / 2
     mouth_midline_offset = mouth_center_x - midline_x
+
+    # 嘴角高度对称性
+    avg_y = (left_corner[1] + right_corner[1]) / 2
+    left_height_diff = avg_y - left_corner[1]
+    right_height_diff = avg_y - right_corner[1]
 
     metrics = {
         "mouth_width": float(mouth["width"]),
@@ -235,14 +238,11 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
         "width_height_ratio": float(mouth["width"] / mouth["height"]) if mouth["height"] > 1e-9 else 0,
         "left_corner": left_corner,
         "right_corner": right_corner,
-        "corner_height_diff": float(left_height_diff - right_height_diff),
-        "left_height_diff": float(left_height_diff),
-        "right_height_diff": float(right_height_diff),
         "midline_x": float(midline_x),
         "left_to_midline": float(left_to_midline),
         "right_to_midline": float(right_to_midline),
-        "midline_symmetry_ratio": float(left_to_midline / right_to_midline) if right_to_midline > 1e-9 else 1.0,
         "mouth_midline_offset": float(mouth_midline_offset),
+        "corner_height_diff": float(left_height_diff - right_height_diff),
         "oral_angle": {
             "AOE": float(oral.AOE_angle),
             "BOF": float(oral.BOF_angle),
@@ -250,22 +250,27 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
         }
     }
 
+    # ========== 嘴唇面中线对称性（用于面瘫侧别判断）==========
+    lip_symmetry = compute_lip_midline_symmetry(landmarks, w, h)
+    metrics["lip_symmetry"] = lip_symmetry
+
     # 基线参考
     if baseline_landmarks is not None:
         scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
         metrics["scale"] = scale
 
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
+        baseline_oral = compute_oral_angle(baseline_landmarks, w, h)
         baseline_left = baseline_mouth["left_corner"]
         baseline_right = baseline_mouth["right_corner"]
 
-        # 嘴角位移（缩放到基线尺度）
+        # 口角角度变化（保留用于参考）
+        aoe_change = oral.AOE_angle - baseline_oral.AOE_angle
+        bof_change = oral.BOF_angle - baseline_oral.BOF_angle
+
+        # 嘴角位移（总位移）
         left_displacement = dist(left_corner, baseline_left) * scale
         right_displacement = dist(right_corner, baseline_right) * scale
-
-        # 撅嘴时嘴角应向中心移动，计算水平位移
-        left_x_move = (left_corner[0] - baseline_left[0]) * scale  # 正值=向右移动
-        right_x_move = (right_corner[0] - baseline_right[0]) * scale  # 负值=向左移动
 
         # 嘴宽变化
         scaled_width = mouth["width"] * scale
@@ -273,15 +278,26 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
 
         metrics["baseline"] = {
             "mouth_width": float(baseline_mouth["width"]),
-            "mouth_height": float(baseline_mouth["height"]),
+            "AOE": float(baseline_oral.AOE_angle),
+            "BOF": float(baseline_oral.BOF_angle),
         }
+
+        metrics["movement"] = {
+            "aoe_change": float(aoe_change),
+            "bof_change": float(bof_change),
+        }
+
         metrics["left_corner_displacement"] = float(left_displacement)
         metrics["right_corner_displacement"] = float(right_displacement)
-        metrics["left_x_move"] = float(left_x_move)
-        metrics["right_x_move"] = float(right_x_move)
         metrics["width_change"] = float(width_change)
         metrics["width_ratio"] = float(scaled_width / baseline_mouth["width"]) if baseline_mouth[
                                                                                       "width"] > 1e-9 else 1.0
+
+        # 保留原有的百分比计算
+        if baseline_mouth["width"] > 1e-9:
+            metrics["width_change_percent"] = width_change / baseline_mouth["width"] * 100
+        else:
+            metrics["width_change_percent"] = 0
 
     return metrics
 
@@ -290,11 +306,14 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
     从撅嘴动作检测面瘫侧别
 
-    原理:
-    1. 撅嘴时两侧嘴角向中心收缩
-    2. 面瘫侧收缩能力差，位移小
-    3. 嘴唇整体可能偏向健侧
-    4. 面瘫侧嘴角位置可能更低
+    核心原理:
+    - 面瘫侧肌肉瘫痪，健侧肌肉收缩把嘴唇拉向健侧
+    - 直接比较峰值帧嘴唇区域相对于面中线的对称性
+    - 嘴唇偏向的那侧是健侧，另一侧是面瘫侧
+
+    方法:
+    1. 主要：嘴唇区域面中线对称性（lip_symmetry）
+    2. 退化：口角角度（oral_angle）
     """
     result = {
         "palsy_side": 0,
@@ -304,79 +323,65 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
+    # ========== 方法1：嘴唇面中线对称性（优先使用）==========
+    if "lip_symmetry" in metrics:
+        lip_sym = metrics["lip_symmetry"]
+        left_dist = lip_sym["left_to_midline"]
+        right_dist = lip_sym["right_to_midline"]
+        lip_offset = lip_sym["lip_offset"]
+        asymmetry_ratio = lip_sym["asymmetry_ratio"]
+
+        result["method"] = "lip_midline_symmetry"
+        result["evidence"] = {
+            "left_to_midline": left_dist,
+            "right_to_midline": right_dist,
+            "lip_offset": lip_offset,
+            "asymmetry_ratio": asymmetry_ratio,
+            "symmetry_ratio": lip_sym["symmetry_ratio"],
+        }
+
+        # 置信度基于不对称程度
+        result["confidence"] = min(1.0, asymmetry_ratio * 3.0)
+
+        if asymmetry_ratio < 0.08:  # 8%以内认为对称
+            result["palsy_side"] = 0
+            result["interpretation"] = f"嘴唇对称 (L={left_dist:.1f}px, R={right_dist:.1f}px, 偏移{lip_offset:+.1f}px)"
+        elif lip_offset > 0:
+            # 嘴唇偏向左侧（患者左侧）= 被左侧拉 = 右侧面瘫
+            result["palsy_side"] = 2
+            result["interpretation"] = f"嘴唇偏左 (L={left_dist:.1f}px > R={right_dist:.1f}px) → 右侧面瘫"
+        else:
+            # 嘴唇偏向右侧（患者右侧）= 被右侧拉 = 左侧面瘫
+            result["palsy_side"] = 1
+            result["interpretation"] = f"嘴唇偏右 (R={right_dist:.1f}px > L={left_dist:.1f}px) → 左侧面瘫"
+
+        return result
+
+    # ========== 方法2（退化）：口角角度比较 ==========
     oral = metrics.get("oral_angle", {})
-    aoe = oral.get("AOE", 0)
-    bof = oral.get("BOF", 0)
+    aoe = oral.get("AOE", 0)  # 右侧口角角度
+    bof = oral.get("BOF", 0)  # 左侧口角角度
 
-    # 优先使用嘴角位移（如果有基线）
-    if "left_corner_displacement" in metrics and "right_corner_displacement" in metrics:
-        left_disp = metrics["left_corner_displacement"]
-        right_disp = metrics["right_corner_displacement"]
-        max_disp = max(left_disp, right_disp)
+    result["method"] = "oral_angle"
+    angle_diff = abs(aoe - bof)
+    result["confidence"] = min(1.0, angle_diff / 15)
+    result["evidence"] = {
+        "AOE_right": aoe,
+        "BOF_left": bof,
+        "angle_diff": angle_diff,
+    }
 
-        result["method"] = "corner_displacement"
-        result["evidence"] = {
-            "left_displacement": left_disp,
-            "right_displacement": right_disp,
-            "width_ratio": metrics.get("width_ratio", 1.0),
-            "midline_offset": metrics.get("mouth_midline_offset", 0),
-        }
-
-        if max_disp < 3:  # 运动幅度过小
-            result["interpretation"] = f"撅嘴幅度过小 (L={left_disp:.1f}px, R={right_disp:.1f}px)"
-            result["evidence"]["status"] = "insufficient_movement"
-            return result
-
-        # 计算不对称比例
-        asymmetry = abs(left_disp - right_disp) / max_disp
-        result["confidence"] = min(1.0, asymmetry * 2.5)
-        result["evidence"]["asymmetry_ratio"] = asymmetry
-
-        if asymmetry < 0.15:
-            result["palsy_side"] = 0
-            result[
-                "interpretation"] = f"双侧运动对称 (L={left_disp:.1f}px, R={right_disp:.1f}px, 差异{asymmetry * 100:.1f}%)"
-        elif left_disp < right_disp:
-            # 左侧位移小 -> 左侧面瘫
-            result["palsy_side"] = 1
-            result[
-                "interpretation"] = f"左侧运动弱 (L={left_disp:.1f}px < R={right_disp:.1f}px, 差异{asymmetry * 100:.1f}%)"
-        else:
-            result["palsy_side"] = 2
-            result[
-                "interpretation"] = f"右侧运动弱 (R={right_disp:.1f}px < L={left_disp:.1f}px, 差异{asymmetry * 100:.1f}%)"
-
+    if angle_diff < 3:  # 3度以内认为对称
+        result["palsy_side"] = 0
+        result["interpretation"] = f"口角对称 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°)"
+    elif aoe < bof:
+        # 右口角角度更小（位置更低） -> 右侧面瘫
+        result["palsy_side"] = 2
+        result["interpretation"] = f"右口角较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
     else:
-        # 没有基线，使用嘴角高度和面中线对称性
-        result["method"] = "height_and_midline"
-
-        corner_height_diff = metrics.get("corner_height_diff", 0)
-        midline_ratio = metrics.get("midline_symmetry_ratio", 1.0)
-        midline_offset = metrics.get("mouth_midline_offset", 0)
-
-        result["evidence"] = {
-            "AOE_right": aoe,
-            "BOF_left": bof,
-            "corner_height_diff": corner_height_diff,
-            "midline_ratio": midline_ratio,
-            "midline_offset": midline_offset,
-        }
-
-        angle_diff = abs(aoe - bof)
-
-        # 综合判断：口角角度 + 高度差
-        if angle_diff < 3 and abs(corner_height_diff) < 3:
-            result["palsy_side"] = 0
-            result["interpretation"] = f"口角对称 (角度差{angle_diff:.1f}°, 高度差{corner_height_diff:.1f}px)"
-        elif aoe < bof or corner_height_diff < -2:
-            # 右口角更低
-            result["palsy_side"] = 2
-            result["confidence"] = min(1.0, max(angle_diff, abs(corner_height_diff)) / 10)
-            result["interpretation"] = f"右口角较低 (AOE={aoe:+.1f}°, 高度差={corner_height_diff:.1f}px)"
-        else:
-            result["palsy_side"] = 1
-            result["confidence"] = min(1.0, max(angle_diff, abs(corner_height_diff)) / 10)
-            result["interpretation"] = f"左口角较低 (BOF={bof:+.1f}°, 高度差={corner_height_diff:.1f}px)"
+        # 左口角角度更小 -> 左侧面瘫
+        result["palsy_side"] = 1
+        result["interpretation"] = f"左口角较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
 
     return result
 
@@ -544,6 +549,41 @@ def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, asym_color, 1)
     y += 22
 
+    # ========== 绘制嘴唇对称性证据 ==========
+    if "lip_symmetry" in metrics:
+        lip_sym = metrics["lip_symmetry"]
+        cv2.putText(img, "=== Lip Symmetry Evidence ===", (15, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        y += 20
+
+        left_dist = lip_sym["left_to_midline"]
+        right_dist = lip_sym["right_to_midline"]
+        lip_offset = lip_sym["lip_offset"]
+        asymmetry_ratio = lip_sym["asymmetry_ratio"]
+
+        # 左侧距离
+        left_color = (0, 255, 0) if left_dist >= right_dist else (0, 0, 255)
+        cv2.putText(img, f"L to mid: {left_dist:.1f}px", (15, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, left_color, 1)
+        y += 18
+
+        # 右侧距离
+        right_color = (0, 255, 0) if right_dist >= left_dist else (0, 0, 255)
+        cv2.putText(img, f"R to mid: {right_dist:.1f}px", (15, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, right_color, 1)
+        y += 18
+
+        # 偏移方向
+        direction = "L" if lip_offset > 0 else "R"
+        cv2.putText(img, f"Offset: {lip_offset:+.1f}px ({direction})", (15, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        y += 18
+
+        # 不对称比例
+        cv2.putText(img, f"Asym: {asymmetry_ratio * 100:.1f}%", (15, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        y += 22
+
     # 面瘫侧别检测结果
     palsy_side = palsy_detection.get("palsy_side", 0)
     palsy_text = {0: "Symmetry", 1: "Left", 2: "Right"}.get(palsy_side, "Unkown")
@@ -555,6 +595,29 @@ def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
     # Voluntary Score
     cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+    # ========== 绘制面中线（虚线） ==========
+    if "midline_x" in metrics:
+        midline_x = int(metrics["midline_x"])
+        # 绘制虚线
+        for yy in range(0, h, 10):
+            cv2.line(img, (midline_x, yy), (midline_x, min(yy + 5, h)), (0, 255, 255), 1)
+        # 标注
+        cv2.putText(img, "Mid", (midline_x + 5, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+    # ========== 绘制嘴角到中线的连线 ==========
+    if "left_corner" in metrics and "midline_x" in metrics:
+        left_corner = metrics["left_corner"]
+        right_corner = metrics["right_corner"]
+        midline_x = int(metrics["midline_x"])
+
+        # 左嘴角到中线的水平线（蓝色）
+        cv2.line(img, (int(left_corner[0]), int(left_corner[1])),
+                 (midline_x, int(left_corner[1])), (255, 0, 0), 1)
+        # 右嘴角到中线的水平线（橙色）
+        cv2.line(img, (int(right_corner[0]), int(right_corner[1])),
+                 (midline_x, int(right_corner[1])), (0, 165, 255), 1)
 
     return img
 
@@ -605,12 +668,15 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     # 存储动作特有指标
     result.action_specific = {
-        "lip_pucker_metrics": {
-            "mouth_width": metrics["mouth_width"],
-            "mouth_height": metrics["mouth_height"],
+        "mouth_metrics": {
+            "width": metrics["mouth_width"],
+            "height": metrics["mouth_height"],
             "width_height_ratio": metrics["width_height_ratio"],
-            "oral_angle": metrics["oral_angle"],
         },
+        "oral_angle": metrics["oral_angle"],
+        "midline_x": metrics.get("midline_x", 0),
+        "left_to_midline": metrics.get("left_to_midline", 0),
+        "right_to_midline": metrics.get("right_to_midline", 0),
         "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
@@ -618,10 +684,14 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     if "baseline" in metrics:
         result.action_specific["baseline"] = metrics["baseline"]
+
+    if "movement" in metrics:
+        result.action_specific["movement"] = metrics["movement"]
+
+    if "width_change" in metrics:
         result.action_specific["changes"] = {
-            "width_change": metrics.get("width_change", 0),
-            "width_change_percent": metrics.get("width_change_percent", 0),
-            "width_ratio": metrics.get("width_ratio", 1),
+            "width_change": metrics["width_change"],
+            "width_ratio": metrics.get("width_ratio", 1.0),
         }
 
     # 创建输出目录

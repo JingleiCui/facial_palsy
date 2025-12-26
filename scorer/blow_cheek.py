@@ -31,9 +31,10 @@ from clinical_base import (
     compute_scale_to_baseline,
     kabsch_rigid_transform, apply_rigid_transform,
     add_valid_region_shading, get_palsy_side_text,
-    draw_palsy_side_label,
+    draw_palsy_side_label, compute_lip_midline_symmetry,
 )
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -112,7 +113,8 @@ def _mean_region_z_aligned(landmarks, indices: List[int], w: int, h: int,
         p = _safe_pt3d(landmarks, i, w, h)
         q = _safe_pt3d(baseline_landmarks, i, w, h)
         if p is not None and q is not None:
-            P.append(p); Q.append(q)
+            P.append(p);
+            Q.append(q)
 
     if len(P) < 3 or len(Q) < 3:
         return _mean_region_z_aligned(landmarks, indices, w, h, baseline_landmarks=None)
@@ -161,7 +163,8 @@ def compute_cheek_depth_delta(landmarks, w: int, h: int, baseline_landmarks=None
     left_z_aligned = _mean_region_z_aligned(landmarks, LM.BLOW_CHEEK_L, w, h, baseline_landmarks=baseline_landmarks)
     right_z_aligned = _mean_region_z_aligned(landmarks, LM.BLOW_CHEEK_R, w, h, baseline_landmarks=baseline_landmarks)
 
-    if not np.isfinite(base_left_z) or not np.isfinite(base_right_z) or not np.isfinite(left_z_aligned) or not np.isfinite(right_z_aligned):
+    if not np.isfinite(base_left_z) or not np.isfinite(base_right_z) or not np.isfinite(
+            left_z_aligned) or not np.isfinite(right_z_aligned):
         return {
             "left_delta_norm": None, "right_delta_norm": None, "mean_delta_norm": None,
             "left_z_aligned": float(left_z_aligned), "right_z_aligned": float(right_z_aligned),
@@ -260,16 +263,16 @@ def _inner_lip_area_norm(lm, w: int, h: int, icd: float) -> float:
 
 
 def find_peak_frame(
-    landmarks_seq: List,
-    frames_seq: List,   # 保留参数，但不再用它做“囤帧”
-    w: int,
-    h: int,
-    baseline_landmarks=None,
-    seal_thr: float = None,          # lip_seal_total / ICD  越小越闭合
-    mouth_thr: float = None,        # mouth_height / ICD    越小越不张口
-    smooth_win: int = None,
-    inner_area_inc_thr: float = None,    #  你提出：内圈面积相对静息增幅>30% => 认为没闭嘴
-    inner_area_base_eps: float = None,   # baseline面积太小防止ratio爆炸
+        landmarks_seq: List,
+        frames_seq: List,  # 保留参数，但不再用它做“囤帧”
+        w: int,
+        h: int,
+        baseline_landmarks=None,
+        seal_thr: float = None,  # lip_seal_total / ICD  越小越闭合
+        mouth_thr: float = None,  # mouth_height / ICD    越小越不张口
+        smooth_win: int = None,
+        inner_area_inc_thr: float = None,  # 你提出：内圈面积相对静息增幅>30% => 认为没闭嘴
+        inner_area_base_eps: float = None,  # baseline面积太小防止ratio爆炸
 ) -> Tuple[int, Dict[str, Any]]:
     """
     鼓腮关键帧选择：
@@ -317,7 +320,6 @@ def find_peak_frame(
         except Exception:
             return None
 
-
     # --------- 区域平均z：对齐到baseline后再算 ----------
     def _mean_region_z_aligned(curr_landmarks, indices: List[int], baseline_landmarks):
         if curr_landmarks is None or baseline_landmarks is None:
@@ -335,7 +337,8 @@ def find_peak_frame(
             p = _safe_pt3d(curr_landmarks, i)
             q = _safe_pt3d(baseline_landmarks, i)
             if p is not None and q is not None:
-                P.append(p); Q.append(q)
+                P.append(p);
+                Q.append(q)
 
         if len(P) < 3:
             # 对齐失败就退化为直接平均当前z（不理想但保证能跑）
@@ -456,7 +459,8 @@ def find_peak_frame(
                 inner_area_inc_arr[i] = (inner_area_norm_arr[i] / base_inner_area) - 1.0
 
         # 核心：左右脸颊深度代理（对齐到baseline）
-        if baseline_landmarks is not None and np.isfinite(base_left_z) and np.isfinite(base_right_z) and np.isfinite(icd):
+        if baseline_landmarks is not None and np.isfinite(base_left_z) and np.isfinite(base_right_z) and np.isfinite(
+                icd):
             lz_aligned = _mean_region_z_aligned(lm, LM.BLOW_CHEEK_L, baseline_landmarks)
             rz_aligned = _mean_region_z_aligned(lm, LM.BLOW_CHEEK_R, baseline_landmarks)
 
@@ -569,6 +573,7 @@ def _smooth_1d_nan(x: np.ndarray, win: int = 5) -> np.ndarray:
         y[i] = np.nanmean(seg)
     return y
 
+
 def _get_blow_cheek_polygons():
     """
     优先用 LM.BLOW_CHEEK_L/R；如果没有，就回退到 LM.CHEEK_L/R。
@@ -603,22 +608,41 @@ def _minmax01(x: np.ndarray) -> np.ndarray:
 
 def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=None) -> Dict[str, Any]:
     """
-    鼓腮动作指标：
-    - 使用统一 scale
-    - lip_seal: 唇封闭距离
-    - mouth: 嘴部宽度等
-    - oral_angle: AOE/BOF角（存成dict，避免 .get 报错）
-    - cheek_area: 脸颊区域面积（归一化 + 左右差异 + 相对静息变化）
+    鼓腮动作指标 - 增加面中线对称性分析
     """
     mouth = compute_mouth_metrics(landmarks, w, h)
     oral = compute_oral_angle(landmarks, w, h)
     lip_seal = compute_lip_seal_distance(landmarks, w, h)
+
+    # ========== 面中线对称性计算 ==========
+    left_corner = mouth["left_corner"]
+    right_corner = mouth["right_corner"]
+
+    # 面中线：使用双内眦中点
+    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+    midline_x = (left_canthus[0] + right_canthus[0]) / 2
+
+    # 左右嘴角到面中线的距离（保留用于参考，不用于判断）
+    left_to_midline = abs(midline_x - left_corner[0])
+    right_to_midline = abs(right_corner[0] - midline_x)
+
+    # 嘴唇中心相对于面中线的偏移
+    mouth_center_x = (left_corner[0] + right_corner[0]) / 2
+    mouth_midline_offset = mouth_center_x - midline_x
+    # ==========================================
 
     metrics = {
         "mouth_width": mouth["width"],
         "mouth_height": mouth["height"],
         "lip_seal": lip_seal,
         "lip_seal_total_distance": lip_seal["total_distance"],
+        "midline_x": float(midline_x),
+        "left_to_midline": float(left_to_midline),
+        "right_to_midline": float(right_to_midline),
+        "mouth_midline_offset": float(mouth_midline_offset),
+        "left_corner": left_corner,
+        "right_corner": right_corner,
         "oral_angle": {
             "AOE": oral.AOE_angle,
             "BOF": oral.BOF_angle,
@@ -630,26 +654,37 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=Non
     cheek_depth = compute_cheek_depth_delta(landmarks, w, h, baseline_landmarks)
     metrics["cheek_depth"] = cheek_depth
 
+    # ========== 嘴唇面中线对称性（用于面瘫侧别判断）==========
+    lip_symmetry = compute_lip_midline_symmetry(landmarks, w, h)
+    metrics["lip_symmetry"] = lip_symmetry
+
     # 如果有基线
     if baseline_landmarks is not None:
-        # ========== 计算统一 scale ==========
         scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
         metrics["scale"] = scale
-        # ====================================
 
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
         baseline_seal = compute_lip_seal_distance(baseline_landmarks, w, h)
+        baseline_oral = compute_oral_angle(baseline_landmarks, w, h)
 
-        # ========== 缩放到 baseline 尺度 ==========
-        scaled_width = mouth["width"] * scale
-        scaled_seal = lip_seal["total_distance"] * scale
-        # ==========================================
+        # 口角角度变化（保留用于参考）
+        aoe_change = oral.AOE_angle - baseline_oral.AOE_angle
+        bof_change = oral.BOF_angle - baseline_oral.BOF_angle
 
         metrics["baseline"] = {
             "mouth_width": baseline_mouth["width"],
             "lip_seal_total": baseline_seal["total_distance"],
+            "AOE": baseline_oral.AOE_angle,
+            "BOF": baseline_oral.BOF_angle,
         }
 
+        metrics["movement"] = {
+            "aoe_change": float(aoe_change),
+            "bof_change": float(bof_change),
+        }
+
+        scaled_width = mouth["width"] * scale
+        scaled_seal = lip_seal["total_distance"] * scale
         metrics["seal_change"] = scaled_seal - baseline_seal["total_distance"]
         metrics["mouth_width_change"] = scaled_width - baseline_mouth["width"]
 
@@ -660,10 +695,15 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
     从鼓腮动作检测面瘫侧别
 
-    原理:
-    1. 嘴唇闭合对称性（面瘫侧可能漏气）
-    2. 脸颊膨胀对称性
-    3. 口角位置对称性
+    核心原理:
+    - 面瘫侧肌肉瘫痪，健侧肌肉收缩把嘴唇拉向健侧
+    - 直接比较峰值帧嘴唇区域相对于面中线的对称性
+    - 嘴唇偏向的那侧是健侧，另一侧是面瘫侧
+
+    方法:
+    1. 主要：嘴唇区域面中线对称性（lip_symmetry）
+    2. 辅助：脸颊深度不对称（cheek_depth）
+    3. 退化：口角角度（oral_angle）
     """
     result = {
         "palsy_side": 0,
@@ -673,68 +713,73 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
-    # 获取各项指标
+    # ========== 方法1：嘴唇面中线对称性（优先使用）==========
+    if "lip_symmetry" in metrics:
+        lip_sym = metrics["lip_symmetry"]
+        left_dist = lip_sym["left_to_midline"]
+        right_dist = lip_sym["right_to_midline"]
+        lip_offset = lip_sym["lip_offset"]
+        asymmetry_ratio = lip_sym["asymmetry_ratio"]
+
+        result["method"] = "lip_midline_symmetry"
+        result["evidence"] = {
+            "left_to_midline": left_dist,
+            "right_to_midline": right_dist,
+            "lip_offset": lip_offset,
+            "asymmetry_ratio": asymmetry_ratio,
+            "symmetry_ratio": lip_sym["symmetry_ratio"],
+        }
+
+        # 置信度基于不对称程度
+        result["confidence"] = min(1.0, asymmetry_ratio * 3.0)
+
+        if asymmetry_ratio < 0.08:  # 8%以内认为对称
+            result["palsy_side"] = 0
+            result["interpretation"] = f"嘴唇对称 (L={left_dist:.1f}px, R={right_dist:.1f}px, 偏移{lip_offset:+.1f}px)"
+        elif lip_offset > 0:
+            # 嘴唇偏向左侧（患者左侧）= 被左侧拉 = 右侧面瘫
+            result["palsy_side"] = 2
+            result["interpretation"] = f"嘴唇偏左 (L={left_dist:.1f}px > R={right_dist:.1f}px) → 右侧面瘫"
+        else:
+            # 嘴唇偏向右侧（患者右侧）= 被右侧拉 = 左侧面瘫
+            result["palsy_side"] = 1
+            result["interpretation"] = f"嘴唇偏右 (R={right_dist:.1f}px > L={left_dist:.1f}px) → 左侧面瘫"
+
+        # 如果有脸颊深度数据，添加到evidence中作为参考
+        if "cheek_depth" in metrics:
+            cd = metrics["cheek_depth"]
+            result["evidence"]["cheek_depth"] = {
+                "left_delta_norm": cd.get("left_delta_norm"),
+                "right_delta_norm": cd.get("right_delta_norm"),
+            }
+
+        return result
+
+    # ========== 方法2（退化）：口角角度比较 ==========
     oral = metrics.get("oral_angle", {})
-    aoe = oral.get("AOE", 0)
-    bof = oral.get("BOF", 0)
-    oral_asym = oral.get("asymmetry", 0)
+    aoe = oral.get("AOE", 0)  # 右侧口角角度
+    bof = oral.get("BOF", 0)  # 左侧口角角度
 
-    cheek = metrics.get("cheek_depth", {})
-    left_delta = cheek.get("left_delta_norm", 0)
-    right_delta = cheek.get("right_delta_norm", 0)
-
-    lip_seal = metrics.get("lip_seal", {})
-
+    result["method"] = "oral_angle"
+    angle_diff = abs(aoe - bof)
+    result["confidence"] = min(1.0, angle_diff / 15)
     result["evidence"] = {
         "AOE_right": aoe,
         "BOF_left": bof,
-        "oral_asymmetry": oral_asym,
-        "left_cheek_delta": left_delta,
-        "right_cheek_delta": right_delta,
+        "angle_diff": angle_diff,
     }
 
-    # 方法1：口角对称性（最可靠）
-    # 鼓腮时嘴唇应该闭紧且对称
-    if oral_asym >= 3:
-        result["method"] = "oral_angle"
-        result["confidence"] = min(1.0, oral_asym / 15)
-
-        if aoe < bof:
-            # 右口角更低 -> 右侧面瘫
-            result["palsy_side"] = 2
-            result["interpretation"] = f"右口角较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°, 差{oral_asym:.1f}°)"
-        else:
-            result["palsy_side"] = 1
-            result["interpretation"] = f"左口角较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°, 差{oral_asym:.1f}°)"
-        return result
-
-    # 方法2：脸颊深度变化
-    # 鼓腮时脸颊外凸，delta应为正值
-    left_abs = abs(left_delta)
-    right_abs = abs(right_delta)
-    max_delta = max(left_abs, right_abs)
-
-    if max_delta >= 0.01:  # 有明显脸颊变化
-        result["method"] = "cheek_depth"
-        asymmetry = abs(left_abs - right_abs) / max_delta
-        result["confidence"] = min(1.0, asymmetry * 2)
-        result["evidence"]["cheek_asymmetry"] = asymmetry
-
-        if asymmetry >= 0.20:  # 20%以上差异
-            if left_abs < right_abs:
-                result["palsy_side"] = 1
-                result[
-                    "interpretation"] = f"左侧鼓腮弱 (L={left_delta:.4f} < R={right_delta:.4f}, 差异{asymmetry * 100:.1f}%)"
-            else:
-                result["palsy_side"] = 2
-                result[
-                    "interpretation"] = f"右侧鼓腮弱 (R={right_delta:.4f} < L={left_delta:.4f}, 差异{asymmetry * 100:.1f}%)"
-            return result
-
-    # 方法3：如果上述都不明显，判断为对称
-    result["method"] = "symmetric"
-    result["palsy_side"] = 0
-    result["interpretation"] = f"双侧鼓腮对称 (口角差{oral_asym:.1f}°, 脸颊差{abs(left_abs - right_abs):.4f})"
+    if angle_diff < 3:  # 3度以内认为对称
+        result["palsy_side"] = 0
+        result["interpretation"] = f"口角对称 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°)"
+    elif aoe < bof:
+        # 右口角角度更小（位置更低） -> 右侧面瘫
+        result["palsy_side"] = 2
+        result["interpretation"] = f"右口角较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
+    else:
+        # 左口角角度更小 -> 左侧面瘫
+        result["palsy_side"] = 1
+        result["interpretation"] = f"左口角较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
 
     return result
 
@@ -828,6 +873,7 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
 
     return synkinesis
 
+
 def _get_blow_cheek_vis_indices() -> list:
     """
     鼓腮可视化：只画嘴唇轮廓 + 鼓腮区域点（BLOW_CHEEK_L/R）
@@ -847,6 +893,7 @@ def _get_blow_cheek_vis_indices() -> list:
 
     # 去重 + 排序
     return sorted(set(int(i) for i in idx if isinstance(i, (int, np.integer))))
+
 
 BLOW_CHEEK_VIS_INDICES = _get_blow_cheek_vis_indices()
 
@@ -916,6 +963,64 @@ def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: i
                 FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
     y += LINE_HEIGHT + 10
 
+    # ========== 绘制嘴唇对称性证据 ==========
+    if "lip_symmetry" in metrics:
+        lip_sym = metrics["lip_symmetry"]
+        cv2.putText(img, "=== Lip Symmetry Evidence ===", (30, y),
+                    FONT, FONT_SCALE_NORMAL, (0, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT
+
+        left_dist = lip_sym["left_to_midline"]
+        right_dist = lip_sym["right_to_midline"]
+        lip_offset = lip_sym["lip_offset"]
+        asymmetry_ratio = lip_sym["asymmetry_ratio"]
+
+        # 左侧距离（距离大的用绿色表示健侧拉力强）
+        left_color = (0, 255, 0) if left_dist >= right_dist else (0, 0, 255)
+        cv2.putText(img, f"L to midline: {left_dist:.1f}px", (30, y),
+                    FONT, FONT_SCALE_NORMAL, left_color, THICKNESS_NORMAL)
+        y += LINE_HEIGHT
+
+        # 右侧距离
+        right_color = (0, 255, 0) if right_dist >= left_dist else (0, 0, 255)
+        cv2.putText(img, f"R to midline: {right_dist:.1f}px", (30, y),
+                    FONT, FONT_SCALE_NORMAL, right_color, THICKNESS_NORMAL)
+        y += LINE_HEIGHT
+
+        # 偏移方向
+        direction = "Left" if lip_offset > 0 else "Right"
+        cv2.putText(img, f"Lip Offset: {lip_offset:+.1f}px ({direction})", (30, y),
+                    FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT
+
+        # 不对称比例
+        cv2.putText(img, f"Asymmetry: {asymmetry_ratio * 100:.1f}%", (30, y),
+                    FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT
+
+    # ========== 绘制面中线（虚线） ==========
+    if "midline_x" in metrics:
+        midline_x = int(metrics["midline_x"])
+        # 绘制虚线
+        for yy in range(0, h, 10):
+            cv2.line(img, (midline_x, yy), (midline_x, min(yy + 5, h)), (0, 255, 255), 1)
+        # 标注
+        cv2.putText(img, "Mid", (midline_x + 5, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+    # ========== 绘制嘴角到中线的连线 ==========
+    if "left_corner" in metrics and "midline_x" in metrics:
+        left_corner = metrics["left_corner"]
+        right_corner = metrics["right_corner"]
+        midline_x = int(metrics["midline_x"])
+
+        # 左嘴角到中线的水平线（蓝色）
+        cv2.line(img, (int(left_corner[0]), int(left_corner[1])),
+                 (midline_x, int(left_corner[1])), (255, 0, 0), 1)
+        # 右嘴角到中线的水平线（橙色）
+        cv2.line(img, (int(right_corner[0]), int(right_corner[1])),
+                 (midline_x, int(right_corner[1])), (0, 165, 255), 1)
+
     # 面瘫侧别
     if palsy_detection:
         palsy_side = palsy_detection.get("palsy_side", 0)
@@ -970,7 +1075,6 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
-
     result.action_specific = {
         "lip_seal": metrics["lip_seal"],
         "mouth_width": metrics["mouth_width"],
@@ -978,10 +1082,16 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "oral_angle": metrics["oral_angle"],
         "cheek_depth": metrics.get("cheek_depth", {}),
         "palsy_detection": palsy_detection,
+        "midline_x": metrics.get("midline_x", 0),
+        "left_to_midline": metrics.get("left_to_midline", 0),
+        "right_to_midline": metrics.get("right_to_midline", 0),
     }
 
     if "baseline" in metrics:
         result.action_specific["baseline"] = metrics["baseline"]
+
+    if "movement" in metrics:
+        result.action_specific["movement"] = metrics["movement"]
         result.action_specific["changes"] = {
             "seal_change": metrics.get("seal_change", 0),
             "mouth_width_change": metrics.get("mouth_width_change", 0),

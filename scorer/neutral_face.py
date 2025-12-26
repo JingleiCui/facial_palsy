@@ -42,7 +42,8 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> in
     标准：
     1. 眼睛睁开（EAR > 阈值）
     2. 嘴巴闭合（嘴高/嘴宽 < 阈值）
-    3. 稳定区间（避免眨眼或张嘴的瞬间）
+    3. 眉毛稳定（眉毛不要在运动过程中）
+    4. 稳定区间（避免眨眼、张嘴或眉毛运动的瞬间）
     """
     from thresholds import THR
 
@@ -54,12 +55,16 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> in
     scores = []
     ear_values = []
     mouth_ratios = []
+    brow_heights_left = []  # 左眉高度（眉眼距）
+    brow_heights_right = []  # 右眉高度（眉眼距）
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
             scores.append(-999)
             ear_values.append(0)
             mouth_ratios.append(1)
+            brow_heights_left.append(0)
+            brow_heights_right.append(0)
             continue
 
         # 眼睛睁开程度
@@ -72,8 +77,15 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> in
         mouth = compute_mouth_metrics(lm, w, h)
         mouth_ratio = mouth["height"] / mouth["width"] if mouth["width"] > 1e-9 else 0
 
+        # 眉毛高度（眉眼距）
+        # 使用简单的眉毛中心到眼睛内眦的Y轴距离
+        left_brow_height = compute_brow_height(lm, w, h, left=True)
+        right_brow_height = compute_brow_height(lm, w, h, left=False)
+
         ear_values.append(avg_ear)
         mouth_ratios.append(mouth_ratio)
+        brow_heights_left.append(left_brow_height)
+        brow_heights_right.append(right_brow_height)
 
         # 评分：眼睛越睁开越好，嘴巴越闭越好
         score = 0.0
@@ -105,13 +117,19 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> in
 
         window_ears = ear_values[start:end]
         window_mouths = mouth_ratios[start:end]
+        window_brow_left = brow_heights_left[start:end]
+        window_brow_right = brow_heights_right[start:end]
 
         # 计算窗口内的变化（标准差）
         ear_std = np.std(window_ears) if len(window_ears) > 1 else 0
         mouth_std = np.std(window_mouths) if len(window_mouths) > 1 else 0
+        brow_left_std = np.std(window_brow_left) if len(window_brow_left) > 1 else 0
+        brow_right_std = np.std(window_brow_right) if len(window_brow_right) > 1 else 0
+        brow_std = (brow_left_std + brow_right_std) / 2  # 平均眉毛变化
 
         # 变化越小，稳定性越好
-        stability = 1.0 / (1.0 + ear_std * 10 + mouth_std * 5)
+        # 加入眉毛稳定性权重
+        stability = 1.0 / (1.0 + ear_std * 10 + mouth_std * 5 + brow_std * 3)
         stability_scores.append(stability)
 
     # 最终分数 = 基础分数 * 稳定性
