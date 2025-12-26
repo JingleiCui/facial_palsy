@@ -100,62 +100,93 @@ def extract_eye_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, Dict[
 
 def detect_palsy_side_from_closure(left_ear: float, right_ear: float,
                                    baseline_left_ear: float = None,
-                                   baseline_right_ear: float = None) -> Dict[str, Any]:
+                                   baseline_right_ear: float = None,
+                                   min_left_ear: float = None,
+                                   min_right_ear: float = None) -> Dict[str, Any]:
     """
-    从闭眼动作检测面瘫侧别 - 改进版，减少阈值依赖
+    从闭眼动作检测面瘫侧别 - 增强版
 
-    原理: 面瘫侧的眼睛无法完全闭合，EAR值较大
-    使用直接比较而非硬编码阈值
+    原理: 面瘫侧的眼睛无法完全闭合
+
+    增强指标:
+    1. 峰值帧的EAR值比较
+    2. 闭合完整性（相对于基线）
+    3. 最小EAR比较（整个序列中）
     """
     result = {
-        "left_ear": left_ear,
-        "right_ear": right_ear,
+        "palsy_side": 0,
+        "confidence": 0.0,
+        "interpretation": "",
+        "method": "",
+        "evidence": {
+            "left_ear": left_ear,
+            "right_ear": right_ear,
+        }
     }
 
-    # 如果有基线，计算闭合比例
+    # 如果有基线，计算闭合完整性
     if baseline_left_ear is not None and baseline_right_ear is not None:
-        # 闭合比例 = 当前EAR / 基线EAR，越小表示闭得越紧
-        left_closure_ratio = left_ear / baseline_left_ear if baseline_left_ear > 1e-9 else 1.0
-        right_closure_ratio = right_ear / baseline_right_ear if baseline_right_ear > 1e-9 else 1.0
-        result["left_closure_ratio"] = left_closure_ratio
-        result["right_closure_ratio"] = right_closure_ratio
-        result["left_closure_percent"] = (1 - left_closure_ratio) * 100
-        result["right_closure_percent"] = (1 - right_closure_ratio) * 100
+        # 闭合完整性 = (基线EAR - 当前EAR) / 基线EAR
+        # 越接近1表示闭得越紧
+        left_closure = (baseline_left_ear - left_ear) / baseline_left_ear if baseline_left_ear > 1e-9 else 0
+        right_closure = (baseline_right_ear - right_ear) / baseline_right_ear if baseline_right_ear > 1e-9 else 0
 
-        # 使用闭合比例比较
-        max_ratio = max(left_closure_ratio, right_closure_ratio)
-        if max_ratio > 1e-9:
-            asymmetry = abs(left_closure_ratio - right_closure_ratio) / max_ratio
+        result["evidence"]["baseline_left_ear"] = baseline_left_ear
+        result["evidence"]["baseline_right_ear"] = baseline_right_ear
+        result["evidence"]["left_closure_pct"] = left_closure * 100
+        result["evidence"]["right_closure_pct"] = right_closure * 100
+
+        result["method"] = "closure_completeness"
+
+        max_closure = max(left_closure, right_closure)
+        if max_closure < 0.3:  # 闭合不足30%
+            result["interpretation"] = f"闭眼幅度过小 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
+            result["evidence"]["status"] = "insufficient_closure"
+            return result
+
+        # 计算不对称比例
+        asymmetry = abs(left_closure - right_closure) / max_closure
+        result["confidence"] = min(1.0, asymmetry * 3)
+        result["evidence"]["asymmetry_ratio"] = asymmetry
+
+        if asymmetry < 0.15:
+            result["palsy_side"] = 0
+            result[
+                "interpretation"] = f"双眼闭合对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
+        elif left_closure < right_closure:
+            # 左眼闭合程度低 -> 左侧面瘫
+            result["palsy_side"] = 1
+            result[
+                "interpretation"] = f"左眼闭合差 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
         else:
-            asymmetry = 0
+            result["palsy_side"] = 2
+            result[
+                "interpretation"] = f"右眼闭合差 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
+
     else:
         # 没有基线，直接比较EAR
+        result["method"] = "ear_comparison"
+
         max_ear = max(left_ear, right_ear)
-        if max_ear > 1e-9:
-            asymmetry = abs(left_ear - right_ear) / max_ear
+        if max_ear < 0.05:  # 两眼都几乎完全闭合
+            result["palsy_side"] = 0
+            result["interpretation"] = f"双眼完全闭合 (L_EAR={left_ear:.4f}, R_EAR={right_ear:.4f})"
+            return result
+
+        asymmetry = abs(left_ear - right_ear) / max_ear
+        result["confidence"] = min(1.0, asymmetry * 3)
+        result["evidence"]["asymmetry_ratio"] = asymmetry
+
+        if asymmetry < 0.15:
+            result["palsy_side"] = 0
+            result["interpretation"] = f"双眼对称 (L={left_ear:.4f}, R={right_ear:.4f}, 差异{asymmetry * 100:.1f}%)"
+        elif left_ear > right_ear:
+            # 左眼EAR更大（闭合更差） -> 左侧面瘫
+            result["palsy_side"] = 1
+            result["interpretation"] = f"左眼闭合差 (L_EAR={left_ear:.4f} > R_EAR={right_ear:.4f})"
         else:
-            asymmetry = 0
-
-    result["asymmetry_ratio"] = asymmetry
-    result["confidence"] = min(1.0, asymmetry * 3)  # 约33%差异 -> 100%置信度
-
-    # 判断面瘫侧别：EAR大的一侧闭合不完全 -> 面瘫侧
-    if asymmetry < 0.10:  # 10%以内认为对称
-        result["palsy_side"] = 0
-        result["left_closed"] = True
-        result["right_closed"] = True
-        result["interpretation"] = f"双眼对称闭合 (差异{asymmetry * 100:.1f}%)"
-    elif left_ear > right_ear:
-        # 左眼EAR更大 -> 左眼闭合较差 -> 左侧面瘫
-        result["palsy_side"] = 1
-        result["left_closed"] = False
-        result["right_closed"] = True
-        result["interpretation"] = f"左眼闭合较差 (L_EAR={left_ear:.3f} > R_EAR={right_ear:.3f})"
-    else:
-        result["palsy_side"] = 2
-        result["left_closed"] = True
-        result["right_closed"] = False
-        result["interpretation"] = f"右眼闭合较差 (R_EAR={right_ear:.3f} > L_EAR={left_ear:.3f})"
+            result["palsy_side"] = 2
+            result["interpretation"] = f"右眼闭合差 (R_EAR={right_ear:.4f} > L_EAR={left_ear:.4f})"
 
     return result
 

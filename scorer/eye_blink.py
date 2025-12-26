@@ -260,36 +260,59 @@ def visualize_blink_indicators(frame: np.ndarray, landmarks, w: int, h: int,
 
 def detect_palsy_side(dynamics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从眨眼动作检测面瘫侧别
+    从眨眼动作检测面瘫侧别 - 增强版
 
-    原理: 面瘫侧眼睛无法完全闭合，闭合比例低
+    原理:
+    1. 面瘫侧眼睛闭合比例低
+    2. 面瘫侧眨眼速度可能慢
+    3. EAR变化曲线不对称
     """
-    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+    result = {
+        "palsy_side": 0,
+        "confidence": 0.0,
+        "interpretation": "",
+        "method": "",
+        "evidence": {}
+    }
 
     left_closure = dynamics.get("left_closure_ratio", 0)
     right_closure = dynamics.get("right_closure_ratio", 0)
+    symmetry_ratio = dynamics.get("symmetry_ratio_mean", 1.0)
+
+    result["evidence"] = {
+        "left_closure_pct": left_closure * 100,
+        "right_closure_pct": right_closure * 100,
+        "symmetry_ratio_mean": symmetry_ratio,
+    }
 
     max_closure = max(left_closure, right_closure)
 
-    if max_closure < 0.2:  # 几乎没有眨眼
-        result["interpretation"] = "眨眼幅度过小"
+    if max_closure < 0.25:  # 闭合不足25%
+        result["method"] = "insufficient"
+        result["interpretation"] = f"眨眼幅度过小 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
+        result["evidence"]["status"] = "insufficient_movement"
         return result
 
+    result["method"] = "closure_ratio"
+
+    # 计算不对称比例
     asymmetry = abs(left_closure - right_closure) / max_closure
-    result["confidence"] = min(1.0, asymmetry * 2)
-    result["asymmetry_ratio"] = asymmetry
-    result["left_closure"] = left_closure
-    result["right_closure"] = right_closure
+    result["confidence"] = min(1.0, asymmetry * 2.5)
+    result["evidence"]["asymmetry_ratio"] = asymmetry
 
     if asymmetry < 0.15:
         result["palsy_side"] = 0
-        result["interpretation"] = f"双眼眨眼对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
+        result[
+            "interpretation"] = f"双眼眨眼对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
     elif left_closure < right_closure:
+        # 左眼闭合程度低 -> 左侧面瘫
         result["palsy_side"] = 1
-        result["interpretation"] = f"左眼闭合弱 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%)"
+        result[
+            "interpretation"] = f"左眼闭合弱 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
     else:
         result["palsy_side"] = 2
-        result["interpretation"] = f"右眼闭合弱 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%)"
+        result[
+            "interpretation"] = f"右眼闭合弱 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
 
     return result
 

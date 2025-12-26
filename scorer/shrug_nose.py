@@ -271,37 +271,64 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
     从皱鼻动作检测面瘫侧别
 
-    原理: 皱鼻时鼻翼上提，面瘫侧鼻翼运动弱
+    原理: 皱鼻时鼻翼上提，鼻翼-内眦距离缩短
+    面瘫侧鼻翼运动弱，距离变化小
+
+    使用相对比较，输出可解释性证据
     """
-    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+    result = {
+        "palsy_side": 0,
+        "confidence": 0.0,
+        "interpretation": "",
+        "method": "ala_canthus_change",
+        "evidence": {}
+    }
 
-    ala_metrics = metrics.get("ala_canthus_metrics", {})
-    left_change = ala_metrics.get("left_change_percent", 0)
-    right_change = ala_metrics.get("right_change_percent", 0)
+    # 修复Bug：直接从metrics获取（而非嵌套的ala_canthus_metrics）
+    left_change_pct = metrics.get("left_change_percent", 0)
+    right_change_pct = metrics.get("right_change_percent", 0)
+    left_change = metrics.get("left_change", 0)
+    right_change = metrics.get("right_change", 0)
 
-    # 皱鼻时距离应该减小（负值）
-    # 使用绝对变化量
-    left_abs = abs(left_change)
-    right_abs = abs(right_change)
+    # 存储证据
+    result["evidence"] = {
+        "left_change_px": left_change,
+        "right_change_px": right_change,
+        "left_change_pct": left_change_pct,
+        "right_change_pct": right_change_pct,
+    }
+
+    # 皱鼻时距离应该减小（负值表示收缩）
+    # 使用变化百分比的绝对值
+    left_abs = abs(left_change_pct)
+    right_abs = abs(right_change_pct)
     max_change = max(left_abs, right_abs)
 
-    if max_change < 2:  # 变化太小
-        result["interpretation"] = "皱鼻幅度过小，无法判断"
+    if max_change < 3:  # 变化小于3%，运动幅度过小
+        result["interpretation"] = f"皱鼻幅度过小 (L={left_change_pct:+.1f}%, R={right_change_pct:+.1f}%)"
+        result["evidence"]["status"] = "insufficient_movement"
         return result
 
+    # 计算不对称比例（相对比较）
     asymmetry = abs(left_abs - right_abs) / max_change
-    result["confidence"] = min(1.0, asymmetry * 2)
-    result["asymmetry_ratio"] = asymmetry
+    result["confidence"] = min(1.0, asymmetry * 2.5)
+    result["evidence"]["asymmetry_ratio"] = asymmetry
 
-    if asymmetry < 0.15:
+    # 判断侧别：变化小的一侧是面瘫侧
+    if asymmetry < 0.15:  # 15%以内认为对称
         result["palsy_side"] = 0
-        result["interpretation"] = f"双侧皱鼻对称 (L={left_change:.1f}%, R={right_change:.1f}%)"
+        result[
+            "interpretation"] = f"双侧皱鼻对称 (L={left_change_pct:+.1f}%, R={right_change_pct:+.1f}%, 差异{asymmetry * 100:.1f}%)"
     elif left_abs < right_abs:
+        # 左侧运动弱 -> 左侧面瘫
         result["palsy_side"] = 1
-        result["interpretation"] = f"左侧皱鼻弱 (L={left_change:.1f}% < R={right_change:.1f}%)"
+        result[
+            "interpretation"] = f"左侧皱鼻弱 (L={left_change_pct:+.1f}% < R={right_change_pct:+.1f}%, 差异{asymmetry * 100:.1f}%)"
     else:
+        # 右侧运动弱 -> 右侧面瘫
         result["palsy_side"] = 2
-        result["interpretation"] = f"右侧皱鼻弱 (R={right_change:.1f}% < L={left_change:.1f}%)"
+        result[
+            "interpretation"] = f"右侧皱鼻弱 (R={right_change_pct:+.1f}% < L={left_change_pct:+.1f}%, 差异{asymmetry * 100:.1f}%)"
 
     return result
 

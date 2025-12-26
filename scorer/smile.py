@@ -265,83 +265,91 @@ def compute_smile_metrics(landmarks, w: int, h: int,
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从微笑动作检测面瘫侧别 - 改进版，减少阈值依赖
+    从微笑动作检测面瘫侧别
 
     原理:
-    1. 面瘫侧口角运动幅度小
-    2. 面瘫侧口角角度低(下垂)
+    1. 面瘫侧口角运动幅度小（excursion小）
+    2. 面瘫侧口角上提幅度小，角度更小（更负）
 
-    使用直接比较而非硬编码阈值
+    注意：AOE是右口角角度，BOF是左口角角度
+    角度越小（或更负）表示口角位置越低
     """
-    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+    result = {
+        "palsy_side": 0,
+        "confidence": 0.0,
+        "interpretation": "",
+        "method": "",
+        "evidence": {}
+    }
 
     oral = metrics.get("oral_angle", {})
     aoe = oral.get("AOE", 0)  # 右侧口角角度
     bof = oral.get("BOF", 0)  # 左侧口角角度
 
-    # 使用运动幅度作为主要指标（如果有基线）
+    # 优先使用运动幅度（如果有基线）
     if "excursion" in metrics:
         exc = metrics["excursion"]
         left_exc = exc["left_total"]
         right_exc = exc["right_total"]
         max_exc = max(left_exc, right_exc)
 
-        if max_exc < 1:  # 运动幅度极小
-            result["interpretation"] = "微笑运动幅度过小，无法判断"
+        result["method"] = "excursion"
+        result["evidence"] = {
+            "left_excursion": left_exc,
+            "right_excursion": right_exc,
+            "excursion_ratio": exc["excursion_ratio"],
+            "AOE_right": aoe,
+            "BOF_left": bof,
+        }
+
+        if max_exc < 3:  # 运动幅度过小
+            result["interpretation"] = f"微笑运动幅度过小 (L={left_exc:.1f}px, R={right_exc:.1f}px)"
+            result["evidence"]["status"] = "insufficient_movement"
             return result
 
-        # 计算不对称比例（无需预设阈值）
+        # 计算不对称比例
         asymmetry = abs(left_exc - right_exc) / max_exc
-
-        # 置信度由不对称程度决定
         result["confidence"] = min(1.0, asymmetry * 2.5)
-        result["asymmetry_ratio"] = asymmetry
-        result["left_excursion"] = left_exc
-        result["right_excursion"] = right_exc
+        result["evidence"]["asymmetry_ratio"] = asymmetry
 
-        # 比较左右运动幅度
-        if left_exc < right_exc:
-            # 左侧运动弱
-            if asymmetry >= 0.10:  # 10%以上差异才判定
-                result["palsy_side"] = 1
-                result[
-                    "interpretation"] = f"左侧运动弱 (L={left_exc:.1f} < R={right_exc:.1f}, 差异{asymmetry * 100:.1f}%)"
-            else:
-                result["palsy_side"] = 0
-                result["interpretation"] = f"双侧对称 (差异{asymmetry * 100:.1f}%)"
+        if asymmetry < 0.10:  # 10%以内认为对称
+            result["palsy_side"] = 0
+            result[
+                "interpretation"] = f"双侧微笑对称 (L={left_exc:.1f}px, R={right_exc:.1f}px, 差异{asymmetry * 100:.1f}%)"
+        elif left_exc < right_exc:
+            # 左侧运动弱 -> 左侧面瘫
+            result["palsy_side"] = 1
+            result[
+                "interpretation"] = f"左侧运动弱 (L={left_exc:.1f}px < R={right_exc:.1f}px, 差异{asymmetry * 100:.1f}%)"
         else:
-            if asymmetry >= 0.10:
-                result["palsy_side"] = 2
-                result[
-                    "interpretation"] = f"右侧运动弱 (R={right_exc:.1f} < L={left_exc:.1f}, 差异{asymmetry * 100:.1f}%)"
-            else:
-                result["palsy_side"] = 0
-                result["interpretation"] = f"双侧对称 (差异{asymmetry * 100:.1f}%)"
+            # 右侧运动弱 -> 右侧面瘫
+            result["palsy_side"] = 2
+            result[
+                "interpretation"] = f"右侧运动弱 (R={right_exc:.1f}px < L={left_exc:.1f}px, 差异{asymmetry * 100:.1f}%)"
+
     else:
         # 没有基线，使用口角角度直接比较
+        result["method"] = "oral_angle"
+
         angle_diff = abs(aoe - bof)
-        max_angle = max(abs(aoe), abs(bof), 1)  # 避免除零
-        asymmetry = angle_diff / max_angle
+        result["confidence"] = min(1.0, angle_diff / 15)
+        result["evidence"] = {
+            "AOE_right": aoe,
+            "BOF_left": bof,
+            "angle_diff": angle_diff,
+        }
 
-        result["confidence"] = min(1.0, asymmetry)
-        result["angle_diff"] = angle_diff
-
-        # 口角角度：越正值表示越上扬，越负值表示越下垂
-        # 面瘫侧口角会下垂（角度更小/更负）
-        if aoe < bof:
-            if angle_diff >= 3:  # 3度以上才判定
-                result["palsy_side"] = 2  # 右口角更低 -> 右侧面瘫
-                result["interpretation"] = f"右口角下垂 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
-            else:
-                result["palsy_side"] = 0
-                result["interpretation"] = f"口角对称 (差{angle_diff:.1f}°)"
+        if angle_diff < 3:  # 3度以内认为对称
+            result["palsy_side"] = 0
+            result["interpretation"] = f"口角对称 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°, 差{angle_diff:.1f}°)"
+        elif aoe < bof:
+            # 右口角角度更小（位置更低） -> 右侧面瘫
+            result["palsy_side"] = 2
+            result["interpretation"] = f"右口角较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
         else:
-            if angle_diff >= 3:
-                result["palsy_side"] = 1  # 左口角更低 -> 左侧面瘫
-                result["interpretation"] = f"左口角下垂 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
-            else:
-                result["palsy_side"] = 0
-                result["interpretation"] = f"口角对称 (差{angle_diff:.1f}°)"
+            # 左口角角度更小 -> 左侧面瘫
+            result["palsy_side"] = 1
+            result["interpretation"] = f"左口角较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
 
     return result
 

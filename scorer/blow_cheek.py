@@ -658,57 +658,83 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=Non
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从鼓腮动作检测面瘫侧别 - 改进版
+    从鼓腮动作检测面瘫侧别
 
-    原理: 使用脸颊深度变化作为主要指标
-    面瘫侧无法有效鼓腮，脸颊深度变化小
+    原理:
+    1. 嘴唇闭合对称性（面瘫侧可能漏气）
+    2. 脸颊膨胀对称性
+    3. 口角位置对称性
     """
-    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+    result = {
+        "palsy_side": 0,
+        "confidence": 0.0,
+        "interpretation": "",
+        "method": "",
+        "evidence": {}
+    }
+
+    # 获取各项指标
+    oral = metrics.get("oral_angle", {})
+    aoe = oral.get("AOE", 0)
+    bof = oral.get("BOF", 0)
+    oral_asym = oral.get("asymmetry", 0)
 
     cheek = metrics.get("cheek_depth", {})
     left_delta = cheek.get("left_delta_norm", 0)
     right_delta = cheek.get("right_delta_norm", 0)
 
-    # 鼓腮时脸颊外凸，delta应为正值（或绝对值较大）
+    lip_seal = metrics.get("lip_seal", {})
+
+    result["evidence"] = {
+        "AOE_right": aoe,
+        "BOF_left": bof,
+        "oral_asymmetry": oral_asym,
+        "left_cheek_delta": left_delta,
+        "right_cheek_delta": right_delta,
+    }
+
+    # 方法1：口角对称性（最可靠）
+    # 鼓腮时嘴唇应该闭紧且对称
+    if oral_asym >= 3:
+        result["method"] = "oral_angle"
+        result["confidence"] = min(1.0, oral_asym / 15)
+
+        if aoe < bof:
+            # 右口角更低 -> 右侧面瘫
+            result["palsy_side"] = 2
+            result["interpretation"] = f"右口角较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°, 差{oral_asym:.1f}°)"
+        else:
+            result["palsy_side"] = 1
+            result["interpretation"] = f"左口角较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°, 差{oral_asym:.1f}°)"
+        return result
+
+    # 方法2：脸颊深度变化
+    # 鼓腮时脸颊外凸，delta应为正值
     left_abs = abs(left_delta)
     right_abs = abs(right_delta)
     max_delta = max(left_abs, right_abs)
 
-    if max_delta < 0.005:  # 运动幅度过小
-        # 检查口角对称性
-        oral = metrics.get("oral_angle", {})
-        asym = oral.get("asymmetry", 0)
-        aoe = oral.get("AOE", 0)
-        bof = oral.get("BOF", 0)
+    if max_delta >= 0.01:  # 有明显脸颊变化
+        result["method"] = "cheek_depth"
+        asymmetry = abs(left_abs - right_abs) / max_delta
+        result["confidence"] = min(1.0, asymmetry * 2)
+        result["evidence"]["cheek_asymmetry"] = asymmetry
 
-        if asym < 3:
-            result["interpretation"] = "鼓腮幅度过小，双侧对称"
-        else:
-            if aoe < bof:
-                result["palsy_side"] = 2
-                result["interpretation"] = f"右口角下垂 (AOE={aoe:+.1f}°)"
-            else:
+        if asymmetry >= 0.20:  # 20%以上差异
+            if left_abs < right_abs:
                 result["palsy_side"] = 1
-                result["interpretation"] = f"左口角下垂 (BOF={bof:+.1f}°)"
-            result["confidence"] = min(1.0, asym / 15)
-        return result
+                result[
+                    "interpretation"] = f"左侧鼓腮弱 (L={left_delta:.4f} < R={right_delta:.4f}, 差异{asymmetry * 100:.1f}%)"
+            else:
+                result["palsy_side"] = 2
+                result[
+                    "interpretation"] = f"右侧鼓腮弱 (R={right_delta:.4f} < L={left_delta:.4f}, 差异{asymmetry * 100:.1f}%)"
+            return result
 
-    # 使用脸颊深度比较
-    asymmetry = abs(left_abs - right_abs) / max_delta
-    result["confidence"] = min(1.0, asymmetry * 2)
-    result["asymmetry_ratio"] = asymmetry
-    result["left_delta"] = left_delta
-    result["right_delta"] = right_delta
-
-    if asymmetry < 0.15:
-        result["palsy_side"] = 0
-        result["interpretation"] = f"双侧鼓腮对称 (差异{asymmetry * 100:.1f}%)"
-    elif left_abs < right_abs:
-        result["palsy_side"] = 1
-        result["interpretation"] = f"左侧鼓腮弱 (L={left_delta:.4f} < R={right_delta:.4f})"
-    else:
-        result["palsy_side"] = 2
-        result["interpretation"] = f"右侧鼓腮弱 (R={right_delta:.4f} < L={left_delta:.4f})"
+    # 方法3：如果上述都不明显，判断为对称
+    result["method"] = "symmetric"
+    result["palsy_side"] = 0
+    result["interpretation"] = f"双侧鼓腮对称 (口角差{oral_asym:.1f}°, 脸颊差{abs(left_abs - right_abs):.4f})"
 
     return result
 

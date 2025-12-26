@@ -39,22 +39,88 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> in
     """
     找静息峰值帧
 
-    使用min(left_ear, right_ear)确保两只眼睛都睁开
+    标准：
+    1. 眼睛睁开（EAR > 阈值）
+    2. 嘴巴闭合（嘴高/嘴宽 < 阈值）
+    3. 稳定区间（避免眨眼或张嘴的瞬间）
     """
-    max_min_ear = -1.0
-    max_idx = 0
+    from thresholds import THR
+
+    n_frames = len(landmarks_seq)
+    if n_frames == 0:
+        return 0
+
+    # 计算每帧的评分
+    scores = []
+    ear_values = []
+    mouth_ratios = []
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
+            scores.append(-999)
+            ear_values.append(0)
+            mouth_ratios.append(1)
             continue
+
+        # 眼睛睁开程度
         l_ear = compute_ear(lm, w, h, True)
         r_ear = compute_ear(lm, w, h, False)
         min_ear = min(l_ear, r_ear)
-        if min_ear > max_min_ear:
-            max_min_ear = min_ear
-            max_idx = i
+        avg_ear = (l_ear + r_ear) / 2
 
-    return max_idx
+        # 嘴巴闭合程度
+        mouth = compute_mouth_metrics(lm, w, h)
+        mouth_ratio = mouth["height"] / mouth["width"] if mouth["width"] > 1e-9 else 0
+
+        ear_values.append(avg_ear)
+        mouth_ratios.append(mouth_ratio)
+
+        # 评分：眼睛越睁开越好，嘴巴越闭越好
+        score = 0.0
+
+        # 眼睛分数（EAR > 0.20 为睁开，越大越好）
+        if min_ear > 0.20:
+            score += min_ear * 10
+        else:
+            score -= (0.20 - min_ear) * 20  # 惩罚闭眼
+
+        # 嘴巴分数（高宽比 < 0.15 为闭合，越小越好）
+        if mouth_ratio < 0.15:
+            score += (0.15 - mouth_ratio) * 10
+        else:
+            score -= (mouth_ratio - 0.15) * 20  # 惩罚张嘴
+
+        scores.append(score)
+
+    # 寻找稳定区间（避免快速变化的帧）
+    # 使用滑动窗口计算稳定性
+    window_size = min(5, n_frames // 3)
+    if window_size < 3:
+        window_size = 3
+
+    stability_scores = []
+    for i in range(n_frames):
+        start = max(0, i - window_size // 2)
+        end = min(n_frames, i + window_size // 2 + 1)
+
+        window_ears = ear_values[start:end]
+        window_mouths = mouth_ratios[start:end]
+
+        # 计算窗口内的变化（标准差）
+        ear_std = np.std(window_ears) if len(window_ears) > 1 else 0
+        mouth_std = np.std(window_mouths) if len(window_mouths) > 1 else 0
+
+        # 变化越小，稳定性越好
+        stability = 1.0 / (1.0 + ear_std * 10 + mouth_std * 5)
+        stability_scores.append(stability)
+
+    # 最终分数 = 基础分数 * 稳定性
+    final_scores = [s * stab for s, stab in zip(scores, stability_scores)]
+
+    # 找最高分
+    best_idx = int(np.argmax(final_scores))
+
+    return best_idx
 
 
 def extract_action_specific_indicators(landmarks, w: int, h: int,
@@ -82,6 +148,103 @@ def extract_action_specific_indicators(landmarks, w: int, h: int,
             "brow_height_ratio": result.brow_height_ratio,
         }
     }
+
+
+def detect_resting_palsy(result: ActionResult) -> Dict[str, Any]:
+    """
+    检测静息状态下的面瘫侧别
+
+    原理：即使在静息状态，面瘫侧也可能表现出：
+    1. 眼睑裂较大或较小（取决于面瘫类型）
+    2. 鼻唇沟变浅
+    3. 口角下垂
+    4. 面部各器官相对于面中线不对称
+    """
+    detection = {
+        "palsy_side": 0,
+        "confidence": 0.0,
+        "interpretation": "",
+        "method": "resting_symmetry",
+        "evidence": {}
+    }
+
+    # 收集证据
+    votes = []  # (side, weight, description)
+
+    # 1. 眼睑裂高度比
+    palp_ratio = result.palpebral_height_ratio
+    if palp_ratio is not None:
+        detection["evidence"]["palpebral_ratio"] = palp_ratio
+        if abs(palp_ratio - 1.0) > 0.15:
+            # 比值远离1，存在不对称
+            if palp_ratio < 1.0:
+                # 左侧眼睑裂较小
+                votes.append((1, abs(palp_ratio - 1.0), f"左眼睑裂较小 (ratio={palp_ratio:.3f})"))
+            else:
+                votes.append((2, abs(palp_ratio - 1.0), f"右眼睑裂较小 (ratio={palp_ratio:.3f})"))
+
+    # 2. 鼻唇沟长度比
+    nlf_ratio = result.nlf_ratio
+    if nlf_ratio is not None:
+        detection["evidence"]["nlf_ratio"] = nlf_ratio
+        if abs(nlf_ratio - 1.0) > 0.15:
+            if nlf_ratio < 1.0:
+                # 左侧NLF较短（变浅）-> 左侧面瘫
+                votes.append((1, abs(nlf_ratio - 1.0), f"左侧鼻唇沟变浅 (ratio={nlf_ratio:.3f})"))
+            else:
+                votes.append((2, abs(nlf_ratio - 1.0), f"右侧鼻唇沟变浅 (ratio={nlf_ratio:.3f})"))
+
+    # 3. 口角角度
+    if result.oral_angle:
+        aoe = result.oral_angle.AOE_angle
+        bof = result.oral_angle.BOF_angle
+        angle_diff = abs(aoe - bof)
+        detection["evidence"]["AOE_right"] = aoe
+        detection["evidence"]["BOF_left"] = bof
+        detection["evidence"]["angle_diff"] = angle_diff
+
+        if angle_diff > 3:
+            if aoe < bof:
+                # 右口角更低
+                votes.append((2, angle_diff / 15, f"右口角下垂 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°)"))
+            else:
+                votes.append((1, angle_diff / 15, f"左口角下垂 (BOF={bof:+.1f}°, AOE={aoe:+.1f}°)"))
+
+    # 4. 眉高比
+    brow_ratio = result.brow_height_ratio
+    if brow_ratio is not None:
+        detection["evidence"]["brow_ratio"] = brow_ratio
+        if abs(brow_ratio - 1.0) > 0.10:
+            if brow_ratio < 1.0:
+                votes.append((1, abs(brow_ratio - 1.0) * 0.5, f"左眉较低 (ratio={brow_ratio:.3f})"))
+            else:
+                votes.append((2, abs(brow_ratio - 1.0) * 0.5, f"右眉较低 (ratio={brow_ratio:.3f})"))
+
+    # 统计投票
+    left_score = sum(w for s, w, _ in votes if s == 1)
+    right_score = sum(w for s, w, _ in votes if s == 2)
+    total_score = left_score + right_score
+
+    detection["evidence"]["left_score"] = left_score
+    detection["evidence"]["right_score"] = right_score
+    detection["evidence"]["votes"] = [(s, w, d) for s, w, d in votes]
+
+    if total_score < 0.15:
+        detection["palsy_side"] = 0
+        detection["interpretation"] = "静息状态对称"
+    elif left_score > right_score * 1.3:
+        detection["palsy_side"] = 1
+        detection["confidence"] = min(1.0, left_score)
+        detection["interpretation"] = f"静息状态左侧异常 (L={left_score:.2f} > R={right_score:.2f})"
+    elif right_score > left_score * 1.3:
+        detection["palsy_side"] = 2
+        detection["confidence"] = min(1.0, right_score)
+        detection["interpretation"] = f"静息状态右侧异常 (R={right_score:.2f} > L={left_score:.2f})"
+    else:
+        detection["palsy_side"] = 0
+        detection["interpretation"] = f"静息状态不确定 (L={left_score:.2f}, R={right_score:.2f})"
+
+    return detection
 
 
 def compute_resting_symmetry_from_result(result: ActionResult) -> RestingSymmetry:
@@ -285,6 +448,11 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     # 提取通用指标
     extract_common_indicators(peak_landmarks, w, h, result)
+
+    # 检测静息状态面瘫
+    resting_palsy = detect_resting_palsy(result)
+    result.action_specific["resting_palsy_detection"] = resting_palsy
+    result.action_specific["palsy_detection"] = resting_palsy
 
     # ========== 存储 baseline ICD 和关键距离 ==========
     icd_base = compute_icd(peak_landmarks, w, h)

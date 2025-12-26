@@ -172,15 +172,13 @@ def plot_show_teeth_peak_selection(
 
 def compute_show_teeth_metrics(landmarks, w: int, h: int,
                                baseline_landmarks=None) -> Dict[str, Any]:
-    """计算露齿(ShowTeeth)特有指标 - 使用统一 scale
-
-    关键：用“内唇缘开口面积”作为露齿/张口幅度的几何代理指标。
-    鼻唇沟(NLF)相关几何指标已禁用（当前实现为鼻翼-嘴角连线，不等价于真实鼻唇沟）。
+    """
+    计算露齿(ShowTeeth)特有指标 - 增加嘴角位移计算
     """
     mouth = compute_mouth_metrics(landmarks, w, h)
     oral = compute_oral_angle(landmarks, w, h)
 
-    # 内唇缘开口面积 (牙齿暴露的几何代理)
+    # 内唇缘开口面积
     inner_pts = np.array(pts2d(landmarks, LM.INNER_LIP, w, h), dtype=np.float32)
     inner_mouth_area = float(abs(polygon_area(inner_pts))) if len(inner_pts) >= 3 else 0.0
 
@@ -190,58 +188,79 @@ def compute_show_teeth_metrics(landmarks, w: int, h: int,
 
     # 嘴角高度 (相对于嘴中心)
     mouth_center_y = (left_corner[1] + right_corner[1]) / 2
-    left_height_from_center = mouth_center_y - left_corner[1]   # 正值: 左嘴角更高
+    left_height_from_center = mouth_center_y - left_corner[1]
     right_height_from_center = mouth_center_y - right_corner[1]
 
-    # 上唇/下唇中心位置（用于描述上唇提升或下颌下压）
-    lip_top = mouth["top_center"]
-    lip_bottom = mouth["bottom_center"]
+    # 面中线参考（使用双内眦中点）
+    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+    midline_x = (left_canthus[0] + right_canthus[0]) / 2
+
+    # 嘴角相对于面中线的水平距离
+    left_to_midline = midline_x - left_corner[0]  # 左嘴角到中线（正值）
+    right_to_midline = right_corner[0] - midline_x  # 右嘴角到中线（正值）
 
     metrics: Dict[str, Any] = {
         "mouth_width": float(mouth["width"]),
         "mouth_height": float(mouth["height"]),
-        "mouth_opening_ratio": float(mouth["height"] / (mouth["width"] + 1e-9)),
         "inner_mouth_area": float(inner_mouth_area),
         "left_corner": left_corner,
         "right_corner": right_corner,
         "left_height_from_center": float(left_height_from_center),
         "right_height_from_center": float(right_height_from_center),
-        "lip_top_y": float(lip_top[1]),
-        "lip_bottom_y": float(lip_bottom[1]),
+        "corner_height_diff": float(left_height_from_center - right_height_from_center),
+        "midline_x": float(midline_x),
+        "left_to_midline": float(left_to_midline),
+        "right_to_midline": float(right_to_midline),
+        "midline_symmetry_ratio": float(left_to_midline / right_to_midline) if right_to_midline > 1e-9 else 1.0,
         "oral_angle": {
             "AOE": float(getattr(oral, "AOE_angle", 0.0) or 0.0),
             "BOF": float(getattr(oral, "BOF_angle", 0.0) or 0.0),
             "asymmetry": float(getattr(oral, "angle_asymmetry", 0.0) or 0.0),
         },
-        "nlf_disabled": True,
     }
 
-    # 基线参考
+    # 基线参考 - 计算嘴角位移
     if baseline_landmarks is not None:
-        # ========== 计算统一 scale ==========
         scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
         metrics["scale"] = scale
-        # ====================================
 
         baseline_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
-        baseline_inner_pts = np.array(pts2d(baseline_landmarks, LM.INNER_LIP, w, h), dtype=np.float32)
-        baseline_inner_area = float(abs(polygon_area(baseline_inner_pts))) if len(baseline_inner_pts) >= 3 else 0.0
+        baseline_left = baseline_mouth["left_corner"]
+        baseline_right = baseline_mouth["right_corner"]
+        baseline_oral = compute_oral_angle(baseline_landmarks, w, h)
 
-        # ========== 缩放到 baseline 尺度 ==========
-        # 面积需要用 scale² 缩放
-        scaled_inner_area = inner_mouth_area * (scale ** 2)
-        scaled_width = mouth["width"] * scale
-        scaled_height = mouth["height"] * scale
+        # 嘴角位移（缩放到基线尺度）
+        left_excursion_raw = dist(left_corner, baseline_left)
+        right_excursion_raw = dist(right_corner, baseline_right)
+        left_excursion = left_excursion_raw * scale
+        right_excursion = right_excursion_raw * scale
 
-        metrics["baseline"] = {
-            "mouth_width": float(baseline_mouth["width"]),
-            "mouth_height": float(baseline_mouth["height"]),
-            "inner_mouth_area": float(baseline_inner_area),
+        # 嘴宽变化
+        width_change = mouth["width"] * scale - baseline_mouth["width"]
+
+        metrics["excursion"] = {
+            "left_total": float(left_excursion),
+            "right_total": float(right_excursion),
+            "excursion_ratio": float(left_excursion / right_excursion) if right_excursion > 1e-9 else 1.0,
+            "baseline_width": float(baseline_mouth["width"]),
+            "width_change": float(width_change),
         }
-        metrics["delta"] = {
-            "mouth_width": float(scaled_width - baseline_mouth["width"]),
-            "mouth_height": float(scaled_height - baseline_mouth["height"]),
-            "inner_mouth_area": float(scaled_inner_area - baseline_inner_area),
+
+        # 口角角度变化
+        metrics["oral_angle_change"] = {
+            "AOE_change": float(oral.AOE_angle - baseline_oral.AOE_angle),
+            "BOF_change": float(oral.BOF_angle - baseline_oral.BOF_angle),
+        }
+
+        # 嘴角高度变化
+        baseline_center_y = (baseline_left[1] + baseline_right[1]) / 2
+        baseline_left_height = baseline_center_y - baseline_left[1]
+        baseline_right_height = baseline_center_y - baseline_right[1]
+
+        metrics["height_change"] = {
+            "left": float((left_height_from_center - baseline_left_height) * scale),
+            "right": float((right_height_from_center - baseline_right_height) * scale),
         }
 
     return metrics
@@ -251,52 +270,93 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
     从露齿动作检测面瘫侧别
 
-    原理: 与微笑类似
-    1. 面瘫侧口角运动幅度小
-    2. 面瘫侧口角角度低
+    原理:
+    1. 面瘫侧口角上提幅度小（excursion小）
+    2. 面瘫侧口角位置低（角度小或更负）
+    3. 相对面中线，面瘫侧嘴角偏移少
+
+    优先使用动态指标（峰值-基线变化）
     """
-    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
+    result = {
+        "palsy_side": 0,
+        "confidence": 0.0,
+        "interpretation": "",
+        "method": "",
+        "evidence": {}
+    }
 
     oral = metrics.get("oral_angle", {})
-    aoe = oral.get("AOE", 0)
-    bof = oral.get("BOF", 0)
+    aoe = oral.get("AOE", 0)  # 右侧口角角度
+    bof = oral.get("BOF", 0)  # 左侧口角角度
 
+    # 优先使用运动幅度（如果有基线）
     if "excursion" in metrics:
         exc = metrics["excursion"]
         left_exc = exc["left_total"]
         right_exc = exc["right_total"]
         max_exc = max(left_exc, right_exc)
 
-        if max_exc < 1:
-            result["interpretation"] = "露齿运动幅度过小"
+        result["method"] = "excursion"
+        result["evidence"] = {
+            "left_excursion": left_exc,
+            "right_excursion": right_exc,
+            "excursion_ratio": exc["excursion_ratio"],
+        }
+
+        if max_exc < 3:  # 运动幅度过小
+            result["interpretation"] = f"露齿运动幅度过小 (L={left_exc:.1f}px, R={right_exc:.1f}px)"
+            result["evidence"]["status"] = "insufficient_movement"
             return result
 
+        # 计算不对称比例
         asymmetry = abs(left_exc - right_exc) / max_exc
         result["confidence"] = min(1.0, asymmetry * 2.5)
-        result["asymmetry_ratio"] = asymmetry
+        result["evidence"]["asymmetry_ratio"] = asymmetry
 
-        if asymmetry < 0.10:
+        if asymmetry < 0.10:  # 10%以内认为对称
             result["palsy_side"] = 0
-            result["interpretation"] = f"双侧对称 (差异{asymmetry * 100:.1f}%)"
+            result[
+                "interpretation"] = f"双侧运动对称 (L={left_exc:.1f}px, R={right_exc:.1f}px, 差异{asymmetry * 100:.1f}%)"
         elif left_exc < right_exc:
+            # 左侧运动弱 -> 左侧面瘫
             result["palsy_side"] = 1
-            result["interpretation"] = f"左侧运动弱 (L={left_exc:.1f} < R={right_exc:.1f})"
+            result[
+                "interpretation"] = f"左侧运动弱 (L={left_exc:.1f}px < R={right_exc:.1f}px, 差异{asymmetry * 100:.1f}%)"
         else:
+            # 右侧运动弱 -> 右侧面瘫
             result["palsy_side"] = 2
-            result["interpretation"] = f"右侧运动弱 (R={right_exc:.1f} < L={left_exc:.1f})"
+            result[
+                "interpretation"] = f"右侧运动弱 (R={right_exc:.1f}px < L={left_exc:.1f}px, 差异{asymmetry * 100:.1f}%)"
+
     else:
+        # 没有基线，使用口角角度 + 面中线对称性
+        result["method"] = "oral_angle_and_midline"
+
+        midline_ratio = metrics.get("midline_symmetry_ratio", 1.0)
+        corner_height_diff = metrics.get("corner_height_diff", 0)
+
+        result["evidence"] = {
+            "AOE_right": aoe,
+            "BOF_left": bof,
+            "angle_diff": abs(aoe - bof),
+            "midline_ratio": midline_ratio,
+            "corner_height_diff": corner_height_diff,
+        }
+
         angle_diff = abs(aoe - bof)
         result["confidence"] = min(1.0, angle_diff / 15)
 
         if angle_diff < 3:
             result["palsy_side"] = 0
-            result["interpretation"] = f"口角对称 (差{angle_diff:.1f}°)"
+            result["interpretation"] = f"口角对称 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°, 差{angle_diff:.1f}°)"
         elif aoe < bof:
+            # 右口角角度更小（更低/下垂） -> 右侧面瘫
             result["palsy_side"] = 2
-            result["interpretation"] = f"右口角下垂 (AOE={aoe:+.1f}°)"
+            result["interpretation"] = f"右口角较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
         else:
+            # 左口角角度更小 -> 左侧面瘫
             result["palsy_side"] = 1
-            result["interpretation"] = f"左口角下垂 (BOF={bof:+.1f}°)"
+            result["interpretation"] = f"左口角较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
 
     return result
 
