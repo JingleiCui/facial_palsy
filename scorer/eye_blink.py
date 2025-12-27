@@ -135,6 +135,29 @@ def analyze_blink_dynamics(ear_seq: Dict[str, List[float]],
     symmetry_mean = float(np.mean(ear_ratio_seq))
     symmetry_std = float(np.std(ear_ratio_seq))
 
+    # ========== 持续性不对称检测 ==========
+    # 观察整段视频中左右眼EAR的持续差异
+    # 如果一只眼睛总是比另一只闭合程度差，可能是患侧
+
+    # 计算每帧左右眼EAR的差值
+    ear_diff = valid_left - valid_right  # 正值表示左眼EAR更大（闭合更差）
+
+    # 统计左眼EAR更大的帧数比例
+    left_worse_ratio = np.mean(ear_diff > 0.02)  # 左眼闭合更差的帧比例
+    right_worse_ratio = np.mean(ear_diff < -0.02)  # 右眼闭合更差的帧比例
+
+    # 计算持续性不对称指标
+    # 如果一侧持续性地闭合更差（>70%的帧），则认为可能是患侧
+    persistent_asymmetry_side = 0  # 0=对称, 1=左侧持续差, 2=右侧持续差
+    persistent_asymmetry_ratio = 0
+
+    if left_worse_ratio > 0.7:
+        persistent_asymmetry_side = 1
+        persistent_asymmetry_ratio = left_worse_ratio
+    elif right_worse_ratio > 0.7:
+        persistent_asymmetry_side = 2
+        persistent_asymmetry_ratio = right_worse_ratio
+
     return {
         "left_ear_max": left_max,
         "left_ear_min": left_min,
@@ -149,7 +172,11 @@ def analyze_blink_dynamics(ear_seq: Dict[str, List[float]],
         "symmetry_ratio_mean": symmetry_mean,
         "symmetry_ratio_std": symmetry_std,
         "fps": fps,
-        "scale": scale,  # 记录使用的scale
+        "scale": scale,
+        "persistent_asymmetry_side": persistent_asymmetry_side,
+        "persistent_asymmetry_ratio": persistent_asymmetry_ratio,
+        "left_worse_frame_ratio": float(left_worse_ratio),
+        "right_worse_frame_ratio": float(right_worse_ratio),
     }
 
 
@@ -264,8 +291,7 @@ def detect_palsy_side(dynamics: Dict[str, Any]) -> Dict[str, Any]:
 
     原理:
     1. 面瘫侧眼睛闭合比例低
-    2. 面瘫侧眨眼速度可能慢
-    3. EAR变化曲线不对称
+    2. 持续性不对称：整段视频中一只眼睛总是闭合程度差
     """
     result = {
         "palsy_side": 0,
@@ -279,10 +305,19 @@ def detect_palsy_side(dynamics: Dict[str, Any]) -> Dict[str, Any]:
     right_closure = dynamics.get("right_closure_ratio", 0)
     symmetry_ratio = dynamics.get("symmetry_ratio_mean", 1.0)
 
+    # 持续性不对称指标
+    persistent_side = dynamics.get("persistent_asymmetry_side", 0)
+    persistent_ratio = dynamics.get("persistent_asymmetry_ratio", 0)
+    left_worse_ratio = dynamics.get("left_worse_frame_ratio", 0)
+    right_worse_ratio = dynamics.get("right_worse_frame_ratio", 0)
+
     result["evidence"] = {
         "left_closure_pct": left_closure * 100,
         "right_closure_pct": right_closure * 100,
         "symmetry_ratio_mean": symmetry_ratio,
+        "persistent_asymmetry_side": persistent_side,
+        "left_worse_frame_ratio": left_worse_ratio,
+        "right_worse_frame_ratio": right_worse_ratio,
     }
 
     max_closure = max(left_closure, right_closure)
@@ -293,6 +328,25 @@ def detect_palsy_side(dynamics: Dict[str, Any]) -> Dict[str, Any]:
         result["evidence"]["status"] = "insufficient_movement"
         return result
 
+    # ========== 方法1：持续性不对称（优先使用）==========
+    # 如果整段视频中一只眼睛持续性地闭合更差，则认为是患侧
+    if persistent_side != 0 and persistent_ratio > 0.7:
+        result["method"] = "persistent_asymmetry"
+        result["confidence"] = min(1.0, persistent_ratio)
+
+        if persistent_side == 1:
+            result["palsy_side"] = 1
+            result["interpretation"] = (
+                f"左眼持续闭合差 ({left_worse_ratio * 100:.0f}%帧中左眼EAR更大) → 左侧面瘫"
+            )
+        else:
+            result["palsy_side"] = 2
+            result["interpretation"] = (
+                f"右眼持续闭合差 ({right_worse_ratio * 100:.0f}%帧中右眼EAR更大) → 右侧面瘫"
+            )
+        return result
+
+    # ========== 方法2：闭合比例比较 ==========
     result["method"] = "closure_ratio"
 
     # 计算不对称比例
@@ -302,17 +356,21 @@ def detect_palsy_side(dynamics: Dict[str, Any]) -> Dict[str, Any]:
 
     if asymmetry < 0.15:
         result["palsy_side"] = 0
-        result[
-            "interpretation"] = f"双眼眨眼对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
+        result["interpretation"] = (
+            f"双眼眨眼对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%, "
+            f"差异{asymmetry * 100:.1f}%)"
+        )
     elif left_closure < right_closure:
         # 左眼闭合程度低 -> 左侧面瘫
         result["palsy_side"] = 1
-        result[
-            "interpretation"] = f"左眼闭合弱 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
+        result["interpretation"] = (
+            f"左眼闭合弱 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%) → 左侧面瘫"
+        )
     else:
         result["palsy_side"] = 2
-        result[
-            "interpretation"] = f"右眼闭合弱 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
+        result["interpretation"] = (
+            f"右眼闭合弱 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%) → 右侧面瘫"
+        )
 
     return result
 
