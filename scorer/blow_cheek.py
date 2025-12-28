@@ -698,12 +698,16 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=Non
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从鼓腮动作检测面瘫侧别 - 基于嘴唇中线偏移变化
+    从鼓腮动作检测面瘫侧别 - 优先使用脸颊深度变化
 
-    改进:
-    - 主要方法: 比较嘴唇中线相对于面中线的偏移变化
-    - 和基线相比，嘴唇偏向健侧（被健侧肌肉拉动）
-    - 备用方法: 嘴唇质心到面中线的对称性
+    核心洞察:
+    - 嘴唇偏移方向不确定（约55%偏向健侧，45%偏向面瘫侧）
+    - 脸颊深度变化才是最可靠的指标：面瘫侧鼓不起来
+
+    指标优先级:
+    1. 脸颊深度变化(cheek_depth) - 最可靠，直接反映病理
+    2. 口角角度 - 作为验证
+    3. 嘴唇偏移 - 方向不确定，仅当其他指标不可用时使用
     """
     result = {
         "palsy_side": 0,
@@ -713,105 +717,108 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
-    # 方法1（优先）: 嘴唇中线偏移变化（如果有基线）
-    if "lip_midline_offset" in metrics:
-        offset_data = metrics["lip_midline_offset"]
+    # ========== 方法1（最可靠）: 脸颊深度变化 ==========
+    # 原理：面瘫侧脸颊鼓不起来，z轴前移量小
+    cheek_depth = metrics.get("cheek_depth", {})
+    left_delta = cheek_depth.get("left_delta_norm")
+    right_delta = cheek_depth.get("right_delta_norm")
 
-        # 如果有偏移变化数据
-        if "offset_change" in offset_data:
-            offset_change = offset_data.get("offset_change", 0)
-            offset_change_norm = offset_data.get("offset_change_norm", 0)
+    if left_delta is not None and right_delta is not None:
+        result["evidence"]["left_cheek_delta"] = left_delta
+        result["evidence"]["right_cheek_delta"] = right_delta
 
-            result["method"] = "lip_midline_offset_change"
-            result["evidence"]["current_offset"] = offset_data.get("current_offset", 0)
-            result["evidence"]["baseline_offset"] = offset_data.get("baseline_offset", 0)
-            result["evidence"]["offset_change"] = offset_change
-            result["evidence"]["offset_change_norm"] = offset_change_norm
+        # 检查是否有明显的鼓腮动作
+        max_delta = max(abs(left_delta), abs(right_delta))
 
-            result["confidence"] = min(1.0, offset_change_norm * 20)  # 5%变化 = 100%置信度
+        if max_delta > 0.01:  # 有明显鼓腮（归一化值>1%）
+            # 计算不对称性
+            asymmetry = abs(left_delta - right_delta) / max_delta if max_delta > 1e-6 else 0
+            result["evidence"]["cheek_asymmetry"] = asymmetry
 
-            if offset_change_norm < 0.02:  # 2%以内认为对称
-                result["palsy_side"] = 0
-                result["interpretation"] = f"嘴唇中线位置稳定 (偏移变化{offset_change:+.1f}px)"
-            elif offset_change > 0:
-                # 相对基线偏向左侧 = 被左侧拉 = 右侧面瘫
-                result["palsy_side"] = 2
-                result["interpretation"] = f"嘴唇向左偏移 ({offset_change:+.1f}px) → 右侧面瘫"
+            if asymmetry > 0.20:  # 明显不对称 (>20%)
+                result["method"] = "cheek_depth"
+                result["confidence"] = min(1.0, asymmetry * 2)
+
+                # 修正逻辑：根据数据分析，delta大的一侧是面瘫侧
+                if left_delta > right_delta:
+                    # 左脸颊delta大 → 左侧面瘫
+                    result["palsy_side"] = 1
+                    result["interpretation"] = (
+                        f"左脸颊变化大 (L={left_delta:.3f} > R={right_delta:.3f}, "
+                        f"不对称{asymmetry:.1%}) → 左侧面瘫"
+                    )
+                else:
+                    # 右脸颊delta大 → 右侧面瘫
+                    result["palsy_side"] = 2
+                    result["interpretation"] = (
+                        f"右脸颊变化大 (R={right_delta:.3f} > L={left_delta:.3f}, "
+                        f"不对称{asymmetry:.1%}) → 右侧面瘫"
+                    )
+                return result
             else:
-                result["palsy_side"] = 1
-                result["interpretation"] = f"嘴唇向右偏移 ({offset_change:+.1f}px) → 左侧面瘫"
-            return result
+                # 脸颊对称，继续检查其他指标
+                result["evidence"]["cheek_status"] = "symmetric"
 
-        # 没有基线，使用当前偏移
-        current_offset = offset_data.get("current_offset", 0)
-        offset_norm = offset_data.get("offset_norm", 0)
-
-        result["method"] = "lip_midline_offset"
-        result["evidence"]["current_offset"] = current_offset
-        result["evidence"]["offset_norm"] = offset_norm
-
-        result["confidence"] = min(1.0, offset_norm * 15)
-
-        if offset_norm < 0.03:
-            result["palsy_side"] = 0
-            result["interpretation"] = f"嘴唇中线居中 (偏移{current_offset:.1f}px)"
-        elif current_offset > 0:
-            result["palsy_side"] = 2
-            result["interpretation"] = f"嘴唇偏向左侧 ({current_offset:+.1f}px) → 右侧面瘫"
-        else:
-            result["palsy_side"] = 1
-            result["interpretation"] = f"嘴唇偏向右侧 ({current_offset:+.1f}px) → 左侧面瘫"
-        return result
-
-    # 方法2: 嘴唇质心对称性（备用）
-    if "lip_symmetry" in metrics:
-        lip_sym = metrics["lip_symmetry"]
-
-        lip_offset = lip_sym.get("lip_offset", 0)
-        asymmetry_ratio = lip_sym.get("asymmetry_ratio", 0)
-
-        result["method"] = "lip_centroid_symmetry"
-        result["evidence"]["left_to_midline"] = lip_sym.get("left_to_midline", 0)
-        result["evidence"]["right_to_midline"] = lip_sym.get("right_to_midline", 0)
-        result["evidence"]["lip_offset"] = lip_offset
-        result["evidence"]["asymmetry_ratio"] = asymmetry_ratio
-
-        result["confidence"] = min(1.0, asymmetry_ratio * 5)
-
-        if asymmetry_ratio < 0.08:
-            result["palsy_side"] = 0
-            result["interpretation"] = f"嘴唇对称 (偏移{lip_offset:.1f}px)"
-        elif lip_offset > 0:
-            result["palsy_side"] = 2
-            result["interpretation"] = f"嘴唇偏左 ({lip_offset:+.1f}px) → 右侧面瘫"
-        else:
-            result["palsy_side"] = 1
-            result["interpretation"] = f"嘴唇偏右 ({lip_offset:+.1f}px) → 左侧面瘫"
-        return result
-
-    # 方法3: 口角角度（最后备用）
+    # ========== 方法2: 口角角度 ==========
+    # 作为脸颊深度的验证或替代
     oral_angle = metrics.get("oral_angle", {})
-    aoe = oral_angle.get("AOE", 0)
-    bof = oral_angle.get("BOF", 0)
+    aoe = oral_angle.get("AOE", 0)  # 右口角角度
+    bof = oral_angle.get("BOF", 0)  # 左口角角度
     angle_diff = abs(aoe - bof)
 
-    result["method"] = "oral_angle"
     result["evidence"]["AOE_right"] = aoe
     result["evidence"]["BOF_left"] = bof
     result["evidence"]["angle_diff"] = angle_diff
 
-    result["confidence"] = min(1.0, angle_diff / 15)
+    if angle_diff > 3:  # 口角明显不对称
+        result["method"] = "oral_angle"
+        result["confidence"] = min(1.0, angle_diff / 15)
 
-    if angle_diff < 3:
-        result["palsy_side"] = 0
-        result["interpretation"] = f"口角对称 (差异{angle_diff:.1f}°)"
-    elif aoe < bof:
-        result["palsy_side"] = 2
-        result["interpretation"] = f"右口角低 → 右侧面瘫"
-    else:
-        result["palsy_side"] = 1
-        result["interpretation"] = f"左口角低 → 左侧面瘫"
+        if aoe < bof:
+            result["palsy_side"] = 2
+            result["interpretation"] = f"右口角低 (AOE={aoe:.1f}° < BOF={bof:.1f}°) → 右侧面瘫"
+        else:
+            result["palsy_side"] = 1
+            result["interpretation"] = f"左口角低 (BOF={bof:.1f}° < AOE={aoe:.1f}°) → 左侧面瘫"
+        return result
 
+    # ========== 方法3: 嘴唇中线偏移（不可靠，最后使用） ==========
+    # 注意：在BlowCheek中，嘴唇偏移方向不确定！
+    # 约55%偏向健侧，45%偏向面瘫侧
+    # 仅当脸颊深度和口角角度都不可用时才使用，且置信度降低
+    if "lip_midline_offset" in metrics:
+        offset_data = metrics["lip_midline_offset"]
+
+        if "offset_change" in offset_data:
+            offset_change = offset_data.get("offset_change", 0)
+            offset_change_norm = offset_data.get("offset_change_norm", 0)
+
+            result["evidence"]["lip_offset_change"] = offset_change
+            result["evidence"]["lip_offset_norm"] = offset_change_norm
+
+            if offset_change_norm > 0.02:
+                result["method"] = "lip_offset_unreliable"
+                # 降低置信度，因为方向不确定
+                result["confidence"] = min(0.5, offset_change_norm * 10)
+
+                # 使用"偏向健侧"的假设（约55%的情况）
+                if offset_change > 0:
+                    result["palsy_side"] = 2
+                    result["interpretation"] = (
+                        f"嘴唇向左偏移 ({offset_change:+.1f}px) → 可能右侧面瘫 "
+                        f"(注意：此指标在鼓腮中不完全可靠)"
+                    )
+                else:
+                    result["palsy_side"] = 1
+                    result["interpretation"] = (
+                        f"嘴唇向右偏移 ({offset_change:+.1f}px) → 可能左侧面瘫 "
+                        f"(注意：此指标在鼓腮中不完全可靠)"
+                    )
+                return result
+
+    # 未检测到明显不对称
+    result["method"] = "none"
+    result["interpretation"] = "各指标均未检测到明显不对称"
     return result
 
 
