@@ -11,11 +11,8 @@
 4. 面瘫侧别检测
 5. 联动运动检测 (眼部联动)
 
-修复内容:
-- 移除错误的NLF分析
-- 使用口角角度和运动幅度作为主要指标
-- 添加面瘫侧别检测
-
+# 1. 关键帧改为嘴角到眼部水平线距离最小的帧
+# 2. 面瘫侧别改为比较左右嘴角上提幅度（距离减小量）
 对应Sunnybrook: Open mouth smile (ZYG/RIS)
 """
 
@@ -37,6 +34,8 @@ from clinical_base import (
     ActionResult, OralAngleMeasure, draw_polygon,
     add_valid_region_shading, get_palsy_side_text,
     draw_palsy_side_label, compute_lip_midline_symmetry,
+    compute_mouth_corner_to_eye_line_distance,
+    compute_smile_excursion_by_eye_line,
 )
 
 from thresholds import THR
@@ -49,54 +48,83 @@ ACTION_NAME = "Smile"
 ACTION_NAME_CN = "微笑"
 
 
-def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
-    """找微笑峰值帧 (嘴宽最大)"""
-    max_width = -1.0
-    max_idx = 0
+def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
+                    baseline_landmarks=None) -> int:
+    """
+    找微笑峰值帧 - 使用嘴角到眼部水平线距离
+
+    改进:
+    - 微笑时嘴角上提，到眼部水平线的距离减小
+    - 取距离之和最小的帧作为峰值帧
+    """
+    min_total_dist = float('inf')
+    min_idx = 0
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
             continue
-        l_corner = pt2d(lm[LM.MOUTH_L], w, h)
-        r_corner = pt2d(lm[LM.MOUTH_R], w, h)
-        width = dist(l_corner, r_corner)
-        if width > max_width:
-            max_width = width
-            max_idx = i
 
-    return max_idx
+        # 计算左右嘴角到眼部水平线的距离
+        left_result = compute_mouth_corner_to_eye_line_distance(lm, w, h, left=True)
+        right_result = compute_mouth_corner_to_eye_line_distance(lm, w, h, left=False)
+
+        # 取两侧距离之和最小的帧
+        total_dist = left_result["distance"] + right_result["distance"]
+
+        if total_dist < min_total_dist:
+            min_total_dist = total_dist
+            min_idx = i
+
+    return min_idx
 
 
 def extract_smile_sequences(landmarks_seq: List, w: int, h: int) -> Dict[str, List[float]]:
     """
     提取微笑关键指标的时序序列
 
-    Returns:
-        包含嘴宽和口角角度的时序数据
+    改进: 添加嘴角到眼部水平线距离的序列
     """
     mouth_width_seq = []
     aoe_seq = []
     bof_seq = []
+    left_eye_dist_seq = []
+    right_eye_dist_seq = []
+    total_eye_dist_seq = []
 
     for lm in landmarks_seq:
         if lm is None:
             mouth_width_seq.append(np.nan)
             aoe_seq.append(np.nan)
             bof_seq.append(np.nan)
+            left_eye_dist_seq.append(np.nan)
+            right_eye_dist_seq.append(np.nan)
+            total_eye_dist_seq.append(np.nan)
         else:
+            # 嘴宽
             l_corner = pt2d(lm[LM.MOUTH_L], w, h)
             r_corner = pt2d(lm[LM.MOUTH_R], w, h)
             width = dist(l_corner, r_corner)
             mouth_width_seq.append(width)
 
+            # 口角角度
             oral = compute_oral_angle(lm, w, h)
             aoe_seq.append(oral.AOE_angle if oral else np.nan)
             bof_seq.append(oral.BOF_angle if oral else np.nan)
+
+            # 嘴角到眼部水平线距离
+            left_result = compute_mouth_corner_to_eye_line_distance(lm, w, h, left=True)
+            right_result = compute_mouth_corner_to_eye_line_distance(lm, w, h, left=False)
+            left_eye_dist_seq.append(left_result["distance"])
+            right_eye_dist_seq.append(right_result["distance"])
+            total_eye_dist_seq.append(left_result["distance"] + right_result["distance"])
 
     return {
         "Mouth Width": mouth_width_seq,
         "AOE (Right)": aoe_seq,
         "BOF (Left)": bof_seq,
+        "Left Eye-Line Dist": left_eye_dist_seq,
+        "Right Eye-Line Dist": right_eye_dist_seq,
+        "Total Eye-Line Dist": total_eye_dist_seq,
     }
 
 
@@ -112,9 +140,9 @@ def plot_smile_peak_selection(
     """
     绘制微笑关键帧选择的可解释性曲线
 
-    微笑选择标准: 嘴宽最大的帧
+    改进: 添加嘴角到眼线距离曲线作为关键帧选择依据
     """
-    fig, axes = plt.subplots(2, 1, figsize=(16, 9))  # 增加宽度
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12))  # 改为3个子图
 
     n_frames = len(sequences["Mouth Width"])
     frames = np.arange(n_frames)
@@ -122,29 +150,32 @@ def plot_smile_peak_selection(
     x_label = 'Time (seconds)' if fps > 0 else 'Frame'
     peak_time = peak_idx / fps if fps > 0 else peak_idx
 
-    # 上图: 嘴宽曲线 (关键帧选择依据)
+    # 上图: 嘴角到眼线距离（关键帧选择依据）
     ax1 = axes[0]
 
-    # 标注 valid/invalid 区域
     if valid_mask is not None:
         add_valid_region_shading(ax1, valid_mask, time_sec)
 
-    mouth_width = sequences["Mouth Width"]
-    ax1.plot(time_sec, mouth_width, 'g-', label='Mouth Width', linewidth=2)
+    if "Total Eye-Line Dist" in sequences:
+        total_dist = sequences["Total Eye-Line Dist"]
+        left_dist = sequences["Left Eye-Line Dist"]
+        right_dist = sequences["Right Eye-Line Dist"]
 
-    # 标注峰值帧
-    ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
-    width_at_peak = mouth_width[peak_idx] if peak_idx < len(mouth_width) else 0
-    ax1.scatter([peak_time], [width_at_peak], color='red', s=150, zorder=5,
-                edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
-    ax1.annotate(f'Max: {width_at_peak:.1f}px', xy=(peak_time, width_at_peak),
-                 xytext=(10, -20), textcoords='offset points', fontsize=10, fontweight='bold')
+        ax1.plot(time_sec, left_dist, 'b-', label='Left Corner to Eye-Line', linewidth=2)
+        ax1.plot(time_sec, right_dist, 'r-', label='Right Corner to Eye-Line', linewidth=2)
+        ax1.plot(time_sec, total_dist, 'g--', label='Total Distance (selection)', linewidth=1.5, alpha=0.7)
+
+        ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
+        dist_at_peak = total_dist[peak_idx] if peak_idx < len(total_dist) else 0
+        ax1.scatter([peak_time], [dist_at_peak], color='red', s=150, zorder=5,
+                    edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
+        ax1.annotate(f'Min: {dist_at_peak:.1f}px', xy=(peak_time, dist_at_peak),
+                     xytext=(10, 10), textcoords='offset points', fontsize=10, fontweight='bold')
 
     ax1.set_xlabel(x_label, fontsize=11)
-    ax1.set_ylabel('Mouth Width (pixels)', fontsize=11)
+    ax1.set_ylabel('Distance to Eye-Line (pixels)', fontsize=11)
 
-    # 在标题中显示患侧信息
-    title = f'{action_name} Peak Selection: Maximum Mouth Width'
+    title = f'{action_name} Peak Selection: Minimum Corner-to-Eye Distance'
     if palsy_detection:
         palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
         title += f' | Detected: {palsy_text}'
@@ -152,34 +183,38 @@ def plot_smile_peak_selection(
     ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3)
 
-    # 下图: 口角角度 (用于患侧判断)
+    # 中图: 嘴宽曲线
     ax2 = axes[1]
 
     if valid_mask is not None:
         add_valid_region_shading(ax2, valid_mask, time_sec)
 
-    ax2.plot(time_sec, sequences["AOE (Right)"], 'r-', label='AOE (Right)', linewidth=2)
-    ax2.plot(time_sec, sequences["BOF (Left)"], 'b-', label='BOF (Left)', linewidth=2)
-    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7, label=f'Peak Frame {peak_idx}')
-    ax2.axhline(y=0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
-
-    # 在峰值帧标注角度值
-    aoe_at_peak = sequences["AOE (Right)"][peak_idx] if peak_idx < len(sequences["AOE (Right)"]) else 0
-    bof_at_peak = sequences["BOF (Left)"][peak_idx] if peak_idx < len(sequences["BOF (Left)"]) else 0
-    if not np.isnan(aoe_at_peak):
-        ax2.scatter([peak_time], [aoe_at_peak], color='red', s=80, zorder=5, edgecolors='white', linewidths=1.5)
-        ax2.annotate(f'{aoe_at_peak:+.1f}°', xy=(peak_time, aoe_at_peak),
-                     xytext=(5, 5), textcoords='offset points', fontsize=9, color='red')
-    if not np.isnan(bof_at_peak):
-        ax2.scatter([peak_time], [bof_at_peak], color='blue', s=80, zorder=5, edgecolors='white', linewidths=1.5)
-        ax2.annotate(f'{bof_at_peak:+.1f}°', xy=(peak_time, bof_at_peak),
-                     xytext=(5, -15), textcoords='offset points', fontsize=9, color='blue')
+    mouth_width = sequences["Mouth Width"]
+    ax2.plot(time_sec, mouth_width, 'g-', label='Mouth Width', linewidth=2)
+    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
 
     ax2.set_xlabel(x_label, fontsize=11)
-    ax2.set_ylabel('Oral Angle (degrees)', fontsize=11)
-    ax2.set_title('Oral Commissure Angles (for Palsy Detection)', fontsize=12)
+    ax2.set_ylabel('Mouth Width (pixels)', fontsize=11)
+    ax2.set_title('Mouth Width Over Time', fontsize=12)
     ax2.legend(loc='best')
     ax2.grid(True, alpha=0.3)
+
+    # 下图: 口角角度 (用于患侧判断参考)
+    ax3 = axes[2]
+
+    if valid_mask is not None:
+        add_valid_region_shading(ax3, valid_mask, time_sec)
+
+    ax3.plot(time_sec, sequences["AOE (Right)"], 'r-', label='AOE (Right)', linewidth=2)
+    ax3.plot(time_sec, sequences["BOF (Left)"], 'b-', label='BOF (Left)', linewidth=2)
+    ax3.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7, label=f'Peak Frame {peak_idx}')
+    ax3.axhline(y=0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
+
+    ax3.set_xlabel(x_label, fontsize=11)
+    ax3.set_ylabel('Oral Angle (degrees)', fontsize=11)
+    ax3.set_title('Oral Commissure Angles (for reference)', fontsize=12)
+    ax3.legend(loc='best')
+    ax3.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
@@ -262,6 +297,10 @@ def compute_smile_metrics(landmarks, w: int, h: int,
             "BOF_change": oral.BOF_angle - baseline_oral.BOF_angle,
         }
 
+        # ========== 计算嘴角到眼部水平线距离的变化 ==========
+        eye_line_excursion = compute_smile_excursion_by_eye_line(landmarks, w, h, baseline_landmarks)
+        metrics["eye_line_excursion"] = eye_line_excursion
+
     # ========== 嘴唇面中线对称性（用于面瘫侧别判断）==========
     lip_symmetry = compute_lip_midline_symmetry(landmarks, w, h)
     metrics["lip_symmetry"] = lip_symmetry
@@ -269,18 +308,14 @@ def compute_smile_metrics(landmarks, w: int, h: int,
     return metrics
 
 
-def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
+def detect_palsy_side(smile_metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从微笑动作检测面瘫侧别
+    从微笑动作检测面瘫侧别 - 基于嘴角上提幅度
 
-    核心原理:
-    - 面瘫侧肌肉瘫痪，健侧肌肉收缩把嘴唇拉向健侧
-    - 直接比较峰值帧嘴唇区域相对于面中线的对称性
-    - 嘴唇偏向的那侧是健侧，另一侧是面瘫侧
-
-    方法:
-    1. 主要：嘴唇区域面中线对称性（lip_symmetry）
-    2. 辅助：口角角度（oral_angle）
+    改进:
+    - 主要方法: 比较左右嘴角到眼部水平线距离的减小量
+    - 健侧距离减小更多（嘴角上提更高）
+    - 备用方法: 嘴唇中线对称性、口角角度
     """
     result = {
         "palsy_side": 0,
@@ -290,65 +325,94 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
-    # ========== 方法1：嘴唇面中线对称性（优先使用）==========
-    if "lip_symmetry" in metrics:
-        lip_sym = metrics["lip_symmetry"]
-        left_dist = lip_sym["left_to_midline"]
-        right_dist = lip_sym["right_to_midline"]
-        lip_offset = lip_sym["lip_offset"]
-        asymmetry_ratio = lip_sym["asymmetry_ratio"]
+    # 方法1（优先）: 嘴角到眼线距离变化（如果有基线）
+    if "eye_line_excursion" in smile_metrics:
+        exc = smile_metrics["eye_line_excursion"]
+
+        left_reduction = exc.get("left_reduction", 0)
+        right_reduction = exc.get("right_reduction", 0)
+
+        result["method"] = "eye_line_excursion"
+        result["evidence"]["left_reduction"] = left_reduction
+        result["evidence"]["right_reduction"] = right_reduction
+
+        max_reduction = max(abs(left_reduction), abs(right_reduction))
+
+        if max_reduction < 5:  # 运动幅度过小
+            result["evidence"]["status"] = "insufficient_movement"
+            # 继续使用其他方法
+        else:
+            reduction_diff = abs(left_reduction - right_reduction)
+            asymmetry = reduction_diff / max_reduction
+            result["evidence"]["reduction_asymmetry"] = asymmetry
+            result["confidence"] = min(1.0, asymmetry * 2)
+
+            if asymmetry < 0.15:
+                result["palsy_side"] = 0
+                result["interpretation"] = (
+                    f"双侧嘴角上提对称 (L减小{left_reduction:.1f}px, R减小{right_reduction:.1f}px)"
+                )
+            elif left_reduction < right_reduction:
+                result["palsy_side"] = 1
+                result["interpretation"] = (
+                    f"左嘴角上提弱 (L减小{left_reduction:.1f}px < R减小{right_reduction:.1f}px) → 左侧面瘫"
+                )
+            else:
+                result["palsy_side"] = 2
+                result["interpretation"] = (
+                    f"右嘴角上提弱 (R减小{right_reduction:.1f}px < L减小{left_reduction:.1f}px) → 右侧面瘫"
+                )
+            return result
+
+    # 方法2: 嘴唇中线对称性
+    if "lip_symmetry" in smile_metrics:
+        lip_sym = smile_metrics["lip_symmetry"]
+
+        lip_offset = lip_sym.get("lip_offset", 0)
+        asymmetry_ratio = lip_sym.get("asymmetry_ratio", 0)
 
         result["method"] = "lip_midline_symmetry"
-        result["evidence"] = {
-            "left_to_midline": left_dist,
-            "right_to_midline": right_dist,
-            "lip_offset": lip_offset,
-            "asymmetry_ratio": asymmetry_ratio,
-            "symmetry_ratio": lip_sym["symmetry_ratio"],
-        }
+        result["evidence"]["left_to_midline"] = lip_sym.get("left_to_midline", 0)
+        result["evidence"]["right_to_midline"] = lip_sym.get("right_to_midline", 0)
+        result["evidence"]["lip_offset"] = lip_offset
+        result["evidence"]["asymmetry_ratio"] = asymmetry_ratio
 
-        # 置信度基于不对称程度
-        result["confidence"] = min(1.0, asymmetry_ratio * 3.0)
+        result["confidence"] = min(1.0, asymmetry_ratio * 5)
 
-        if asymmetry_ratio < 0.08:  # 8%以内认为对称
+        if asymmetry_ratio < 0.08:
             result["palsy_side"] = 0
-            result["interpretation"] = f"嘴唇对称 (L={left_dist:.1f}px, R={right_dist:.1f}px, 偏移{lip_offset:+.1f}px)"
+            result["interpretation"] = f"嘴唇中线对称 (偏移{lip_offset:.1f}px, 不对称{asymmetry_ratio * 100:.1f}%)"
         elif lip_offset > 0:
-            # 嘴唇偏向左侧（患者左侧）= 被左侧拉 = 右侧面瘫
             result["palsy_side"] = 2
-            result["interpretation"] = f"嘴唇偏左 (L={left_dist:.1f}px > R={right_dist:.1f}px) → 右侧面瘫"
+            result["interpretation"] = f"嘴唇偏向左侧 ({lip_offset:+.1f}px) → 右侧面瘫"
         else:
-            # 嘴唇偏向右侧（患者右侧）= 被右侧拉 = 左侧面瘫
             result["palsy_side"] = 1
-            result["interpretation"] = f"嘴唇偏右 (R={right_dist:.1f}px > L={left_dist:.1f}px) → 左侧面瘫"
+            result["interpretation"] = f"嘴唇偏向右侧 ({lip_offset:+.1f}px) → 左侧面瘫"
 
         return result
 
-    # ========== 方法2（退化）：口角角度比较 ==========
-    oral = metrics.get("oral_angle", {})
-    aoe = oral.get("AOE", 0)  # 右侧口角角度
-    bof = oral.get("BOF", 0)  # 左侧口角角度
+    # 方法3: 口角角度（备用）
+    oral_angle = smile_metrics.get("oral_angle", {})
+    aoe = oral_angle.get("AOE", 0)
+    bof = oral_angle.get("BOF", 0)
+    angle_diff = abs(aoe - bof)
 
     result["method"] = "oral_angle"
-    angle_diff = abs(aoe - bof)
-    result["confidence"] = min(1.0, angle_diff / 15)
-    result["evidence"] = {
-        "AOE_right": aoe,
-        "BOF_left": bof,
-        "angle_diff": angle_diff,
-    }
+    result["evidence"]["AOE_right"] = aoe
+    result["evidence"]["BOF_left"] = bof
+    result["evidence"]["angle_diff"] = angle_diff
 
-    if angle_diff < 3:  # 3度以内认为对称
+    result["confidence"] = min(1.0, angle_diff / 15)
+
+    if angle_diff < 3:
         result["palsy_side"] = 0
-        result["interpretation"] = f"口角对称 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°)"
+        result["interpretation"] = f"口角对称 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°, 差异{angle_diff:.1f}°)"
     elif aoe < bof:
-        # 右口角角度更小（位置更低） -> 右侧面瘫
         result["palsy_side"] = 2
-        result["interpretation"] = f"右口角较低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°)"
+        result["interpretation"] = f"右口角低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°) → 右侧面瘫"
     else:
-        # 左口角角度更小 -> 左侧面瘫
         result["palsy_side"] = 1
-        result["interpretation"] = f"左口角较低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°)"
+        result["interpretation"] = f"左口角低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°) → 左侧面瘫"
 
     return result
 
@@ -484,8 +548,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     if not landmarks_seq or not frames_seq:
         return None
 
-    # 找峰值帧
-    peak_idx = find_peak_frame(landmarks_seq, frames_seq, w, h)
+    # 找峰值帧（嘴角到眼线距离最小）
+    peak_idx = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 

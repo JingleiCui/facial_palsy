@@ -93,10 +93,10 @@ class Thresholds:
     # =========================================================================
 
     # 闭眼判断 EAR 阈值
-    CLOSE_EYE_EAR_CLOSED: float = 0.15  # EAR < 此值认为眼睛闭合
+    CLOSE_EYE_EAR_CLOSED: float = 0.10  # EAR < 此值认为眼睛闭合
 
     # 闭眼程度对称性阈值
-    CLOSE_EYE_SYMMETRY: float = 0.20  # |L_EAR - R_EAR| / max(L,R) > 此值认为不对称
+    CLOSE_EYE_SYMMETRY: float = 0.10  # |L_EAR - R_EAR| / max(L,R) > 此值认为不对称
 
     # =========================================================================
     # RaiseEyebrow 抬眉动作阈值
@@ -147,7 +147,7 @@ class Thresholds:
     EYE_BLINK_CLOSURE_RATIO: float = 0.50  # EAR下降比例 > 此值认为有效眨眼
 
     # 眨眼对称性阈值
-    EYE_BLINK_SYMMETRY: float = 0.25
+    EYE_BLINK_SYMMETRY: float = 0.15
 
     # =========================================================================
     # Synkinesis 联动运动阈值

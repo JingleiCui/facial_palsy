@@ -156,12 +156,12 @@ def process_action_generic(landmarks_seq, frames_seq, w, h, video_info, output_d
     elif action_name == "VoluntaryEyeBlink":
         return eye_blink.process_voluntary_blink(
             landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result
+            baseline_result, baseline_landmarks
         )
     elif action_name == "SpontaneousEyeBlink":
         return eye_blink.process_spontaneous_blink(
             landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result
+            baseline_result, baseline_landmarks
         )
 
     # --- Close Eye ---

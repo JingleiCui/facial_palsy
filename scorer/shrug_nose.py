@@ -27,7 +27,7 @@ from clinical_base import (
     LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
     compute_mouth_metrics, compute_icd, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
-    compute_nose_midline_symmetry,
+    compute_nose_midline_symmetry, compute_ala_canthus_change,
 )
 
 from thresholds import THR
@@ -265,6 +265,10 @@ def compute_shrug_nose_metrics(landmarks, w: int, h: int,
         metrics["left_ala_vertical_move"] = (left_ala[1] - baseline_left_ala[1]) * scale
         metrics["right_ala_vertical_move"] = (right_ala[1] - baseline_right_ala[1]) * scale
 
+        # ========== 计算鼻翼-内眦距离的变化量 ==========
+        ala_change_data = compute_ala_canthus_change(landmarks, w, h, baseline_landmarks)
+        metrics["ala_canthus_change"] = ala_change_data
+
     # ========== 鼻部面中线对称性（用于面瘫侧别判断）==========
     nose_symmetry = compute_nose_midline_symmetry(landmarks, w, h)
     metrics["nose_symmetry"] = nose_symmetry
@@ -308,16 +312,12 @@ def compute_shrug_nose_metrics(landmarks, w: int, h: int,
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从皱鼻动作检测面瘫侧别
+    从皱鼻动作检测面瘫侧别 - 基于鼻翼-内眦距离变化
 
-    核心原理:
-    - 皱鼻时健侧鼻翼能上提，患侧鼻翼不能
-    - 比较左右鼻翼到眼部水平线（双眼内眦连线）的垂直距离
-    - 健侧鼻翼距离短（能上提），患侧鼻翼距离长（不能上提）
-
-    判断方法:
-    1. 主要：鼻翼到眼部水平线的距离比较
-    2. 辅助：鼻翼连线相对于眼部水平线的倾斜角度
+    改进:
+    - 主要方法: 比较左右鼻翼-内眦距离的缩短量
+    - 皱鼻时距离应减小，健侧减小更多（肌肉拉力强）
+    - 面瘫侧减小量小（或不减小）
     """
     result = {
         "palsy_side": 0,
@@ -327,85 +327,78 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
-    # ========== 方法1：鼻翼到眼部水平线距离比较 ==========
-    if "ala_to_eye_line" in metrics:
-        ala_eye = metrics["ala_to_eye_line"]
-        left_dist = ala_eye["left_distance"]
-        right_dist = ala_eye["right_distance"]
-        distance_diff = ala_eye["distance_diff"]
-        tilt_angle = ala_eye.get("tilt_angle", 0)
+    # 方法1（优先）: 距离变化量（如果有基线）
+    if "ala_canthus_change" in metrics:
+        change_data = metrics["ala_canthus_change"]
 
-        result["method"] = "ala_to_eye_line_distance"
-        result["evidence"] = {
-            "left_ala_to_eye_line": left_dist,
-            "right_ala_to_eye_line": right_dist,
-            "distance_diff": distance_diff,
-            "tilt_angle": tilt_angle,
-        }
+        left_reduction = change_data.get("left_reduction", 0)
+        right_reduction = change_data.get("right_reduction", 0)
 
-        # 计算不对称比例
-        max_dist = max(abs(left_dist), abs(right_dist))
-        if max_dist < 5:  # 距离太小，无法判断
-            result["interpretation"] = f"鼻翼-眼部距离过小 (L={left_dist:.1f}px, R={right_dist:.1f}px)"
-            result["evidence"]["status"] = "insufficient_distance"
+        result["method"] = "ala_canthus_change"
+        result["evidence"]["left_distance"] = change_data.get("left_distance", 0)
+        result["evidence"]["right_distance"] = change_data.get("right_distance", 0)
+        result["evidence"]["baseline_left_distance"] = change_data.get("baseline_left_distance", 0)
+        result["evidence"]["baseline_right_distance"] = change_data.get("baseline_right_distance", 0)
+        result["evidence"]["left_reduction"] = left_reduction
+        result["evidence"]["right_reduction"] = right_reduction
+
+        max_reduction = max(abs(left_reduction), abs(right_reduction))
+
+        if max_reduction < 3:  # 运动幅度过小（像素）
+            result["evidence"]["status"] = "insufficient_movement"
+            # 继续使用静态方法
+        else:
+            reduction_diff = abs(left_reduction - right_reduction)
+            asymmetry = reduction_diff / max_reduction
+            result["evidence"]["reduction_asymmetry"] = asymmetry
+            result["confidence"] = min(1.0, asymmetry * 2)
+
+            if asymmetry < 0.15:
+                result["palsy_side"] = 0
+                result["interpretation"] = (
+                    f"双侧鼻翼收缩对称 (L缩短{left_reduction:.1f}px, R缩短{right_reduction:.1f}px)"
+                )
+            elif left_reduction < right_reduction:
+                # 左侧缩短量小 = 左侧收缩弱 = 左侧面瘫
+                result["palsy_side"] = 1
+                result["interpretation"] = (
+                    f"左侧鼻翼收缩弱 (L缩短{left_reduction:.1f}px < R缩短{right_reduction:.1f}px) → 左侧面瘫"
+                )
+            else:
+                result["palsy_side"] = 2
+                result["interpretation"] = (
+                    f"右侧鼻翼收缩弱 (R缩短{right_reduction:.1f}px < L缩短{left_reduction:.1f}px) → 右侧面瘫"
+                )
             return result
 
-        asymmetry_ratio = abs(distance_diff) / max_dist
-        result["confidence"] = min(1.0, asymmetry_ratio * 3.0 + abs(tilt_angle) / 10.0)
-        result["evidence"]["asymmetry_ratio"] = asymmetry_ratio
+    # 方法2: 静态距离比较（当前帧）
+    # 皱鼻时距离大的一侧是面瘫侧（收缩弱）
+    left_dist = metrics.get("left_ala_canthus_dist", 0)
+    right_dist = metrics.get("right_ala_canthus_dist", 0)
 
-        # 判断逻辑：
-        # 健侧鼻翼能上提 → 距离短（y值小）
-        # 患侧鼻翼不能上提 → 距离长（y值大）
-        # 所以距离长的一侧是患侧
+    result["method"] = "ala_canthus_static"
+    result["evidence"]["left_ala_canthus_dist"] = left_dist
+    result["evidence"]["right_ala_canthus_dist"] = right_dist
 
-        if asymmetry_ratio < 0.08 and abs(tilt_angle) < 2:  # 8%以内且角度<2°认为对称
+    max_dist = max(left_dist, right_dist)
+    if max_dist > 1e-6:
+        dist_diff = abs(left_dist - right_dist)
+        asymmetry = dist_diff / max_dist
+        result["evidence"]["distance_asymmetry"] = asymmetry
+        result["confidence"] = min(1.0, asymmetry * 3)
+
+        if asymmetry < 0.10:
             result["palsy_side"] = 0
-            result["interpretation"] = f"鼻翼对称 (L={left_dist:.1f}px, R={right_dist:.1f}px, 倾斜{tilt_angle:+.1f}°)"
+            result["interpretation"] = f"双侧鼻翼-内眦距离对称 (L={left_dist:.1f}px, R={right_dist:.1f}px)"
         elif left_dist > right_dist:
-            # 左侧距离大 = 左侧鼻翼不能上提 = 左侧面瘫
-            result["palsy_side"] = 1
-            result[
-                "interpretation"] = f"左鼻翼距离大 (L={left_dist:.1f}px > R={right_dist:.1f}px, 倾斜{tilt_angle:+.1f}°) → 左侧面瘫"
-        else:
-            # 右侧距离大 = 右侧鼻翼不能上提 = 右侧面瘫
-            result["palsy_side"] = 2
-            result[
-                "interpretation"] = f"右鼻翼距离大 (R={right_dist:.1f}px > L={left_dist:.1f}px, 倾斜{tilt_angle:+.1f}°) → 右侧面瘫"
-
-        return result
-
-    # ========== 方法2（退化）：使用原有的鼻翼-内眦距离 ==========
-    if "nose_symmetry" in metrics:
-        nose_sym = metrics["nose_symmetry"]
-        left_dist = nose_sym["left_ala_canthus_dist"]
-        right_dist = nose_sym["right_ala_canthus_dist"]
-        asymmetry_ratio = nose_sym["asymmetry_ratio"]
-
-        result["method"] = "nose_midline_symmetry"
-        result["evidence"] = {
-            "left_ala_canthus_dist": left_dist,
-            "right_ala_canthus_dist": right_dist,
-            "asymmetry_ratio": asymmetry_ratio,
-        }
-
-        result["confidence"] = min(1.0, asymmetry_ratio * 3.0)
-
-        if asymmetry_ratio < 0.08:
-            result["palsy_side"] = 0
-            result["interpretation"] = f"鼻翼对称 (L={left_dist:.1f}px, R={right_dist:.1f}px)"
-        elif left_dist > right_dist:
+            # 左侧距离大 = 左侧收缩弱 = 左侧面瘫
             result["palsy_side"] = 1
             result["interpretation"] = f"左侧距离大 (L={left_dist:.1f}px > R={right_dist:.1f}px) → 左侧面瘫"
         else:
             result["palsy_side"] = 2
             result["interpretation"] = f"右侧距离大 (R={right_dist:.1f}px > L={left_dist:.1f}px) → 右侧面瘫"
 
-        return result
-
-    result["interpretation"] = "无足够数据判断面瘫侧别"
     return result
-
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
     """

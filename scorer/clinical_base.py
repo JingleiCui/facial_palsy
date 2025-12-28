@@ -66,9 +66,9 @@ class LM:
     # ========== 嘴部 ==========
     MOUTH_L = 291  # 左嘴角
     MOUTH_R = 61  # 右嘴角
-    LIP_TOP = 13  # 上唇中心 (上唇下边界)
-    LIP_BOT = 14  # 下唇中心 (下唇上边界)
     LIP_TOP_CENTER = 0  # 上唇上边界中心
+    LIP_TOP = 13  # 上唇下边界中心
+    LIP_BOT = 14  # 下唇上边界中心
     LIP_BOT_CENTER = 17  # 下唇下边界中心
 
     # 嘴唇轮廓
@@ -83,12 +83,14 @@ class LM:
     LOWER_LIP_L = [317, 402, 318, 324, 308, 291, 375, 321, 405, 314]
     LIP_L = [267, 269, 270, 409, 291, 308, 415, 310, 311, 312,
              317, 402, 318, 324, 375, 321, 405, 314]  # 合并去重
+    INNER_LIP_L = [13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14]
 
     # 患者右侧嘴唇（图像左侧，x值较小）
     UPPER_LIP_R = [37, 39, 40, 185, 61, 78, 191, 80, 81, 82]
     LOWER_LIP_R = [87, 178, 88, 95, 78, 61, 146, 91, 181, 84]
     LIP_R = [37, 39, 40, 185, 61, 78, 191, 80, 81, 82,
              87, 178, 88, 95, 146, 91, 181, 84]  # 合并去重
+    INNER_LIP_R = [13,  82,  81,  80, 191, 78,  95,  88, 178,  87, 14]
 
     # ========== 口角角度 ==========
     ORAL_CORNER_R = 78  # A点: 右嘴角
@@ -2105,3 +2107,623 @@ def compute_nose_midline_symmetry(landmarks, w: int, h: int) -> Dict[str, Any]:
         "symmetry_ratio": float(symmetry_ratio),
         "palsy_side_suggestion": palsy_side_suggestion,
     }
+
+
+def compute_eye_closure_by_area(landmarks, w: int, h: int,
+                                baseline_landmarks=None) -> Dict[str, Any]:
+    """
+    使用眼睛面积计算闭眼程度（解决天生大小眼的问题）
+
+    原理:
+    - 用当前眼睛面积 / 基线眼睛面积 来计算闭合度
+    - 比值越小表示闭合程度越高
+    - 相比EAR更能反映真实的眼睛开合状态
+
+    Args:
+        landmarks: 当前帧landmarks
+        w, h: 图像尺寸
+        baseline_landmarks: 基线帧landmarks（NeutralFace）
+
+    Returns:
+        Dict包含:
+        - left_area, right_area: 当前帧眼睛面积
+        - baseline_left_area, baseline_right_area: 基线眼睛面积
+        - left_open_ratio, right_open_ratio: 睁眼比例 (0-1, 越大越睁开)
+        - left_closure_ratio, right_closure_ratio: 闭眼比例 (0-1, 越大越闭合)
+        - closure_asymmetry: 闭眼不对称度
+        - palsy_side_suggestion: 面瘫侧建议 (闭合差的一侧)
+    """
+    # 当前帧眼睛面积
+    left_area, _ = compute_eye_area(landmarks, w, h, left=True)
+    right_area, _ = compute_eye_area(landmarks, w, h, left=False)
+
+    result = {
+        "left_area": float(left_area),
+        "right_area": float(right_area),
+    }
+
+    if baseline_landmarks is None:
+        # 没有基线，使用面积比作为替代
+        max_area = max(left_area, right_area)
+        if max_area < 1e-6:
+            result["left_open_ratio"] = 1.0
+            result["right_open_ratio"] = 1.0
+            result["left_closure_ratio"] = 0.0
+            result["right_closure_ratio"] = 0.0
+            result["closure_asymmetry"] = 0.0
+            result["palsy_side_suggestion"] = 0
+            return result
+
+        # 假设面积更大的眼睛是"更睁开"的
+        result["left_open_ratio"] = left_area / max_area
+        result["right_open_ratio"] = right_area / max_area
+        result["left_closure_ratio"] = 1 - result["left_open_ratio"]
+        result["right_closure_ratio"] = 1 - result["right_open_ratio"]
+
+        # 面积更大的眼睛可能是闭合更差的（面瘫侧）
+        area_ratio = left_area / right_area if right_area > 1e-6 else 1.0
+        if abs(area_ratio - 1.0) < 0.15:
+            result["closure_asymmetry"] = 0.0
+            result["palsy_side_suggestion"] = 0
+        elif left_area > right_area:
+            result["closure_asymmetry"] = (left_area - right_area) / max_area
+            result["palsy_side_suggestion"] = 1  # 左眼面积大=左眼闭合差=左侧面瘫
+        else:
+            result["closure_asymmetry"] = (right_area - left_area) / max_area
+            result["palsy_side_suggestion"] = 2
+        return result
+
+    # 有基线：计算相对于基线的闭合程度
+    # 需要进行尺度归一化
+    scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+
+    baseline_left_area, _ = compute_eye_area(baseline_landmarks, w, h, left=True)
+    baseline_right_area, _ = compute_eye_area(baseline_landmarks, w, h, left=False)
+
+    result["baseline_left_area"] = float(baseline_left_area)
+    result["baseline_right_area"] = float(baseline_right_area)
+    result["scale"] = float(scale)
+
+    # 将当前面积换算到基线尺度 (面积用scale²)
+    scaled_left_area = left_area * (scale ** 2)
+    scaled_right_area = right_area * (scale ** 2)
+
+    result["scaled_left_area"] = float(scaled_left_area)
+    result["scaled_right_area"] = float(scaled_right_area)
+
+    # 计算睁眼比例 = 当前面积 / 基线面积
+    left_open_ratio = scaled_left_area / baseline_left_area if baseline_left_area > 1e-6 else 1.0
+    right_open_ratio = scaled_right_area / baseline_right_area if baseline_right_area > 1e-6 else 1.0
+
+    # 闭眼比例 = 1 - 睁眼比例 (限制在0-1范围)
+    left_closure_ratio = max(0.0, min(1.0, 1.0 - left_open_ratio))
+    right_closure_ratio = max(0.0, min(1.0, 1.0 - right_open_ratio))
+
+    result["left_open_ratio"] = float(left_open_ratio)
+    result["right_open_ratio"] = float(right_open_ratio)
+    result["left_closure_ratio"] = float(left_closure_ratio)
+    result["right_closure_ratio"] = float(right_closure_ratio)
+
+    # 闭合不对称度
+    max_closure = max(left_closure_ratio, right_closure_ratio)
+    if max_closure < 0.1:
+        # 两眼都几乎没闭合
+        result["closure_asymmetry"] = 0.0
+        result["palsy_side_suggestion"] = 0
+    else:
+        closure_diff = abs(left_closure_ratio - right_closure_ratio)
+        result["closure_asymmetry"] = closure_diff / max_closure
+
+        # 闭合比例低的一侧是面瘫侧
+        if closure_diff < 0.15 * max_closure:  # 15%以内认为对称
+            result["palsy_side_suggestion"] = 0
+        elif left_closure_ratio < right_closure_ratio:
+            result["palsy_side_suggestion"] = 1  # 左眼闭合差=左侧面瘫
+        else:
+            result["palsy_side_suggestion"] = 2  # 右眼闭合差=右侧面瘫
+
+    return result
+
+
+def compute_inner_lip_area(landmarks, w: int, h: int, left: bool = True) -> float:
+    """
+    计算左侧或右侧内唇面积
+
+    Args:
+        landmarks: 关键点
+        w, h: 图像尺寸
+        left: True=左侧内唇, False=右侧内唇
+
+    Returns:
+        内唇面积（像素平方）
+    """
+    indices = LM.INNER_LIP_L if left else LM.INNER_LIP_R
+    points = pts2d(landmarks, indices, w, h)
+    return polygon_area(points)
+
+
+def compute_inner_lip_symmetry(landmarks, w: int, h: int,
+                               baseline_landmarks=None) -> Dict[str, Any]:
+    """
+    计算左右内唇面积对称性（用于ShowTeeth面瘫侧判断）
+
+    原理:
+    - 露齿时，健侧肌肉拉力强，内唇面积增加更多
+    - 面瘫侧肌肉无力，内唇面积增加少
+
+    Args:
+        landmarks: 当前帧landmarks
+        w, h: 图像尺寸
+        baseline_landmarks: 基线帧landmarks
+
+    Returns:
+        Dict包含:
+        - left_area, right_area: 当前帧左右内唇面积
+        - area_ratio: 左/右面积比
+        - area_diff: 左-右面积差
+        - baseline_left_area, baseline_right_area: 基线面积（如有）
+        - left_change, right_change: 面积变化量（如有基线）
+        - left_change_ratio, right_change_ratio: 面积变化比例
+        - palsy_side_suggestion: 面瘫侧建议（面积增加少的一侧）
+    """
+    left_area = compute_inner_lip_area(landmarks, w, h, left=True)
+    right_area = compute_inner_lip_area(landmarks, w, h, left=False)
+
+    result = {
+        "left_area": float(left_area),
+        "right_area": float(right_area),
+        "area_ratio": float(left_area / right_area) if right_area > 1e-6 else 1.0,
+        "area_diff": float(left_area - right_area),
+    }
+
+    if baseline_landmarks is None:
+        # 没有基线，直接比较当前面积
+        max_area = max(left_area, right_area)
+        if max_area < 1e-6:
+            result["asymmetry_ratio"] = 0.0
+            result["palsy_side_suggestion"] = 0
+            return result
+
+        asymmetry = abs(left_area - right_area) / max_area
+        result["asymmetry_ratio"] = float(asymmetry)
+
+        if asymmetry < 0.15:
+            result["palsy_side_suggestion"] = 0
+        elif left_area < right_area:
+            # 左侧面积小 = 左侧肌肉弱 = 左侧面瘫
+            result["palsy_side_suggestion"] = 1
+        else:
+            result["palsy_side_suggestion"] = 2
+        return result
+
+    # 有基线：计算变化量
+    scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+
+    baseline_left_area = compute_inner_lip_area(baseline_landmarks, w, h, left=True)
+    baseline_right_area = compute_inner_lip_area(baseline_landmarks, w, h, left=False)
+
+    result["baseline_left_area"] = float(baseline_left_area)
+    result["baseline_right_area"] = float(baseline_right_area)
+    result["scale"] = float(scale)
+
+    # 换算到基线尺度
+    scaled_left_area = left_area * (scale ** 2)
+    scaled_right_area = right_area * (scale ** 2)
+
+    # 面积变化量
+    left_change = scaled_left_area - baseline_left_area
+    right_change = scaled_right_area - baseline_right_area
+
+    result["left_change"] = float(left_change)
+    result["right_change"] = float(right_change)
+
+    # 面积变化比例
+    left_change_ratio = left_change / baseline_left_area if baseline_left_area > 1e-6 else 0.0
+    right_change_ratio = right_change / baseline_right_area if baseline_right_area > 1e-6 else 0.0
+
+    result["left_change_ratio"] = float(left_change_ratio)
+    result["right_change_ratio"] = float(right_change_ratio)
+
+    # 面瘫侧判断：面积增加少的一侧是面瘫侧
+    max_change = max(abs(left_change), abs(right_change))
+    if max_change < 1e-6:
+        result["change_asymmetry"] = 0.0
+        result["palsy_side_suggestion"] = 0
+    else:
+        change_diff = abs(left_change - right_change)
+        result["change_asymmetry"] = float(change_diff / max_change)
+
+        if change_diff < 0.15 * max_change:
+            result["palsy_side_suggestion"] = 0
+        elif left_change < right_change:
+            # 左侧变化小 = 左侧肌肉弱 = 左侧面瘫
+            result["palsy_side_suggestion"] = 1
+        else:
+            result["palsy_side_suggestion"] = 2
+
+    return result
+
+
+def compute_lip_midline_center(landmarks, w: int, h: int) -> Tuple[float, float]:
+    """
+    计算嘴唇中线的中心点
+
+    使用上唇中线点(0, 13)和下唇中线点(14, 17)拟合嘴唇中线，返回中心点
+
+    Args:
+        landmarks: 关键点
+        w, h: 图像尺寸
+
+    Returns:
+        (x, y): 嘴唇中线中心点坐标
+    """
+    # 上唇中线点
+    lip_top_center = pt2d(landmarks[LM.LIP_TOP_CENTER], w, h)  # 0
+    lip_top = pt2d(landmarks[LM.LIP_TOP], w, h)  # 13
+
+    # 下唇中线点
+    lip_bot = pt2d(landmarks[LM.LIP_BOT], w, h)  # 14
+    lip_bot_center = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)  # 17
+
+    # 计算四个点的质心作为嘴唇中线中心
+    center_x = (lip_top_center[0] + lip_top[0] + lip_bot[0] + lip_bot_center[0]) / 4
+    center_y = (lip_top_center[1] + lip_top[1] + lip_bot[1] + lip_bot_center[1]) / 4
+
+    return (center_x, center_y)
+
+
+def compute_lip_midline_offset_from_face_midline(landmarks, w: int, h: int,
+                                                 baseline_landmarks=None) -> Dict[str, Any]:
+    """
+    计算嘴唇中线相对于面中线的偏移（用于BlowCheek/LipPucker面瘫侧判断）
+
+    原理:
+    - 面中线: 双内眦中点的x坐标
+    - 嘴唇中线: 上下唇中线点的平均x坐标
+    - 面瘫时嘴唇被健侧肌肉拉动，偏向健侧
+    - 和基线相比，偏移变化方向指示面瘫侧
+
+    Args:
+        landmarks: 当前帧landmarks
+        w, h: 图像尺寸
+        baseline_landmarks: 基线帧landmarks
+
+    Returns:
+        Dict包含:
+        - face_midline_x: 面中线x坐标
+        - lip_midline_x: 嘴唇中线x坐标
+        - current_offset: 当前偏移 (lip_x - face_x, 正=偏左，负=偏右)
+        - baseline_offset: 基线偏移（如有）
+        - offset_change: 偏移变化量（如有基线）
+        - palsy_side_suggestion: 面瘫侧建议
+    """
+    # 面中线
+    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+    face_midline_x = (left_canthus[0] + right_canthus[0]) / 2
+
+    # 嘴唇中线中心
+    lip_center = compute_lip_midline_center(landmarks, w, h)
+    lip_midline_x = lip_center[0]
+
+    # 当前偏移
+    current_offset = lip_midline_x - face_midline_x
+
+    result = {
+        "face_midline_x": float(face_midline_x),
+        "lip_midline_x": float(lip_midline_x),
+        "lip_midline_y": float(lip_center[1]),
+        "current_offset": float(current_offset),
+    }
+
+    if baseline_landmarks is None:
+        # 没有基线，直接根据当前偏移判断
+        icd = compute_icd(landmarks, w, h)
+        offset_norm = abs(current_offset) / icd if icd > 1e-6 else 0
+        result["offset_norm"] = float(offset_norm)
+
+        if offset_norm < 0.03:  # 3%以内认为对称
+            result["palsy_side_suggestion"] = 0
+        elif current_offset > 0:
+            # 偏向患者左侧 = 被左侧拉 = 左侧健侧 = 右侧面瘫
+            result["palsy_side_suggestion"] = 2
+        else:
+            result["palsy_side_suggestion"] = 1
+        return result
+
+    # 有基线：计算偏移变化
+    baseline_lip_center = compute_lip_midline_center(baseline_landmarks, w, h)
+    baseline_left_canthus = pt2d(baseline_landmarks[LM.EYE_INNER_L], w, h)
+    baseline_right_canthus = pt2d(baseline_landmarks[LM.EYE_INNER_R], w, h)
+    baseline_face_midline_x = (baseline_left_canthus[0] + baseline_right_canthus[0]) / 2
+
+    baseline_offset = baseline_lip_center[0] - baseline_face_midline_x
+
+    result["baseline_offset"] = float(baseline_offset)
+
+    # 偏移变化量（考虑尺度）
+    scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+    scaled_current_offset = current_offset * scale
+
+    offset_change = scaled_current_offset - baseline_offset
+    result["offset_change"] = float(offset_change)
+    result["scale"] = float(scale)
+
+    # 归一化偏移变化
+    icd_base = compute_icd(baseline_landmarks, w, h)
+    offset_change_norm = abs(offset_change) / icd_base if icd_base > 1e-6 else 0
+    result["offset_change_norm"] = float(offset_change_norm)
+
+    # 面瘫侧判断：偏移变化方向
+    if offset_change_norm < 0.02:  # 2%以内认为无变化
+        result["palsy_side_suggestion"] = 0
+    elif offset_change > 0:
+        # 相对基线偏向左侧 = 被左侧拉 = 右侧面瘫
+        result["palsy_side_suggestion"] = 2
+    else:
+        result["palsy_side_suggestion"] = 1
+
+    return result
+
+
+def compute_mouth_corner_to_eye_line_distance(landmarks, w: int, h: int,
+                                              left: bool = True) -> Dict[str, Any]:
+    """
+    计算嘴角到眼部水平线的距离（用于Smile关键帧选择和面瘫侧判断）
+
+    原理:
+    - 眼部水平线: 双内眦连线
+    - 微笑时嘴角上提，嘴角到眼部水平线的距离减小
+    - 距离减小最多的帧是微笑峰值帧
+
+    Args:
+        landmarks: 关键点
+        w, h: 图像尺寸
+        left: True=左嘴角, False=右嘴角
+
+    Returns:
+        Dict包含:
+        - corner: 嘴角坐标
+        - eye_line_y: 眼部水平线y坐标（内眦平均y）
+        - distance: 嘴角到眼部水平线的垂直距离
+    """
+    # 眼部水平线（双内眦平均y坐标）
+    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+    eye_line_y = (left_canthus[1] + right_canthus[1]) / 2
+
+    # 嘴角
+    if left:
+        corner = pt2d(landmarks[LM.MOUTH_L], w, h)
+    else:
+        corner = pt2d(landmarks[LM.MOUTH_R], w, h)
+
+    # 垂直距离（在图像坐标系中，y向下为正，所以corner_y > eye_line_y表示嘴角在眼睛下方）
+    distance = corner[1] - eye_line_y
+
+    return {
+        "corner": corner,
+        "eye_line_y": float(eye_line_y),
+        "distance": float(distance),
+    }
+
+
+def compute_smile_excursion_by_eye_line(landmarks, w: int, h: int,
+                                        baseline_landmarks=None) -> Dict[str, Any]:
+    """
+    计算微笑运动幅度（基于嘴角到眼部水平线的距离变化）
+
+    原理:
+    - 微笑时嘴角上提，到眼部水平线的距离减小
+    - 健侧距离减小更多（嘴角上提更高）
+    - 面瘫侧距离减小较少
+
+    Args:
+        landmarks: 当前帧landmarks
+        w, h: 图像尺寸
+        baseline_landmarks: 基线帧landmarks
+
+    Returns:
+        Dict包含:
+        - left_distance, right_distance: 当前帧左右嘴角到眼线距离
+        - baseline_left_distance, baseline_right_distance: 基线距离（如有）
+        - left_change, right_change: 距离变化量（负值=上提）
+        - excursion_ratio: 运动比例（min/max变化量）
+        - palsy_side_suggestion: 面瘫侧建议（变化小的一侧）
+    """
+    left_result = compute_mouth_corner_to_eye_line_distance(landmarks, w, h, left=True)
+    right_result = compute_mouth_corner_to_eye_line_distance(landmarks, w, h, left=False)
+
+    result = {
+        "left_distance": left_result["distance"],
+        "right_distance": right_result["distance"],
+        "eye_line_y": left_result["eye_line_y"],
+        "left_corner": left_result["corner"],
+        "right_corner": right_result["corner"],
+    }
+
+    if baseline_landmarks is None:
+        # 没有基线，直接比较当前距离
+        dist_diff = abs(left_result["distance"] - right_result["distance"])
+        avg_dist = (left_result["distance"] + right_result["distance"]) / 2
+
+        if avg_dist < 1e-6:
+            result["asymmetry_ratio"] = 0.0
+            result["palsy_side_suggestion"] = 0
+        else:
+            result["asymmetry_ratio"] = float(dist_diff / avg_dist)
+
+            if result["asymmetry_ratio"] < 0.10:
+                result["palsy_side_suggestion"] = 0
+            elif left_result["distance"] > right_result["distance"]:
+                # 左嘴角距离大（没上提）= 左侧面瘫
+                result["palsy_side_suggestion"] = 1
+            else:
+                result["palsy_side_suggestion"] = 2
+        return result
+
+    # 有基线：计算变化量
+    scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+
+    baseline_left = compute_mouth_corner_to_eye_line_distance(baseline_landmarks, w, h, left=True)
+    baseline_right = compute_mouth_corner_to_eye_line_distance(baseline_landmarks, w, h, left=False)
+
+    result["baseline_left_distance"] = baseline_left["distance"]
+    result["baseline_right_distance"] = baseline_right["distance"]
+    result["scale"] = float(scale)
+
+    # 换算到基线尺度后的距离
+    scaled_left_dist = left_result["distance"] * scale
+    scaled_right_dist = right_result["distance"] * scale
+
+    # 变化量（负值表示距离减小=嘴角上提）
+    left_change = scaled_left_dist - baseline_left["distance"]
+    right_change = scaled_right_dist - baseline_right["distance"]
+
+    result["left_change"] = float(left_change)
+    result["right_change"] = float(right_change)
+
+    # 运动比例
+    # 微笑时两侧都应该是负值（距离减小）
+    # 面瘫侧减小得少（负值绝对值小，或为正值）
+    left_reduction = -left_change  # 转为正值表示减小量
+    right_reduction = -right_change
+
+    result["left_reduction"] = float(left_reduction)
+    result["right_reduction"] = float(right_reduction)
+
+    max_reduction = max(left_reduction, right_reduction)
+    min_reduction = min(left_reduction, right_reduction)
+
+    if max_reduction < 1e-6:
+        result["excursion_ratio"] = 1.0
+        result["palsy_side_suggestion"] = 0
+    else:
+        result["excursion_ratio"] = float(min_reduction / max_reduction) if max_reduction > 1e-6 else 1.0
+        reduction_diff = abs(left_reduction - right_reduction)
+
+        if reduction_diff < 0.15 * max_reduction:
+            result["palsy_side_suggestion"] = 0
+        elif left_reduction < right_reduction:
+            # 左侧减小量小（嘴角没上提）= 左侧面瘫
+            result["palsy_side_suggestion"] = 1
+        else:
+            result["palsy_side_suggestion"] = 2
+
+    return result
+
+
+def compute_ala_canthus_change(landmarks, w: int, h: int,
+                               baseline_landmarks=None) -> Dict[str, Any]:
+    """
+    计算鼻翼-内眦距离变化量（用于ShrugNose面瘫侧判断）
+
+    原理:
+    - 皱鼻时鼻翼上提向内收缩，鼻翼-内眦距离减小
+    - 健侧距离减小更多
+    - 面瘫侧距离减小较少
+
+    Args:
+        landmarks: 当前帧landmarks
+        w, h: 图像尺寸
+        baseline_landmarks: 基线帧landmarks
+
+    Returns:
+        Dict包含:
+        - left_distance, right_distance: 当前帧距离
+        - baseline_left_distance, baseline_right_distance: 基线距离
+        - left_change, right_change: 变化量（负值=距离减小）
+        - left_change_ratio, right_change_ratio: 变化比例
+        - palsy_side_suggestion: 面瘫侧建议（变化小的一侧）
+    """
+    # 当前帧距离
+    left_ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
+    right_ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
+    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+
+    left_dist = dist(left_ala, left_canthus)
+    right_dist = dist(right_ala, right_canthus)
+
+    result = {
+        "left_distance": float(left_dist),
+        "right_distance": float(right_dist),
+        "distance_ratio": float(left_dist / right_dist) if right_dist > 1e-6 else 1.0,
+    }
+
+    if baseline_landmarks is None:
+        # 没有基线，直接比较当前距离（距离大=收缩弱=面瘫）
+        max_dist = max(left_dist, right_dist)
+        if max_dist < 1e-6:
+            result["asymmetry_ratio"] = 0.0
+            result["palsy_side_suggestion"] = 0
+        else:
+            diff = abs(left_dist - right_dist)
+            result["asymmetry_ratio"] = float(diff / max_dist)
+
+            if result["asymmetry_ratio"] < 0.10:
+                result["palsy_side_suggestion"] = 0
+            elif left_dist > right_dist:
+                result["palsy_side_suggestion"] = 1  # 左侧距离大=左侧收缩弱=左侧面瘫
+            else:
+                result["palsy_side_suggestion"] = 2
+        return result
+
+    # 有基线：计算变化量
+    scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+
+    baseline_left_ala = pt2d(baseline_landmarks[LM.NOSE_ALA_L], w, h)
+    baseline_right_ala = pt2d(baseline_landmarks[LM.NOSE_ALA_R], w, h)
+    baseline_left_canthus = pt2d(baseline_landmarks[LM.EYE_INNER_L], w, h)
+    baseline_right_canthus = pt2d(baseline_landmarks[LM.EYE_INNER_R], w, h)
+
+    baseline_left_dist = dist(baseline_left_ala, baseline_left_canthus)
+    baseline_right_dist = dist(baseline_right_ala, baseline_right_canthus)
+
+    result["baseline_left_distance"] = float(baseline_left_dist)
+    result["baseline_right_distance"] = float(baseline_right_dist)
+    result["scale"] = float(scale)
+
+    # 换算到基线尺度
+    scaled_left_dist = left_dist * scale
+    scaled_right_dist = right_dist * scale
+
+    # 变化量（负值=距离减小=收缩）
+    left_change = scaled_left_dist - baseline_left_dist
+    right_change = scaled_right_dist - baseline_right_dist
+
+    result["left_change"] = float(left_change)
+    result["right_change"] = float(right_change)
+
+    # 变化比例
+    left_change_ratio = left_change / baseline_left_dist if baseline_left_dist > 1e-6 else 0.0
+    right_change_ratio = right_change / baseline_right_dist if baseline_right_dist > 1e-6 else 0.0
+
+    result["left_change_ratio"] = float(left_change_ratio)
+    result["right_change_ratio"] = float(right_change_ratio)
+
+    # 面瘫侧判断：皱鼻时距离应减小，减小少的是面瘫侧
+    left_reduction = -left_change  # 正值表示减小量
+    right_reduction = -right_change
+
+    result["left_reduction"] = float(left_reduction)
+    result["right_reduction"] = float(right_reduction)
+
+    max_reduction = max(left_reduction, right_reduction)
+
+    if max_reduction < 1e-6:
+        result["reduction_asymmetry"] = 0.0
+        result["palsy_side_suggestion"] = 0
+    else:
+        reduction_diff = abs(left_reduction - right_reduction)
+        result["reduction_asymmetry"] = float(reduction_diff / max_reduction)
+
+        if reduction_diff < 0.15 * max_reduction:
+            result["palsy_side_suggestion"] = 0
+        elif left_reduction < right_reduction:
+            # 左侧减小量小=左侧收缩弱=左侧面瘫
+            result["palsy_side_suggestion"] = 1
+        else:
+            result["palsy_side_suggestion"] = 2
+
+    return result

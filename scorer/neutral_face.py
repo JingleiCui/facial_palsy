@@ -22,7 +22,7 @@ from clinical_base import (
     compute_mouth_metrics, compute_oral_angle, compute_nlf_length,
     compute_icd, extract_common_indicators,
     ActionResult, OralAngleMeasure,
-    draw_text_with_background, draw_landmarks, draw_polygon, compute_brow_eye_distance
+    draw_text_with_background, draw_landmarks, draw_polygon, compute_brow_eye_distance,
 )
 
 from sunnybrook_scorer import (
@@ -170,97 +170,140 @@ def extract_action_specific_indicators(landmarks, w: int, h: int,
 
 def detect_resting_palsy(result: ActionResult) -> Dict[str, Any]:
     """
-    检测静息状态下的面瘫侧别
+    检测静息状态下的面瘫侧别 - 增强版
 
     原理：即使在静息状态，面瘫侧也可能表现出：
-    1. 眼睑裂较大或较小（取决于面瘫类型）
+    1. 眼睑裂不对称（高度或面积）
     2. 鼻唇沟变浅
     3. 口角下垂
-    4. 面部各器官相对于面中线不对称
+    4. 眉毛高度不对称
+    5. 面部各器官相对于面中线不对称
+
+    增强：使用更多指标和加权投票机制
     """
     detection = {
         "palsy_side": 0,
         "confidence": 0.0,
         "interpretation": "",
-        "method": "resting_symmetry",
+        "method": "resting_symmetry_enhanced",
         "evidence": {}
     }
 
-    # 收集证据
-    votes = []  # (side, weight, description)
+    # 收集证据 (side, weight, description)
+    votes = []
 
-    # 1. 眼睑裂高度比
+    # ========== 1. 眼睛面积比 ==========
+    area_ratio = result.eye_area_ratio
+    if area_ratio is not None:
+        detection["evidence"]["eye_area_ratio"] = area_ratio
+        # 面积比显著偏离1表示不对称
+        deviation = abs(area_ratio - 1.0)
+        if deviation > 0.10:  # 10%以上差异
+            weight = min(1.0, deviation * 2)  # 权重随差异增大
+            if area_ratio < 1.0:
+                # 左眼面积小 - 可能是左侧面瘫（眼睑下垂）或右侧（眼睑提升）
+                # 静息态时，面瘫侧眼睑可能松弛下垂，导致面积略小
+                votes.append((1, weight * 0.3, f"左眼面积较小 (ratio={area_ratio:.3f})"))
+            else:
+                votes.append((2, weight * 0.3, f"右眼面积较小 (ratio={area_ratio:.3f})"))
+
+    # ========== 2. 眼睑裂高度比 ==========
     palp_ratio = result.palpebral_height_ratio
     if palp_ratio is not None:
-        detection["evidence"]["palpebral_ratio"] = palp_ratio
-        if abs(palp_ratio - 1.0) > 0.15:
-            # 比值远离1，存在不对称
+        detection["evidence"]["palpebral_height_ratio"] = palp_ratio
+        deviation = abs(palp_ratio - 1.0)
+        if deviation > 0.12:  # 12%以上差异
+            weight = min(1.0, deviation * 2)
             if palp_ratio < 1.0:
-                # 左侧眼睑裂较小
-                votes.append((1, abs(palp_ratio - 1.0), f"左眼睑裂较小 (ratio={palp_ratio:.3f})"))
+                votes.append((1, weight * 0.4, f"左眼睑裂高度较小 (ratio={palp_ratio:.3f})"))
             else:
-                votes.append((2, abs(palp_ratio - 1.0), f"右眼睑裂较小 (ratio={palp_ratio:.3f})"))
+                votes.append((2, weight * 0.4, f"右眼睑裂高度较小 (ratio={palp_ratio:.3f})"))
 
-    # 2. 鼻唇沟长度比
+    # ========== 3. 鼻唇沟长度比 ==========
     nlf_ratio = result.nlf_ratio
     if nlf_ratio is not None:
         detection["evidence"]["nlf_ratio"] = nlf_ratio
-        if abs(nlf_ratio - 1.0) > 0.15:
+        deviation = abs(nlf_ratio - 1.0)
+        if deviation > 0.12:
+            weight = min(1.0, deviation * 2)
             if nlf_ratio < 1.0:
                 # 左侧NLF较短（变浅）-> 左侧面瘫
-                votes.append((1, abs(nlf_ratio - 1.0), f"左侧鼻唇沟变浅 (ratio={nlf_ratio:.3f})"))
+                votes.append((1, weight * 0.5, f"左侧鼻唇沟变浅 (ratio={nlf_ratio:.3f})"))
             else:
-                votes.append((2, abs(nlf_ratio - 1.0), f"右侧鼻唇沟变浅 (ratio={nlf_ratio:.3f})"))
+                votes.append((2, weight * 0.5, f"右侧鼻唇沟变浅 (ratio={nlf_ratio:.3f})"))
 
-    # 3. 口角角度
+    # ========== 4. 口角角度 ==========
     if result.oral_angle:
         aoe = result.oral_angle.AOE_angle
         bof = result.oral_angle.BOF_angle
         angle_diff = abs(aoe - bof)
         detection["evidence"]["AOE_right"] = aoe
         detection["evidence"]["BOF_left"] = bof
-        detection["evidence"]["angle_diff"] = angle_diff
+        detection["evidence"]["oral_angle_diff"] = angle_diff
 
         if angle_diff > 3:
+            weight = min(1.0, angle_diff / 15)
             if aoe < bof:
-                # 右口角更低
-                votes.append((2, angle_diff / 15, f"右口角下垂 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°)"))
+                # 右口角更低（角度更小/更负）
+                votes.append((2, weight * 0.6, f"右口角下垂 (AOE={aoe:+.1f}°, BOF={bof:+.1f}°)"))
             else:
-                votes.append((1, angle_diff / 15, f"左口角下垂 (BOF={bof:+.1f}°, AOE={aoe:+.1f}°)"))
+                votes.append((1, weight * 0.6, f"左口角下垂 (BOF={bof:+.1f}°, AOE={aoe:+.1f}°)"))
 
-    # 4. 眉高比
+    # ========== 5. 眉高比 ==========
     brow_ratio = result.brow_height_ratio
     if brow_ratio is not None:
-        detection["evidence"]["brow_ratio"] = brow_ratio
-        if abs(brow_ratio - 1.0) > 0.10:
+        detection["evidence"]["brow_height_ratio"] = brow_ratio
+        deviation = abs(brow_ratio - 1.0)
+        if deviation > 0.12:
+            weight = min(1.0, deviation * 2)
             if brow_ratio < 1.0:
-                votes.append((1, abs(brow_ratio - 1.0) * 0.5, f"左眉较低 (ratio={brow_ratio:.3f})"))
+                # 左侧眉毛较低 -> 可能是左侧面瘫
+                votes.append((1, weight * 0.3, f"左眉较低 (ratio={brow_ratio:.3f})"))
             else:
-                votes.append((2, abs(brow_ratio - 1.0) * 0.5, f"右眉较低 (ratio={brow_ratio:.3f})"))
+                votes.append((2, weight * 0.3, f"右眉较低 (ratio={brow_ratio:.3f})"))
 
-    # 统计投票
-    left_score = sum(w for s, w, _ in votes if s == 1)
-    right_score = sum(w for s, w, _ in votes if s == 2)
-    total_score = left_score + right_score
-
-    detection["evidence"]["left_score"] = left_score
-    detection["evidence"]["right_score"] = right_score
-    detection["evidence"]["votes"] = [(s, w, d) for s, w, d in votes]
-
-    if total_score < 0.15:
+    # ========== 综合投票 ==========
+    if not votes:
         detection["palsy_side"] = 0
-        detection["interpretation"] = "静息状态对称"
-    elif left_score > right_score * 1.3:
-        detection["palsy_side"] = 1
-        detection["confidence"] = min(1.0, left_score)
-        detection["interpretation"] = f"静息状态左侧异常 (L={left_score:.2f} > R={right_score:.2f})"
-    elif right_score > left_score * 1.3:
-        detection["palsy_side"] = 2
-        detection["confidence"] = min(1.0, right_score)
-        detection["interpretation"] = f"静息状态右侧异常 (R={right_score:.2f} > L={left_score:.2f})"
+        detection["confidence"] = 0.0
+        detection["interpretation"] = "静息状态面部对称，无明显面瘫迹象"
+        return detection
+
+    # 加权投票
+    side_weights = {0: 0.0, 1: 0.0, 2: 0.0}
+    for side, weight, _ in votes:
+        side_weights[side] += weight
+
+    total_weight = sum(side_weights.values())
+    if total_weight < 0.3:  # 总权重太小
+        detection["palsy_side"] = 0
+        detection["confidence"] = 0.2
+        detection["interpretation"] = "静息状态轻微不对称，但不足以判断面瘫侧别"
+        return detection
+
+    # 归一化
+    for k in side_weights:
+        side_weights[k] /= total_weight
+
+    # 选择得票最高的
+    final_side = max(side_weights, key=side_weights.get)
+    final_conf = side_weights[final_side]
+
+    detection["palsy_side"] = final_side
+    detection["confidence"] = final_conf
+    detection["vote_weights"] = side_weights
+    detection["vote_details"] = [(side, weight, desc) for side, weight, desc in votes]
+
+    if final_side == 0:
+        detection["interpretation"] = "静息状态面部基本对称"
+    elif final_side == 1:
+        evidence_list = [desc for side, _, desc in votes if side == 1]
+        detection["interpretation"] = f"静息态左侧面瘫迹象 (置信度{final_conf * 100:.0f}%): " + "; ".join(
+            evidence_list[:2])
     else:
-        detection["palsy_side"] = 0
-        detection["interpretation"] = f"静息状态不确定 (L={left_score:.2f}, R={right_score:.2f})"
+        evidence_list = [desc for side, _, desc in votes if side == 2]
+        detection["interpretation"] = f"静息态右侧面瘫迹象 (置信度{final_conf * 100:.0f}%): " + "; ".join(
+            evidence_list[:2])
 
     return detection
 
@@ -474,12 +517,19 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     # ========== 存储 baseline ICD 和关键距离 ==========
     icd_base = compute_icd(peak_landmarks, w, h)
+    left_eye_area, _ = compute_eye_area(peak_landmarks, w, h, left=True)
+    right_eye_area, _ = compute_eye_area(peak_landmarks, w, h, left=False)
+    left_palp_width = compute_palpebral_width(peak_landmarks, w, h, left=True)
+    right_palp_width = compute_palpebral_width(peak_landmarks, w, h, left=False)
 
-    # 存储 baseline 距离（原始像素值，作为后续动作的参考）
     baseline_distances = {
         "icd": icd_base,
         "left_palpebral_height": compute_palpebral_height(peak_landmarks, w, h, left=True),
         "right_palpebral_height": compute_palpebral_height(peak_landmarks, w, h, left=False),
+        "left_palpebral_width": left_palp_width,
+        "right_palpebral_width": right_palp_width,
+        "left_eye_area": left_eye_area,
+        "right_eye_area": right_eye_area,
         "left_brow_eye_distance": compute_brow_eye_distance(peak_landmarks, w, h, left=True),
         "right_brow_eye_distance": compute_brow_eye_distance(peak_landmarks, w, h, left=False),
         "mouth_width": result.mouth_width,

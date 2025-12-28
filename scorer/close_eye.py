@@ -35,30 +35,64 @@ from clinical_base import (
     compute_palpebral_height, compute_mouth_metrics,
     compute_icd, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
-    draw_palsy_side_label,
+    draw_palsy_side_label, compute_eye_closure_by_area,
 )
 
 from thresholds import THR
 
 
-def find_peak_frame_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
+def find_peak_frame_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
+                              baseline_landmarks=None) -> int:
     """
-    找闭眼峰值帧 (EAR最小)
+    找闭眼峰值帧 - 使用眼睛面积
+
+    改进: 使用眼睛面积相对于基线的闭合程度来找峰值帧
     """
-    min_ear = float('inf')
-    min_idx = 0
+    if baseline_landmarks is not None:
+        # 有基线：使用面积闭合度
+        baseline_left_area, _ = compute_eye_area(baseline_landmarks, w, h, True)
+        baseline_right_area, _ = compute_eye_area(baseline_landmarks, w, h, False)
 
-    for i, lm in enumerate(landmarks_seq):
-        if lm is None:
-            continue
-        l_ear = compute_ear(lm, w, h, True)
-        r_ear = compute_ear(lm, w, h, False)
-        avg_ear = (l_ear + r_ear) / 2
-        if avg_ear < min_ear:
-            min_ear = avg_ear
-            min_idx = i
+        max_closure = -float('inf')
+        max_idx = 0
 
-    return min_idx
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
+
+            scale = compute_scale_to_baseline(lm, baseline_landmarks, w, h)
+
+            l_area, _ = compute_eye_area(lm, w, h, True)
+            r_area, _ = compute_eye_area(lm, w, h, False)
+            scaled_l_area = l_area * (scale ** 2)
+            scaled_r_area = r_area * (scale ** 2)
+
+            l_closure = 1.0 - (scaled_l_area / baseline_left_area) if baseline_left_area > 1e-6 else 0
+            r_closure = 1.0 - (scaled_r_area / baseline_right_area) if baseline_right_area > 1e-6 else 0
+
+            avg_closure = (max(0, min(1, l_closure)) + max(0, min(1, r_closure))) / 2
+
+            if avg_closure > max_closure:
+                max_closure = avg_closure
+                max_idx = i
+
+        return max_idx
+    else:
+        # 没有基线：使用面积最小的帧
+        min_area = float('inf')
+        min_idx = 0
+
+        for i, lm in enumerate(landmarks_seq):
+            if lm is None:
+                continue
+            l_area, _ = compute_eye_area(lm, w, h, True)
+            r_area, _ = compute_eye_area(lm, w, h, False)
+            avg_area = (l_area + r_area) / 2
+            if avg_area < min_area:
+                min_area = avg_area
+                min_idx = i
+
+        return min_idx
 
 
 def extract_eye_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, Dict[str, List[float]]]:
@@ -98,95 +132,70 @@ def extract_eye_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, Dict[
     }
 
 
-def detect_palsy_side_from_closure(left_ear: float, right_ear: float,
-                                   baseline_left_ear: float = None,
-                                   baseline_right_ear: float = None,
-                                   min_left_ear: float = None,
-                                   min_right_ear: float = None) -> Dict[str, Any]:
+def detect_palsy_side_from_closure(peak_closure_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从闭眼动作检测面瘫侧别 - 增强版
+    从闭眼动作检测面瘫侧别 - 基于眼睛面积
 
-    原理: 面瘫侧的眼睛无法完全闭合
+    原理: 使用compute_eye_closure_by_area的结果来判断面瘫侧
 
-    增强指标:
-    1. 峰值帧的EAR值比较
-    2. 闭合完整性（相对于基线）
-    3. 最小EAR比较（整个序列中）
+    Args:
+        peak_closure_data: 峰值帧的眼睛闭合数据（来自compute_eye_closure_by_area）
     """
     result = {
         "palsy_side": 0,
         "confidence": 0.0,
         "interpretation": "",
-        "method": "",
-        "evidence": {
-            "left_ear": left_ear,
-            "right_ear": right_ear,
-        }
+        "method": "area_closure",
+        "evidence": {}
     }
 
-    # 如果有基线，计算闭合完整性
-    if baseline_left_ear is not None and baseline_right_ear is not None:
-        # 闭合完整性 = (基线EAR - 当前EAR) / 基线EAR
-        # 越接近1表示闭得越紧
-        left_closure = (baseline_left_ear - left_ear) / baseline_left_ear if baseline_left_ear > 1e-9 else 0
-        right_closure = (baseline_right_ear - right_ear) / baseline_right_ear if baseline_right_ear > 1e-9 else 0
+    if peak_closure_data is None:
+        result["interpretation"] = "无闭眼数据"
+        return result
 
-        result["evidence"]["baseline_left_ear"] = baseline_left_ear
-        result["evidence"]["baseline_right_ear"] = baseline_right_ear
-        result["evidence"]["left_closure_pct"] = left_closure * 100
-        result["evidence"]["right_closure_pct"] = right_closure * 100
+    left_closure = peak_closure_data.get("left_closure_ratio", 0)
+    right_closure = peak_closure_data.get("right_closure_ratio", 0)
 
-        result["method"] = "closure_completeness"
+    result["evidence"] = {
+        "left_area": peak_closure_data.get("left_area", 0),
+        "right_area": peak_closure_data.get("right_area", 0),
+        "left_closure_pct": left_closure * 100,
+        "right_closure_pct": right_closure * 100,
+    }
 
-        max_closure = max(left_closure, right_closure)
-        if max_closure < 0.3:  # 闭合不足30%
-            result["interpretation"] = f"闭眼幅度过小 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
-            result["evidence"]["status"] = "insufficient_closure"
-            return result
+    if "baseline_left_area" in peak_closure_data:
+        result["evidence"]["baseline_left_area"] = peak_closure_data["baseline_left_area"]
+        result["evidence"]["baseline_right_area"] = peak_closure_data["baseline_right_area"]
 
-        # 计算不对称比例
-        asymmetry = abs(left_closure - right_closure) / max_closure
-        result["confidence"] = min(1.0, asymmetry * 3)
-        result["evidence"]["asymmetry_ratio"] = asymmetry
+    max_closure = max(left_closure, right_closure)
 
-        if asymmetry < 0.15:
-            result["palsy_side"] = 0
-            result[
-                "interpretation"] = f"双眼闭合对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
-        elif left_closure < right_closure:
-            # 左眼闭合程度低 -> 左侧面瘫
-            result["palsy_side"] = 1
-            result[
-                "interpretation"] = f"左眼闭合差 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
-        else:
-            result["palsy_side"] = 2
-            result[
-                "interpretation"] = f"右眼闭合差 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%, 差异{asymmetry * 100:.1f}%)"
+    if max_closure < 0.25:  # 闭合不足25%
+        result["interpretation"] = f"闭眼幅度过小 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
+        result["evidence"]["status"] = "insufficient_closure"
+        return result
 
+    # 计算不对称比例
+    asymmetry = abs(left_closure - right_closure) / max_closure
+    result["confidence"] = min(1.0, asymmetry * 3)
+    result["evidence"]["asymmetry_ratio"] = asymmetry
+
+    if asymmetry < 0.15:  # 15%以内认为对称
+        result["palsy_side"] = 0
+        result["interpretation"] = (
+            f"双眼闭合对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%, "
+            f"差异{asymmetry * 100:.1f}%)"
+        )
+    elif left_closure < right_closure:
+        # 左眼闭合程度低 -> 左侧面瘫
+        result["palsy_side"] = 1
+        result["interpretation"] = (
+            f"左眼闭合差 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%) → 左侧面瘫"
+        )
     else:
-        # 没有基线，直接比较EAR
-        result["method"] = "ear_comparison"
-
-        max_ear = max(left_ear, right_ear)
-        if max_ear < 0.05:  # 两眼都几乎完全闭合
-            result["palsy_side"] = 0
-            result["interpretation"] = f"双眼完全闭合 (L_EAR={left_ear:.4f}, R_EAR={right_ear:.4f})"
-            return result
-
-        asymmetry = abs(left_ear - right_ear) / max_ear
-        result["confidence"] = min(1.0, asymmetry * 3)
-        result["evidence"]["asymmetry_ratio"] = asymmetry
-
-        if asymmetry < 0.15:
-            result["palsy_side"] = 0
-            result["interpretation"] = f"双眼对称 (L={left_ear:.4f}, R={right_ear:.4f}, 差异{asymmetry * 100:.1f}%)"
-        elif left_ear > right_ear:
-            # 左眼EAR更大（闭合更差） -> 左侧面瘫
-            result["palsy_side"] = 1
-            result["interpretation"] = f"左眼闭合差 (L_EAR={left_ear:.4f} > R_EAR={right_ear:.4f})"
-        else:
-            result["palsy_side"] = 2
-            result["interpretation"] = f"右眼闭合差 (R_EAR={right_ear:.4f} > L_EAR={left_ear:.4f})"
+        result["palsy_side"] = 2
+        result["interpretation"] = (
+            f"右眼闭合差 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%) → 右侧面瘫"
+        )
 
     return result
 
@@ -245,11 +254,20 @@ def compute_close_eye_metrics(landmarks, w: int, h: int,
         metrics["left_height_change"] = l_height_scaled - baseline_l_height
         metrics["right_height_change"] = r_height_scaled - baseline_r_height
 
-        # 面瘫侧别检测
-        palsy_detection = detect_palsy_side_from_closure(
-            l_ear, r_ear, baseline_l_ear, baseline_r_ear
-        )
-        metrics["palsy_detection"] = palsy_detection
+    # ========== 使用眼睛面积计算闭合度 ==========
+    area_closure = compute_eye_closure_by_area(landmarks, w, h, baseline_landmarks)
+    metrics["area_closure"] = area_closure
+
+    # 使用面积闭合度作为主要的闭合指标
+    if "left_closure_ratio" in area_closure:
+        metrics["left_closure_ratio"] = area_closure["left_closure_ratio"]
+        metrics["right_closure_ratio"] = area_closure["right_closure_ratio"]
+        metrics["left_closure_percent"] = area_closure["left_closure_ratio"] * 100
+        metrics["right_closure_percent"] = area_closure["right_closure_ratio"] * 100
+
+    # 面瘫侧检测（使用面积方法）
+    palsy_detection = detect_palsy_side_from_closure(area_closure)
+    metrics["palsy_detection"] = palsy_detection
 
     return metrics
 
@@ -502,8 +520,8 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     if not landmarks_seq or not frames_seq:
         return None
 
-    # 找峰值帧 (EAR最小)
-    peak_idx = find_peak_frame_close_eye(landmarks_seq, frames_seq, w, h)
+    # 找峰值帧 (眼睛面积最小/闭合度最大)
+    peak_idx = find_peak_frame_close_eye(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
