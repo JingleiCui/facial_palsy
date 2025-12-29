@@ -347,26 +347,26 @@ def detect_palsy_side(smile_metrics: Dict[str, Any]) -> Dict[str, Any]:
             result["evidence"]["distance_asymmetry"] = asymmetry
             result["confidence"] = min(1.0, asymmetry * 3)
 
-            # 判断阈值：15%以内认为对称
-            if asymmetry < 0.15:
+            # 判断阈值：1.5%以内认为对称
+            if asymmetry < 0.015:
                 result["palsy_side"] = 0
                 result["interpretation"] = (
                     f"双侧嘴角到眼线距离对称 (L={left_dist:.1f}px, R={right_dist:.1f}px, "
-                    f"不对称{asymmetry:.1%})"
+                    f"不对称{asymmetry:.4%})"
                 )
             elif left_dist > right_dist:
                 # 左嘴角距离大（位置低，上提少）→ 左侧面瘫
                 result["palsy_side"] = 1
                 result["interpretation"] = (
                     f"左嘴角距离大 (L={left_dist:.1f}px > R={right_dist:.1f}px, "
-                    f"不对称{asymmetry:.1%}) → 左侧面瘫"
+                    f"不对称{asymmetry:.4%}) → 左侧面瘫"
                 )
             else:
                 # 右嘴角距离大（位置低，上提少）→ 右侧面瘫
                 result["palsy_side"] = 2
                 result["interpretation"] = (
                     f"右嘴角距离大 (R={right_dist:.1f}px > L={left_dist:.1f}px, "
-                    f"不对称{asymmetry:.1%}) → 右侧面瘫"
+                    f"不对称{asymmetry:.4%}) → 右侧面瘫"
                 )
             return result
 

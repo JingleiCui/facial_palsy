@@ -429,20 +429,23 @@ def detect_palsy_side(dynamics: Dict[str, Any],
             result["evidence"]["closure_asymmetry"] = asymmetry
             result["confidence"] = min(1.0, asymmetry * 3)
 
-            if asymmetry < 0.15:
+            if asymmetry < 0.015:
                 result["palsy_side"] = 0
                 result["interpretation"] = (
-                    f"双眼闭合对称 (L={peak_left_closure * 100:.1f}%, R={peak_right_closure * 100:.1f}%)"
+                    f"双眼闭合对称 (L={peak_left_closure * 100:.1f}%, R={peak_right_closure * 100:.1f}%), "
+                    f"不对称{asymmetry:.4%})"
                 )
             elif peak_left_closure < peak_right_closure:
                 result["palsy_side"] = 1
                 result["interpretation"] = (
-                    f"左眼闭合差 (L={peak_left_closure * 100:.1f}% < R={peak_right_closure * 100:.1f}%) → 左侧面瘫"
+                    f"左眼闭合差 (L={peak_left_closure * 100:.1f}% < R={peak_right_closure * 100:.1f}%), "
+                    f"不对称{asymmetry:.4%}) → 左侧面瘫"
                 )
             else:
                 result["palsy_side"] = 2
                 result["interpretation"] = (
-                    f"右眼闭合差 (R={peak_right_closure * 100:.1f}% < L={peak_left_closure * 100:.1f}%) → 右侧面瘫"
+                    f"右眼闭合差 (R={peak_right_closure * 100:.1f}% < L={peak_left_closure * 100:.1f}%), "
+                    f"不对称{asymmetry:.4%}) → 右侧面瘫"
                 )
             return result
 

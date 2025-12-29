@@ -353,21 +353,24 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
             result["evidence"]["reduction_asymmetry"] = asymmetry
             result["confidence"] = min(1.0, asymmetry * 2)
 
-            if asymmetry < 0.15:
+            if asymmetry < 0.10:
                 result["palsy_side"] = 0
                 result["interpretation"] = (
-                    f"双侧鼻翼收缩对称 (L缩短{left_reduction:.1f}px, R缩短{right_reduction:.1f}px)"
+                    f"双侧鼻翼收缩对称 (L缩短{left_reduction:.1f}px, R缩短{right_reduction:.1f}px), "
+                    f"不对称{asymmetry:.4%})"
                 )
             elif left_reduction < right_reduction:
                 # 左侧缩短量小 = 左侧收缩弱 = 左侧面瘫
                 result["palsy_side"] = 1
                 result["interpretation"] = (
-                    f"左侧鼻翼收缩弱 (L缩短{left_reduction:.1f}px < R缩短{right_reduction:.1f}px) → 左侧面瘫"
+                    f"左侧鼻翼收缩弱 (L缩短{left_reduction:.1f}px < R缩短{right_reduction:.1f}px), "
+                    f"不对称{asymmetry:.4%}) → 左侧面瘫"
                 )
             else:
                 result["palsy_side"] = 2
                 result["interpretation"] = (
-                    f"右侧鼻翼收缩弱 (R缩短{right_reduction:.1f}px < L缩短{left_reduction:.1f}px) → 右侧面瘫"
+                    f"右侧鼻翼收缩弱 (R缩短{right_reduction:.1f}px < L缩短{left_reduction:.1f}px), "
+                    f"不对称{asymmetry:.4%}) → 右侧面瘫"
                 )
             return result
 

@@ -68,10 +68,25 @@ TARGET_EXAM_ID = None
 # 调试筛选：只分析特定患者/特定检查（其余跳过）
 # =============================================================================
 # 1) 只跑指定患者（常用）
-TARGET_PATIENT_IDS = [] # "XW000264", "XW000304", "XW000312"]
+TARGET_PATIENT_IDS = []  # "XW000264", "XW000304", "XW000312"]
 
 # 2) 只跑指定检查ID（优先级更高）
 TARGET_EXAM_IDS = []
+
+ENABLED_ACTIONS = [
+    "NeutralFace",  # 基线（如果REUSE_BASELINE=False会自动添加）
+    "ShowTeeth",
+]
+
+# 是否复用已有的 NeutralFace 结果（用于调试其他动作时跳过基线重算）
+# True: 从已有的 indicators.json 加载基线
+# False: 每次都重新运行 NeutralFace
+REUSE_BASELINE = True
+
+# 是否跳过已存在的动作结果（增量更新模式）
+# True: 如果动作结果已存在，跳过该动作
+# False: 总是重新处理所有指定的动作
+SKIP_EXISTING_ACTIONS = False
 
 # =============================================================================
 # 并行配置（多CPU加速）
@@ -574,7 +589,10 @@ def _palsy_side_to_text(side_code: Any) -> str:
 
 def infer_palsy_and_side(action_results: Dict[str, ActionResult]) -> Dict[str, Any]:
     """
-    综合 11 个动作的"是否面瘫 + 患侧投票"（以运动证据为主，静息仅作辅证）。
+    综合 11 个动作的"是否面瘫 + 患侧投票"。
+
+    优先使用每个动作模块的 palsy_detection 结果（保存在 action_specific 中），
+    这样可以确保报告和 indicators.json 的结果一致。
 
     返回结构直接给HTML使用：
     - has_palsy / palsy_side / confidence
@@ -609,122 +627,42 @@ def infer_palsy_and_side(action_results: Dict[str, ActionResult]) -> Dict[str, A
             "metric": metric or {}
         }
 
-    def _decide_side_from_pair(left_val: float, right_val: float, weaker_if_smaller: bool):
-        l = float(left_val)
-        r = float(right_val)
-        denom = max(abs(l), abs(r), 1e-9)
-        strength = _clip01(abs(l - r) / denom)
-
-        if strength < 0.08:
-            return 0, 0.0
-
-        if weaker_if_smaller:
-            return (1, strength) if l < r else (2, strength)
-        else:
-            return (1, strength) if l > r else (2, strength)
-
     votes: List[Dict[str, Any]] = []
 
-    # ========== 眼部动作 ==========
-    for act in ["SpontaneousEyeBlink", "VoluntaryEyeBlink", "CloseEyeSoftly", "CloseEyeHardly"]:
-        res = action_results.get(act)
-        if not res:
+    # ========== 优先使用各动作模块的 palsy_detection 结果 ==========
+    for act_name, res in action_results.items():
+        if not res or not res.action_specific:
             continue
-        l_ear = float(res.left_ear or 0.0)
-        r_ear = float(res.right_ear or 0.0)
-        side, strength = _decide_side_from_pair(l_ear, r_ear, weaker_if_smaller=True)
-        if side != 0:
-            votes.append(_vote_record(
-                act, side, strength, "眼",
-                f"EAR L={l_ear:.3f}, R={r_ear:.3f}",
-                {"left_ear": l_ear, "right_ear": r_ear}
-            ))
 
-    # ========== 眉部 ==========
-    res = action_results.get("RaiseEyebrow")
-    if res:
-        l = float(res.left_brow_eye_distance_change or res.left_brow_height or 0.0)
-        r = float(res.right_brow_eye_distance_change or res.right_brow_height or 0.0)
-        side, strength = _decide_side_from_pair(l, r, weaker_if_smaller=True)
-        if side != 0:
-            votes.append(_vote_record(
-                "RaiseEyebrow", side, strength, "额",
-                f"Brow L={l:.2f}, R={r:.2f}",
-                {"left": l, "right": r}
-            ))
-
-    # ========== 微笑/露齿 ==========
-    for act in ["Smile", "ShowTeeth"]:
-        res = action_results.get(act)
-        if not res:
+        palsy_det = res.action_specific.get("palsy_detection", {})
+        if not palsy_det:
             continue
-        oral = res.oral_angle
-        if not oral:
-            continue
-        aoe = float(oral.AOE_angle or 0.0)
-        bof = float(oral.BOF_angle or 0.0)
-        # AOE是右侧角度，BOF是左侧角度
-        side, strength = _decide_side_from_pair(bof, aoe, weaker_if_smaller=True)
-        if side != 0:
-            votes.append(_vote_record(
-                act, side, strength, "口",
-                f"AOE(R)={aoe:+.1f}°, BOF(L)={bof:+.1f}°",
-                {"aoe": aoe, "bof": bof}
-            ))
 
-    # ========== 皱鼻/鼓腮/撅嘴 ==========
-    for act in ["ShrugNose", "BlowCheek", "LipPucker"]:
-        res = action_results.get(act)
-        if not res:
-            continue
-        l_nlf = float(res.left_nlf_length or 0.0)
-        r_nlf = float(res.right_nlf_length or 0.0)
-        # NLF 短的一侧更弱
-        side, strength = _decide_side_from_pair(l_nlf, r_nlf, weaker_if_smaller=True)
-        if side != 0:
-            votes.append(_vote_record(
-                act, side, strength, "中面",
-                f"NLF L={l_nlf:.1f}, R={r_nlf:.1f}",
-                {"left_nlf": l_nlf, "right_nlf": r_nlf}
-            ))
+        palsy_side = palsy_det.get("palsy_side", 0)
+        confidence = palsy_det.get("confidence", 0.0)
+        method = palsy_det.get("method", "")
+        interpretation = palsy_det.get("interpretation", "")
+        evidence = palsy_det.get("evidence", {})
 
-    # ========== 静息面 ==========
-    res = action_results.get("NeutralFace")
-    if res:
-        palp_ratio = float(res.palpebral_height_ratio or 1.0)
-        nlf_ratio = float(res.nlf_ratio or 1.0)
-        oral = res.oral_angle
-        aoe = float(oral.AOE_angle if oral else 0.0)
-        bof = float(oral.BOF_angle if oral else 0.0)
+        if palsy_side != 0 and confidence > 0.05:
+            # 根据动作类型确定区域
+            if act_name in ["SpontaneousEyeBlink", "VoluntaryEyeBlink", "CloseEyeSoftly", "CloseEyeHardly"]:
+                region = "眼"
+            elif act_name == "RaiseEyebrow":
+                region = "额"
+            elif act_name in ["Smile", "ShowTeeth"]:
+                region = "口"
+            elif act_name in ["ShrugNose", "BlowCheek", "LipPucker"]:
+                region = "中面"
+            elif act_name == "NeutralFace":
+                region = "静息"
+            else:
+                region = "其他"
 
-        # 睑裂高度比
-        if abs(palp_ratio - 1.0) > 0.08:
-            side = 1 if palp_ratio < 1.0 else 2
-            strength = _clip01(abs(palp_ratio - 1.0))
             votes.append(_vote_record(
-                "NeutralFace", side, strength * 0.5, "眼(静息)",
-                f"Palpebral ratio={palp_ratio:.3f}",
-                {"palpebral_height_ratio": palp_ratio}
-            ))
-
-        # NLF比值
-        if abs(nlf_ratio - 1.0) > 0.08:
-            side = 1 if nlf_ratio < 1.0 else 2
-            strength = _clip01(abs(nlf_ratio - 1.0))
-            votes.append(_vote_record(
-                "NeutralFace", side, strength * 0.5, "中面(静息)",
-                f"NLF ratio={nlf_ratio:.3f}",
-                {"nlf_ratio": nlf_ratio}
-            ))
-
-        # 口角
-        if abs(aoe - bof) > 3:
-            side = 1 if bof < aoe else 2
-            strength = _clip01(abs(aoe - bof) / 20.0)
-            votes.append(_vote_record(
-                "NeutralFace", side, strength * 0.5, "口(静息)",
-                f"AOE={aoe:+.1f}°, BOF={bof:+.1f}°",
-                {"aoe": aoe, "bof": bof}
+                act_name, palsy_side, confidence, region,
+                f"{method}: {interpretation}",
+                evidence
             ))
 
     # ========== 汇总 ==========
@@ -1114,13 +1052,84 @@ def generate_html_report(exam_id: str, patient_id: str,
     print(f"[OK] HTML报告已生成: {report_path}")
 
 
+def load_existing_baseline(exam_output_dir: Path) -> Tuple[Optional[ActionResult], Optional[Any]]:
+    """
+    从已有的 NeutralFace 结果加载基线
+
+    Returns:
+        (baseline_result, baseline_landmarks) 或 (None, None)
+    """
+    neutral_dir = exam_output_dir / "NeutralFace"
+    indicators_path = neutral_dir / "indicators.json"
+
+    if not indicators_path.exists():
+        print(f"    [!] 未找到已有基线: {indicators_path}")
+        return None, None
+
+    try:
+        with open(indicators_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        # 重建 ActionResult
+        result = ActionResult(
+            action_name="NeutralFace",
+            action_name_cn="静息面",
+            video_path=data.get("video_path", ""),
+            total_frames=data.get("total_frames", 0),
+            peak_frame_idx=data.get("peak_frame_idx", 0),
+            image_size=tuple(data.get("image_size", (0, 0))),
+            fps=data.get("fps", 30.0)
+        )
+
+        # 恢复关键属性
+        for key in ["left_ear", "right_ear", "left_eye_area", "right_eye_area",
+                    "mouth_width", "mouth_height", "left_brow_height", "right_brow_height",
+                    "left_nlf_length", "right_nlf_length", "brow_height_ratio",
+                    "eye_area_ratio", "nlf_ratio", "voluntary_movement_score"]:
+            if key in data:
+                setattr(result, key, data[key])
+
+        print(f"    [OK] 复用已有基线: {indicators_path}")
+
+        # 注意：baseline_landmarks 无法从 JSON 恢复
+        # 如果需要 baseline_landmarks，必须重新处理 NeutralFace
+        return result, None
+
+    except Exception as e:
+        print(f"    [!] 加载基线失败: {e}")
+        return None, None
+
+
+def should_process_action(action_name: str, enabled_actions: Optional[List[str]]) -> bool:
+    """判断是否应该处理该动作"""
+    if enabled_actions is None or len(enabled_actions) == 0:
+        return True  # 空列表表示处理所有动作
+    return action_name in enabled_actions
+
+
+def action_result_exists(exam_output_dir: Path, action_name: str) -> bool:
+    """检查动作结果是否已存在"""
+    indicators_path = exam_output_dir / action_name / "indicators.json"
+    return indicators_path.exists()
+
+
 # =============================================================================
 # 主处理函数
 # =============================================================================
 
 def process_examination(examination: Dict[str, Any], db_path: str,
-                        output_dir: Path, extractor: LandmarkExtractor) -> Dict[str, Any]:
-    """处理单个检查"""
+                        output_dir: Path, extractor: LandmarkExtractor,
+                        enabled_actions: Optional[List[str]] = None,
+                        reuse_baseline: bool = False,
+                        skip_existing: bool = False) -> Dict[str, Any]:
+    """
+    处理单个检查
+
+    Args:
+        enabled_actions: 要处理的动作列表，None 或 [] 表示全部
+        reuse_baseline: 是否复用已有的 NeutralFace 结果
+        skip_existing: 是否跳过已存在的动作结果
+    """
     exam_id = examination["examination_id"]
     patient_id = examination["patient_id"]
 
@@ -1143,7 +1152,13 @@ def process_examination(examination: Dict[str, Any], db_path: str,
     baseline_landmarks = None
 
     # 首先处理NeutralFace获取基线
-    if "NeutralFace" in videos:
+    need_neutral = (
+            not reuse_baseline or
+            should_process_action("NeutralFace", enabled_actions) or
+            not action_result_exists(exam_output_dir, "NeutralFace")
+    )
+
+    if "NeutralFace" in videos and need_neutral:
         video_info = videos["NeutralFace"]
         video_path = video_info["file_path"]
 
@@ -1168,9 +1183,65 @@ def process_examination(examination: Dict[str, Any], db_path: str,
                     peak_idx = result.peak_frame_idx
                     baseline_landmarks = landmarks_seq[peak_idx]
 
-    # 处理其他动作
+    elif reuse_baseline:
+        # 尝试复用已有基线
+        print(f"\n  尝试复用已有基线...")
+        baseline_result, baseline_landmarks = load_existing_baseline(exam_output_dir)
+        if baseline_result:
+            action_results["NeutralFace"] = baseline_result
+        else:
+            # 复用失败，需要重新处理
+            if "NeutralFace" in videos:
+                print(f"  复用失败，重新处理 NeutralFace...")
+                video_info = videos["NeutralFace"]
+                video_path = video_info["file_path"]
+
+                if os.path.exists(video_path):
+                    landmarks_seq, frames_seq = extractor.extract_sequence(
+                        video_path,
+                        video_info.get("start_frame", 0),
+                        video_info.get("end_frame", None)
+                    )
+                    if landmarks_seq and frames_seq:
+                        h, w = frames_seq[0].shape[:2]
+                        result = neutral_face.process(landmarks_seq, frames_seq, w, h,
+                                                      video_info, exam_output_dir)
+                        if result:
+                            action_results["NeutralFace"] = result
+                            baseline_result = result
+                            peak_idx = result.peak_frame_idx
+                            baseline_landmarks = landmarks_seq[peak_idx]
+
+    # ========== 处理其他动作（移到 if-elif 块外面！）==========
     for action_name, video_info in videos.items():
         if action_name == "NeutralFace":
+            continue
+
+        # 检查是否应该处理该动作
+        if not should_process_action(action_name, enabled_actions):
+            print(f"\n  跳过动作 (未启用): {action_name}")
+            continue
+
+        # 检查是否跳过已存在的结果
+        if skip_existing and action_result_exists(exam_output_dir, action_name):
+            print(f"\n  跳过动作 (结果已存在): {action_name}")
+            # 尝试加载已有结果
+            try:
+                with open(exam_output_dir / action_name / "indicators.json", 'r') as f:
+                    existing_data = json.load(f)
+                # 简单创建一个占位结果（用于报告生成）
+                existing_result = ActionResult(
+                    action_name=action_name,
+                    action_name_cn=existing_data.get("action_name_cn", action_name),
+                    video_path=existing_data.get("video_path", ""),
+                    total_frames=existing_data.get("total_frames", 0),
+                    peak_frame_idx=existing_data.get("peak_frame_idx", 0),
+                    image_size=tuple(existing_data.get("image_size", (0, 0))),
+                    fps=existing_data.get("fps", 30.0)
+                )
+                action_results[action_name] = existing_result
+            except:
+                pass
             continue
 
         video_path = video_info["file_path"]
@@ -1237,14 +1308,18 @@ def process_examination(examination: Dict[str, Any], db_path: str,
 def _process_exam_worker(args):
     """
     子进程执行单个检查的处理。
-    注意：spawn 模式下每个进程都需要自己初始化 LandmarkExtractor。
     """
-    exam, db_path, output_dir_str, model_path = args
+    exam, db_path, output_dir_str, model_path, enabled_actions, reuse_baseline, skip_existing = args
     output_dir = Path(output_dir_str)
 
-    # 这里直接复用本文件的 process_examination（已在模块内定义）
     with LandmarkExtractor(model_path) as extractor:
-        return process_examination(exam, db_path, output_dir, extractor)
+        return process_examination(
+            exam, db_path, output_dir, extractor,
+            enabled_actions=enabled_actions,
+            reuse_baseline=reuse_baseline,
+            skip_existing=skip_existing
+        )
+
 
 # =============================================================================
 # 主函数
@@ -1303,7 +1378,8 @@ def main():
         except RuntimeError:
             pass
 
-        tasks = [(exam, DATABASE_PATH, str(output_dir), MEDIAPIPE_MODEL_PATH) for exam in examinations]
+        tasks = [(exam, DATABASE_PATH, str(output_dir), MEDIAPIPE_MODEL_PATH, ENABLED_ACTIONS, REUSE_BASELINE,
+                  SKIP_EXISTING_ACTIONS) for exam in examinations]
 
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
             future_map = {pool.submit(_process_exam_worker, tasks[i]): i for i in range(len(tasks))}

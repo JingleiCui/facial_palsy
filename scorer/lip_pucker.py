@@ -348,8 +348,8 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         offset_norm = abs(current_offset) / icd
         result["evidence"]["offset_norm"] = offset_norm
 
-        # 判断阈值：偏移超过ICD的2%
-        if offset_norm > 0.02:
+        # 判断阈值：偏移超过ICD的1.5%
+        if offset_norm > 0.015:
             result["method"] = "lip_midline_offset"
             result["confidence"] = min(1.0, offset_norm * 15)
 
@@ -357,19 +357,19 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
                 # 嘴唇中线偏向左侧（图像右侧）= 被左侧拉 = 右侧面瘫
                 result["palsy_side"] = 2
                 result["interpretation"] = (
-                    f"嘴唇中线偏向左侧 ({current_offset:+.1f}px, {offset_norm:.1%}) → 右侧面瘫"
+                    f"嘴唇中线偏向左侧 ({current_offset:+.1f}px, {offset_norm:.4%}) → 右侧面瘫"
                 )
             else:
                 # 嘴唇中线偏向右侧（图像左侧）= 被右侧拉 = 左侧面瘫
                 result["palsy_side"] = 1
                 result["interpretation"] = (
-                    f"嘴唇中线偏向右侧 ({current_offset:+.1f}px, {offset_norm:.1%}) → 左侧面瘫"
+                    f"嘴唇中线偏向右侧 ({current_offset:+.1f}px, {offset_norm:.4%}) → 左侧面瘫"
                 )
             return result
 
     # 未检测到明显不对称
     result["method"] = "none"
-    result["interpretation"] = "各指标均未检测到明显不对称"
+    result["interpretation"] = (f"各指标均未检测到明显不对称, {offset_norm:.4%}")
     return result
 
 

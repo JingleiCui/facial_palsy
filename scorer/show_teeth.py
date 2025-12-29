@@ -264,8 +264,12 @@ def compute_show_teeth_metrics(landmarks, w: int, h: int,
             "right": float((right_height_from_center - baseline_right_height) * scale),
         }
 
-        # ========== 嘴唇中线偏移（用于面瘫侧别判断）==========
+        # ========== 嘴唇中线偏移（用于面瘫侧别判断，有基线版本）==========
         lip_offset_data = compute_lip_midline_offset_from_face_midline(landmarks, w, h, baseline_landmarks)
+        metrics["lip_midline_offset"] = lip_offset_data
+    else:
+        # ========== 没有基线时也计算嘴唇中线偏移 ==========
+        lip_offset_data = compute_lip_midline_offset_from_face_midline(landmarks, w, h, None)
         metrics["lip_midline_offset"] = lip_offset_data
 
     return metrics
@@ -280,7 +284,6 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     - 嘴唇中线相对于面中线会偏向健侧
 
     重要改进:
-    - 不再和静息帧比较！因为面瘫患者的静息帧嘴也可能是歪的（偏向健侧）
     - 直接看当前帧嘴唇中线偏离面中线的距离和方向
     - 嘴唇偏向哪侧 → 对侧是面瘫侧
     """
@@ -292,14 +295,18 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
-    # 使用当前帧的嘴唇中线偏移（不和基线比较）
     lip_offset_data = metrics.get("lip_midline_offset", {})
 
     if lip_offset_data:
         current_offset = lip_offset_data.get("current_offset", 0)
-        offset_norm = lip_offset_data.get("offset_norm", 0)
         face_midline_x = lip_offset_data.get("face_midline_x", 0)
         lip_midline_x = lip_offset_data.get("lip_midline_x", 0)
+
+        # 获取归一化偏移（兼容有/无基线两种情况）
+        # 无基线时用 offset_norm，有基线时用 offset_change_norm
+        offset_norm = lip_offset_data.get("offset_norm", None)
+        if offset_norm is None:
+            offset_norm = lip_offset_data.get("offset_change_norm", 0)
 
         result["method"] = "lip_midline_offset"
         result["evidence"]["current_offset"] = current_offset
@@ -307,10 +314,11 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         result["evidence"]["face_midline_x"] = face_midline_x
         result["evidence"]["lip_midline_x"] = lip_midline_x
 
-        # 直接根据当前偏移判断（不考虑基线）
-        result["confidence"] = min(1.0, offset_norm * 15)
+        # 置信度计算
+        result["confidence"] = min(1.0, offset_norm * 10)
 
-        if offset_norm < 0.02:  # 2%以内认为对称
+        # 阈值调整为 3%（与 clinical_base.py 一致）
+        if offset_norm < 0.03:
             result["palsy_side"] = 0
             result["interpretation"] = (
                 f"嘴唇中线居中 (偏移{current_offset:.1f}px, {offset_norm:.1%})"
@@ -328,6 +336,8 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
                 f"嘴唇偏向右侧 ({current_offset:+.1f}px, {offset_norm:.1%}) → 左侧面瘫"
             )
         return result
+
+    return result
 
     return result
 

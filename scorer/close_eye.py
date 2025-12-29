@@ -179,11 +179,11 @@ def detect_palsy_side_from_closure(peak_closure_data: Dict[str, Any]) -> Dict[st
     result["confidence"] = min(1.0, asymmetry * 3)
     result["evidence"]["asymmetry_ratio"] = asymmetry
 
-    if asymmetry < 0.15:  # 15%以内认为对称
+    if asymmetry < 0.01:  # 1%以内认为对称
         result["palsy_side"] = 0
         result["interpretation"] = (
             f"双眼闭合对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%, "
-            f"差异{asymmetry * 100:.1f}%)"
+            f"差异{asymmetry * 100:.4f}%)"
         )
     elif left_closure < right_closure:
         # 左眼闭合程度低 -> 左侧面瘫
