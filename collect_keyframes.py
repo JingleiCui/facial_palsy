@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-collect_keyframes.py (增强版 v3)
+collect_keyframes.py
 
 批量收集 clinical_grading 下所有动作的 peak_raw / peak_indicators 图片，
 并统计每个动作的面瘫侧别预测准确性
@@ -26,7 +26,7 @@ from typing import Dict, List, Any, Optional, Tuple
 # 配置
 # =============================================================================
 SRC_ROOT = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading")
-DST_ROOT = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading_debug_enhanced")
+DST_ROOT = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading_debug")
 
 # 11个标准动作
 ACTIONS = [

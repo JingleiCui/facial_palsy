@@ -106,8 +106,8 @@ class LM:
     CHIN = 152
 
     # ========== 鼻部 ==========
-    NOSE_ALA_L = 358  # 左鼻翼
-    NOSE_ALA_R = 129  # 右鼻翼
+    NOSE_ALA_L = 294  # 左鼻翼
+    NOSE_ALA_R = 64  # 右鼻翼
     NOSE_TIP_TOP = 4  # 鼻尖
     NOSE_BRIDGE = 168  # 鼻梁
 

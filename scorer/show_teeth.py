@@ -278,7 +278,11 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     原理:
     - 面瘫侧肌肉无力，嘴巴整体被健侧肌肉拉向健侧
     - 嘴唇中线相对于面中线会偏向健侧
-    - 与静息帧相比，偏移变化方向指示面瘫侧
+
+    重要改进:
+    - 不再和静息帧比较！因为面瘫患者的静息帧嘴也可能是歪的（偏向健侧）
+    - 直接看当前帧嘴唇中线偏离面中线的距离和方向
+    - 嘴唇偏向哪侧 → 对侧是面瘫侧
     """
     result = {
         "palsy_side": 0,
@@ -288,87 +292,42 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
-    # 方法1（优先）: 嘴唇中线偏移变化
+    # 使用当前帧的嘴唇中线偏移（不和基线比较）
     lip_offset_data = metrics.get("lip_midline_offset", {})
 
     if lip_offset_data:
         current_offset = lip_offset_data.get("current_offset", 0)
-
-        result["method"] = "lip_midline_offset_change"
-        result["evidence"]["current_offset"] = current_offset
-        result["evidence"]["face_midline_x"] = lip_offset_data.get("face_midline_x", 0)
-        result["evidence"]["lip_midline_x"] = lip_offset_data.get("lip_midline_x", 0)
-
-        # 如果有基线，使用偏移变化量
-        if "offset_change" in lip_offset_data:
-            offset_change = lip_offset_data.get("offset_change", 0)
-            offset_change_norm = lip_offset_data.get("offset_change_norm", 0)
-            baseline_offset = lip_offset_data.get("baseline_offset", 0)
-
-            result["evidence"]["baseline_offset"] = baseline_offset
-            result["evidence"]["offset_change"] = offset_change
-            result["evidence"]["offset_change_norm"] = offset_change_norm
-
-            result["confidence"] = min(1.0, offset_change_norm * 20)
-
-            if offset_change_norm < 0.02:  # 2%以内认为对称
-                result["palsy_side"] = 0
-                result["interpretation"] = (
-                    f"嘴唇中线偏移无明显变化 (变化{offset_change:+.1f}px, {offset_change_norm:.1%})"
-                )
-            elif offset_change > 0:
-                # 相对基线偏向左侧 = 被左侧拉 = 右侧面瘫
-                result["palsy_side"] = 2
-                result["interpretation"] = (
-                    f"嘴唇向左偏移 ({offset_change:+.1f}px) → 右侧面瘫"
-                )
-            else:
-                # 相对基线偏向右侧 = 被右侧拉 = 左侧面瘫
-                result["palsy_side"] = 1
-                result["interpretation"] = (
-                    f"嘴唇向右偏移 ({offset_change:+.1f}px) → 左侧面瘫"
-                )
-            return result
-
-        # 没有基线，直接根据当前偏移判断
         offset_norm = lip_offset_data.get("offset_norm", 0)
+        face_midline_x = lip_offset_data.get("face_midline_x", 0)
+        lip_midline_x = lip_offset_data.get("lip_midline_x", 0)
+
+        result["method"] = "lip_midline_offset"
+        result["evidence"]["current_offset"] = current_offset
         result["evidence"]["offset_norm"] = offset_norm
+        result["evidence"]["face_midline_x"] = face_midline_x
+        result["evidence"]["lip_midline_x"] = lip_midline_x
+
+        # 直接根据当前偏移判断（不考虑基线）
         result["confidence"] = min(1.0, offset_norm * 15)
 
-        if offset_norm < 0.03:  # 3%以内认为对称
+        if offset_norm < 0.02:  # 2%以内认为对称
             result["palsy_side"] = 0
-            result["interpretation"] = f"嘴唇中线对称 (偏移{current_offset:.1f}px)"
+            result["interpretation"] = (
+                f"嘴唇中线居中 (偏移{current_offset:.1f}px, {offset_norm:.1%})"
+            )
         elif current_offset > 0:
-            # 偏向左侧 = 被左侧拉 = 右侧面瘫
+            # 嘴唇偏向左侧 = 被左侧（健侧）拉动 = 右侧面瘫
             result["palsy_side"] = 2
-            result["interpretation"] = f"嘴唇偏左 ({current_offset:+.1f}px) → 右侧面瘫"
+            result["interpretation"] = (
+                f"嘴唇偏向左侧 ({current_offset:+.1f}px, {offset_norm:.1%}) → 右侧面瘫"
+            )
         else:
+            # 嘴唇偏向右侧 = 被右侧（健侧）拉动 = 左侧面瘫
             result["palsy_side"] = 1
-            result["interpretation"] = f"嘴唇偏右 ({current_offset:+.1f}px) → 左侧面瘫"
+            result["interpretation"] = (
+                f"嘴唇偏向右侧 ({current_offset:+.1f}px, {offset_norm:.1%}) → 左侧面瘫"
+            )
         return result
-
-    # 方法2（备用）: 口角角度
-    oral_angle = metrics.get("oral_angle", {})
-    aoe = oral_angle.get("AOE", 0)
-    bof = oral_angle.get("BOF", 0)
-    angle_diff = abs(aoe - bof)
-
-    result["method"] = "oral_angle"
-    result["evidence"]["AOE_right"] = aoe
-    result["evidence"]["BOF_left"] = bof
-    result["evidence"]["angle_diff"] = angle_diff
-
-    result["confidence"] = min(1.0, angle_diff / 15)
-
-    if angle_diff < 3:
-        result["palsy_side"] = 0
-        result["interpretation"] = f"口角对称 (差异{angle_diff:.1f}°)"
-    elif aoe < bof:
-        result["palsy_side"] = 2
-        result["interpretation"] = f"右口角低 (AOE={aoe:+.1f}° < BOF={bof:+.1f}°) → 右侧面瘫"
-    else:
-        result["palsy_side"] = 1
-        result["interpretation"] = f"左口角低 (BOF={bof:+.1f}° < AOE={aoe:+.1f}°) → 左侧面瘫"
 
     return result
 
@@ -538,7 +497,7 @@ def visualize_show_teeth(frame: np.ndarray, landmarks, w: int, h: int,
 
         # 当前偏移
         offset_color = (0, 255, 0) if abs(current_offset) < 10 else (0, 165, 255) if abs(current_offset) < 20 else (
-        0, 0, 255)
+            0, 0, 255)
         direction = "Left" if current_offset > 0 else "Right" if current_offset < 0 else "Center"
         cv2.putText(img, f"  Current: {current_offset:+.1f}px ({direction})", (25, y),
                     FONT, FONT_SCALE_NORMAL, offset_color, THICKNESS_NORMAL)
