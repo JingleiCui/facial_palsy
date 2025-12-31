@@ -459,7 +459,6 @@ def import_metadata(
 
     print("="*60 + "\n")
 
-    # 给出下一步建议
     if stats['videos_updated'] > 0 or stats['features_deleted'] > 0:
         print("💡 提示:")
         print("   部分视频的时间段已更新,建议运行 video_pipeline.py 重新提取特征")

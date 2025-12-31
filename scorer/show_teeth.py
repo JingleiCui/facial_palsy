@@ -317,8 +317,8 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         # 置信度计算
         result["confidence"] = min(1.0, offset_norm * 10)
 
-        # 阈值调整为 3%（与 clinical_base.py 一致）
-        if offset_norm < 0.03:
+        # 阈值调整
+        if offset_norm < 0.025:
             result["palsy_side"] = 0
             result["interpretation"] = (
                 f"嘴唇中线居中 (偏移{current_offset:.1f}px, {offset_norm:.1%})"
@@ -339,7 +339,31 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
 
     return result
 
-    return result
+
+def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
+    """
+    计算动作严重度分数(医生标注标准)
+
+    修改: 大幅提高阈值，解决高估问题
+    """
+    lip_offset_data = metrics.get("lip_midline_offset", {})
+    offset_norm = lip_offset_data.get("offset_norm")
+    if offset_norm is None:
+        offset_norm = lip_offset_data.get("offset_change_norm", 0) or 0
+    current_offset = lip_offset_data.get("current_offset", 0)
+
+    # 阈值大幅提高，解决高估问题
+    # GT分布: 1=26例, 2=9例, 3=19例, 4=27例, 5=3例
+    if offset_norm < 0.05:  # 原0.03，提高
+        return 1, f"正常 (偏移{offset_norm:.4%}, {current_offset:+.4f}px)"
+    elif offset_norm < 0.10:  # 原0.06，提高
+        return 2, f"轻度异常 (偏移{offset_norm:.4%})"
+    elif offset_norm < 0.18:  # 原0.10，大幅提高
+        return 3, f"中度异常 (偏移{offset_norm:.4%})"
+    elif offset_norm < 0.28:  # 原0.15，大幅提高
+        return 4, f"重度异常 (偏移{offset_norm:.4%})"
+    else:
+        return 5, f"完全面瘫 (偏移{offset_norm:.4%})"
 
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
@@ -600,12 +624,17 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
+    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
+    severity_score, severity_desc = compute_severity_score(metrics)
+
     # 存储动作特有指标
     result.action_specific = {
         "show_teeth_metrics": metrics,
         "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
+        "severity_score": severity_score,
+        "severity_desc": severity_desc,
     }
 
     # 创建输出目录

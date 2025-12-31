@@ -310,13 +310,12 @@ def compute_smile_metrics(landmarks, w: int, h: int,
 
 def detect_palsy_side(smile_metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从微笑动作检测面瘫侧别 - 基于嘴角到眼部水平线距离
+    从微笑动作检测面瘫侧别 - 基于嘴角到眼线距离
 
-    原理:
-    - 微笑时嘴角上提，到眼部水平线的距离减小
-    - 即使轻微上提，也比较两侧距离的对称性
-    - 距离更小的一侧是健侧（嘴角上提更高）
-    - 距离更大的一侧是面瘫侧
+    核心逻辑:
+    - 微笑时嘴角上提，到眼线的距离减小
+    - 距离减小量小的一侧 = 嘴角上提弱 = 面瘫侧
+    - 或者：当前距离大的一侧 = 嘴角位置低 = 面瘫侧
     """
     result = {
         "palsy_side": 0,
@@ -326,91 +325,140 @@ def detect_palsy_side(smile_metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
-    # ========== 方法1（优先）: 比较当前帧嘴角到眼线的距离 ==========
-    # 不需要基线，直接比较左右两侧的距离
-    if "eye_line_excursion" in smile_metrics:
-        exc = smile_metrics["eye_line_excursion"]
+    if "eye_line_excursion" not in smile_metrics:
+        result["interpretation"] = "无eye_line数据"
+        return result
 
-        # 当前帧的左右嘴角到眼线距离
-        left_dist = exc.get("left_distance", 0)
-        right_dist = exc.get("right_distance", 0)
+    exc = smile_metrics["eye_line_excursion"]
 
+    # 优先使用距离减小量（如果有基线）
+    left_reduction = exc.get("left_reduction", None)
+    right_reduction = exc.get("right_reduction", None)
+
+    if left_reduction is not None and right_reduction is not None:
+        effective_left = max(0, left_reduction)
+        effective_right = max(0, right_reduction)
+        max_reduction = max(effective_left, effective_right)
+
+        if max_reduction > 3:  # 有一定的微笑幅度
+            result["method"] = "eye_line_reduction"
+            result["evidence"]["left_reduction"] = left_reduction
+            result["evidence"]["right_reduction"] = right_reduction
+
+            asymmetry = abs(effective_left - effective_right) / max_reduction
+            result["evidence"]["reduction_asymmetry"] = asymmetry
+            result["confidence"] = min(1.0, asymmetry * 2)
+
+            if asymmetry < 0.15:
+                result["palsy_side"] = 0
+                result["interpretation"] = (
+                    f"双侧嘴角上提对称 (L减小{left_reduction:.1f}px, R减小{right_reduction:.1f}px)"
+                )
+            elif effective_left < effective_right:
+                # 左侧距离减小量小 = 左嘴角上提弱 = 左侧面瘫
+                result["palsy_side"] = 1
+                result["interpretation"] = (
+                    f"左嘴角上提弱 (L减小{left_reduction:.1f}px < R减小{right_reduction:.1f}px) → 左侧面瘫"
+                )
+            else:
+                result["palsy_side"] = 2
+                result["interpretation"] = (
+                    f"右嘴角上提弱 (R减小{right_reduction:.1f}px < L减小{left_reduction:.1f}px) → 右侧面瘫"
+                )
+            return result
+
+    # 没有基线时，使用当前距离比较
+    left_dist = exc.get("left_distance", 0)
+    right_dist = exc.get("right_distance", 0)
+
+    if left_dist > 0 or right_dist > 0:
         result["method"] = "eye_line_distance"
         result["evidence"]["left_distance"] = left_dist
         result["evidence"]["right_distance"] = right_dist
 
-        # 计算距离差和不对称性
         avg_dist = (left_dist + right_dist) / 2
-        if avg_dist > 1e-6:
-            dist_diff = abs(left_dist - right_dist)
-            asymmetry = dist_diff / avg_dist
+        if avg_dist > 1:
+            asymmetry = abs(left_dist - right_dist) / avg_dist
             result["evidence"]["distance_asymmetry"] = asymmetry
             result["confidence"] = min(1.0, asymmetry * 3)
 
-            # 判断阈值：1.5%以内认为对称
-            if asymmetry < 0.015:
+            if asymmetry < 0.02:
                 result["palsy_side"] = 0
                 result["interpretation"] = (
                     f"双侧嘴角到眼线距离对称 (L={left_dist:.1f}px, R={right_dist:.1f}px, "
-                    f"不对称{asymmetry:.4%})"
+                    f"不对称{asymmetry:.1%})"
                 )
             elif left_dist > right_dist:
                 # 左嘴角距离大（位置低，上提少）→ 左侧面瘫
                 result["palsy_side"] = 1
                 result["interpretation"] = (
                     f"左嘴角距离大 (L={left_dist:.1f}px > R={right_dist:.1f}px, "
-                    f"不对称{asymmetry:.4%}) → 左侧面瘫"
+                    f"不对称{asymmetry:.1%}) → 左侧面瘫"
                 )
             else:
-                # 右嘴角距离大（位置低，上提少）→ 右侧面瘫
                 result["palsy_side"] = 2
                 result["interpretation"] = (
                     f"右嘴角距离大 (R={right_dist:.1f}px > L={left_dist:.1f}px, "
-                    f"不对称{asymmetry:.4%}) → 右侧面瘫"
+                    f"不对称{asymmetry:.1%}) → 右侧面瘫"
                 )
             return result
 
-    # ========== 方法2（备用）: 基于距离减小量（如果有基线） ==========
+    result["interpretation"] = "无有效数据"
+    return result
+
+
+def compute_severity_score(smile_metrics: Dict[str, Any]) -> Tuple[int, str]:
+    """
+    计算动作严重度分数(医生标注标准)
+
+    计算依据: 嘴角到眼线距离的不对称度
+    """
     if "eye_line_excursion" in smile_metrics:
         exc = smile_metrics["eye_line_excursion"]
 
+        # 优先使用距离减小量的不对称度
         left_reduction = exc.get("left_reduction", None)
         right_reduction = exc.get("right_reduction", None)
 
         if left_reduction is not None and right_reduction is not None:
-            result["method"] = "eye_line_reduction"
-            result["evidence"]["left_reduction"] = left_reduction
-            result["evidence"]["right_reduction"] = right_reduction
-
-            # 有效减小量（只考虑正值）
             effective_left = max(0, left_reduction)
             effective_right = max(0, right_reduction)
             max_reduction = max(effective_left, effective_right)
 
-            if max_reduction > 3:  # 有一定的微笑幅度
+            if max_reduction > 3:
                 asymmetry = abs(effective_left - effective_right) / max_reduction
-                result["evidence"]["reduction_asymmetry"] = asymmetry
-                result["confidence"] = min(1.0, asymmetry * 2)
 
-                if asymmetry < 0.15:
-                    result["palsy_side"] = 0
-                    result["interpretation"] = (
-                        f"双侧嘴角上提对称 (L减小{left_reduction:.1f}px, R减小{right_reduction:.1f}px)"
-                    )
-                elif effective_left < effective_right:
-                    result["palsy_side"] = 1
-                    result["interpretation"] = (
-                        f"左嘴角上提弱 (L减小{left_reduction:.1f}px < R减小{right_reduction:.1f}px) → 左侧面瘫"
-                    )
+                if asymmetry < 0.08:
+                    return 1, f"正常 (不对称度{asymmetry:.2%})"
+                elif asymmetry < 0.18:
+                    return 2, f"轻度异常 (不对称度{asymmetry:.2%})"
+                elif asymmetry < 0.30:
+                    return 3, f"中度异常 (不对称度{asymmetry:.2%})"
+                elif asymmetry < 0.45:
+                    return 4, f"重度异常 (不对称度{asymmetry:.2%})"
                 else:
-                    result["palsy_side"] = 2
-                    result["interpretation"] = (
-                        f"右嘴角上提弱 (R减小{right_reduction:.1f}px < L减小{left_reduction:.1f}px) → 右侧面瘫"
-                    )
-                return result
+                    return 5, f"完全面瘫 (不对称度{asymmetry:.2%})"
 
+        # 回退到当前距离
+        left_dist = exc.get("left_distance", 0)
+        right_dist = exc.get("right_distance", 0)
 
-    return result
+        avg_dist = (left_dist + right_dist) / 2
+        if avg_dist > 1:
+            asymmetry = abs(left_dist - right_dist) / avg_dist
+
+            if asymmetry < 0.03:
+                return 1, f"正常 (不对称度{asymmetry:.1%})"
+            elif asymmetry < 0.08:
+                return 2, f"轻度异常 (不对称度{asymmetry:.1%})"
+            elif asymmetry < 0.15:
+                return 3, f"中度异常 (不对称度{asymmetry:.1%})"
+            elif asymmetry < 0.25:
+                return 4, f"重度异常 (不对称度{asymmetry:.1%})"
+            else:
+                return 5, f"完全面瘫 (不对称度{asymmetry:.1%})"
+
+    return 1, "无有效数据"
 
 
 def detect_synkinesis_from_smile(baseline_result: Optional[ActionResult],
@@ -636,6 +684,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis_from_smile(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
+    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
+    severity_score, severity_desc = compute_severity_score(smile_metrics)
+
     # 计算Voluntary Movement评分
     if "excursion" in smile_metrics:
         exc_ratio = smile_metrics["excursion"]["excursion_ratio"]
@@ -666,6 +717,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "palsy_detection": palsy_detection,
         "synkinesis": synkinesis,
         "voluntary_score": result.voluntary_movement_score,
+        "severity_score": severity_score,
+        "severity_desc": severity_desc,
     }
 
     if "excursion" in smile_metrics:

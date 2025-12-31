@@ -694,6 +694,10 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=Non
         # ========== 计算嘴唇中线相对于面中线的偏移变化 ==========
         lip_offset_data = compute_lip_midline_offset_from_face_midline(landmarks, w, h, baseline_landmarks)
         metrics["lip_midline_offset"] = lip_offset_data
+    else:
+        # 无baseline时也计算当前帧的lip_midline_offset（用于severity_score）
+        lip_offset_data = compute_lip_midline_offset_from_face_midline(landmarks, w, h, None)
+        metrics["lip_midline_offset"] = lip_offset_data
 
     return metrics
 
@@ -739,10 +743,10 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         offset_norm = abs(current_offset) / icd
         result["evidence"]["offset_norm"] = offset_norm
 
-        # 判断阈值：偏移超过ICD的1.5%
-        if offset_norm > 0.015:
+        # 判断阈值：偏移超过ICD的2.5%
+        if offset_norm > 0.025:
             result["method"] = "lip_midline_offset"
-            result["confidence"] = min(1.0, offset_norm * 15)
+            result["confidence"] = min(1.0, offset_norm * 5)
 
             if current_offset > 0:
                 # 嘴唇中线偏向左侧（图像右侧）= 被左侧拉 = 右侧面瘫
@@ -762,6 +766,35 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     result["method"] = "none"
     result["interpretation"] = (f"各指标均未检测到明显不对称, {offset_norm:.4%}")
     return result
+
+
+def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
+    """
+    计算动作严重度分数 (医生标注标准)
+
+    医生标注标准:
+    - 1 = 正常 (对称性好)
+    - 2 = 轻度异常
+    - 3 = 中度异常
+    - 4 = 重度异常
+    - 5 = 完全面瘫 (严重不对称)
+
+    计算依据: 嘴唇中线偏移量 (归一化到ICD)
+    """
+    lip_offset_data = metrics.get("lip_midline_offset", {})
+    offset_norm = lip_offset_data.get("offset_norm", 0) or 0
+    current_offset = lip_offset_data.get("current_offset", 0)
+
+    if offset_norm < 0.03:
+        return 1, f"正常 (偏移{offset_norm:.2%}, {current_offset:+.2f}px)"
+    elif offset_norm < 0.06:
+        return 2, f"轻度异常 (偏移{offset_norm:.2%})"
+    elif offset_norm < 0.10:
+        return 3, f"中度异常 (偏移{offset_norm:.2%})"
+    elif offset_norm < 0.15:
+        return 4, f"重度异常 (偏移{offset_norm:.2%})"
+    else:
+        return 5, f"完全面瘫 (偏移{offset_norm:.2%})"
 
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
@@ -1119,6 +1152,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
+    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
+    severity_score, severity_desc = compute_severity_score(metrics)
+
     result.action_specific = {
         "lip_seal": metrics["lip_seal"],
         "mouth_width": metrics["mouth_width"],
@@ -1129,6 +1165,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "midline_x": metrics.get("midline_x", 0),
         "left_to_midline": metrics.get("left_to_midline", 0),
         "right_to_midline": metrics.get("right_to_midline", 0),
+        "synkinesis": synkinesis,
+        "severity_score": severity_score,
+        "severity_desc": severity_desc,
     }
 
     if "baseline" in metrics:

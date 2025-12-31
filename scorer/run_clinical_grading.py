@@ -74,8 +74,17 @@ TARGET_PATIENT_IDS = []  # "XW000264", "XW000304", "XW000312"]
 TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
-    "NeutralFace",  # 基线（如果REUSE_BASELINE=False会自动添加）
+    "NeutralFace",
+    "Smile",
     "ShowTeeth",
+    "RaiseEyebrow",
+    "CloseEyeSoftly",
+    "CloseEyeHardly",
+    "VoluntaryEyeBlink",
+    "SpontaneousEyeBlink",
+    "LipPucker",
+    "BlowCheek",
+    "ShrugNose"
 ]
 
 # 是否复用已有的 NeutralFace 结果（用于调试其他动作时跳过基线重算）
@@ -93,7 +102,7 @@ SKIP_EXISTING_ACTIONS = False
 # =============================================================================
 USE_MULTIPROCESS = True
 CPU_N = os.cpu_count()
-MAX_WORKERS = 5
+MAX_WORKERS = 6
 
 # =============================================================================
 # 动作处理器映射

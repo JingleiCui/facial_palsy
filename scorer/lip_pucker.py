@@ -24,8 +24,8 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import json
+import math
 import matplotlib
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -37,6 +37,7 @@ from clinical_base import (
     kabsch_rigid_transform, apply_rigid_transform,
     compute_lip_midline_symmetry,
     compute_lip_midline_offset_from_face_midline,
+    compute_lip_midline_center,
 )
 
 from thresholds import THR
@@ -304,22 +305,52 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
         lip_offset_data = compute_lip_midline_offset_from_face_midline(landmarks, w, h, baseline_landmarks)
         metrics["lip_midline_offset"] = lip_offset_data
 
+        # 嘴唇中心点
+        lip_center = compute_lip_midline_center(landmarks, w, h)
+        baseline_lip_center = compute_lip_midline_center(baseline_landmarks, w, h)
+
+        # 当前嘴角位置
+        left_corner = pt2d(landmarks[LM.MOUTH_CORNER_L], w, h)
+        right_corner = pt2d(landmarks[LM.MOUTH_CORNER_R], w, h)
+
+        # 基线嘴角位置
+        baseline_left_corner = pt2d(baseline_landmarks[LM.MOUTH_CORNER_L], w, h)
+        baseline_right_corner = pt2d(baseline_landmarks[LM.MOUTH_CORNER_R], w, h)
+
+        # 计算嘴角到嘴唇中心的距离变化（收缩量）
+        # 撅嘴时距离应该减小，所以是 baseline - current
+        def dist(p1, p2):
+            return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+        baseline_left_dist = dist(baseline_left_corner, baseline_lip_center)
+        baseline_right_dist = dist(baseline_right_corner, baseline_lip_center)
+        current_left_dist = dist(left_corner, lip_center)
+        current_right_dist = dist(right_corner, lip_center)
+
+        left_contraction = baseline_left_dist - current_left_dist
+        right_contraction = baseline_right_dist - current_right_dist
+
+        metrics["left_corner_contraction"] = left_contraction
+        metrics["right_corner_contraction"] = right_contraction
+
+        # 计算不对称度
+        max_contraction = max(abs(left_contraction), abs(right_contraction))
+        if max_contraction > 1:
+            metrics["corner_contraction_asymmetry"] = abs(left_contraction - right_contraction) / max_contraction
+        else:
+            metrics["corner_contraction_asymmetry"] = 0
+
     return metrics
 
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从撅嘴动作检测面瘫侧别 - 基于嘴唇中线偏移
+    从撅嘴动作检测面瘫侧别 - 基于嘴角收缩程度比较
 
     核心逻辑:
-    - 拟合嘴唇中线，计算相对于面中线的偏移
-    - 面中线是双眼内眦连线的中垂线
-    - 嘴唇被健侧肌肉拉扯，偏向健侧
-    - 嘴唇偏向哪侧 → 对侧是面瘫侧
-
-    指标优先级:
-    1. 嘴唇中线偏移（最直观）
-    2. 口角角度（作为验证）
+    - 撅嘴时口轮匝肌收缩，嘴唇向中间聚拢
+    - 比较左右嘴角的收缩量
+    - 收缩量小的一侧 = 面瘫侧（肌肉无力）
     """
     result = {
         "palsy_side": 0,
@@ -329,48 +360,109 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
-    # ========== 方法1（优先）: 嘴唇中线偏移 ==========
-    if "lip_midline_offset" in metrics:
-        offset_data = metrics["lip_midline_offset"]
+    # ========== 方法: 嘴角收缩量比较 ==========
+    left_contraction = metrics.get("left_corner_contraction", 0)
+    right_contraction = metrics.get("right_corner_contraction", 0)
 
-        current_offset = offset_data.get("current_offset", 0)
-        face_midline_x = offset_data.get("face_midline_x", 0)
-        lip_midline_x = offset_data.get("lip_midline_x", 0)
+    result["evidence"]["left_contraction"] = left_contraction
+    result["evidence"]["right_contraction"] = right_contraction
 
-        result["evidence"]["face_midline_x"] = face_midline_x
-        result["evidence"]["lip_midline_x"] = lip_midline_x
-        result["evidence"]["current_offset"] = current_offset
+    max_contraction = max(abs(left_contraction), abs(right_contraction))
 
-        # 计算归一化偏移
-        icd = metrics.get("icd", 1)
-        if icd < 1e-6:
-            icd = 1
-        offset_norm = abs(current_offset) / icd
-        result["evidence"]["offset_norm"] = offset_norm
+    if max_contraction < 2:  # 运动幅度过小（像素）
+        # 回退到lip_midline_offset
+        if "lip_midline_offset" in metrics:
+            offset_data = metrics["lip_midline_offset"]
+            current_offset = offset_data.get("current_offset", 0)
+            icd = metrics.get("icd", 1)
+            if icd < 1e-6:
+                icd = 1
+            offset_norm = abs(current_offset) / icd
+            result["evidence"]["offset_norm"] = offset_norm
 
-        # 判断阈值：偏移超过ICD的1.5%
-        if offset_norm > 0.015:
-            result["method"] = "lip_midline_offset"
-            result["confidence"] = min(1.0, offset_norm * 15)
+            if offset_norm > 0.020:
+                result["method"] = "lip_midline_offset"
+                result["confidence"] = min(1.0, offset_norm * 15)
 
-            if current_offset > 0:
-                # 嘴唇中线偏向左侧（图像右侧）= 被左侧拉 = 右侧面瘫
-                result["palsy_side"] = 2
-                result["interpretation"] = (
-                    f"嘴唇中线偏向左侧 ({current_offset:+.1f}px, {offset_norm:.4%}) → 右侧面瘫"
-                )
-            else:
-                # 嘴唇中线偏向右侧（图像左侧）= 被右侧拉 = 左侧面瘫
-                result["palsy_side"] = 1
-                result["interpretation"] = (
-                    f"嘴唇中线偏向右侧 ({current_offset:+.1f}px, {offset_norm:.4%}) → 左侧面瘫"
-                )
-            return result
+                if current_offset > 0:
+                    result["palsy_side"] = 2
+                    result["interpretation"] = f"嘴唇偏向左侧 ({current_offset:+.1f}px) → 右侧面瘫"
+                else:
+                    result["palsy_side"] = 1
+                    result["interpretation"] = f"嘴唇偏向右侧 ({current_offset:+.1f}px) → 左侧面瘫"
+                return result
 
-    # 未检测到明显不对称
-    result["method"] = "none"
-    result["interpretation"] = (f"各指标均未检测到明显不对称, {offset_norm:.4%}")
+        result["method"] = "none"
+        result["interpretation"] = "运动幅度过小，无法判断"
+        return result
+
+    # 计算不对称度
+    asymmetry = abs(left_contraction - right_contraction) / max_contraction
+    result["evidence"]["contraction_asymmetry"] = asymmetry
+    result["method"] = "corner_contraction"
+    result["confidence"] = min(1.0, asymmetry * 2)
+
+    if asymmetry < 0.15:
+        result["palsy_side"] = 0
+        result["interpretation"] = (
+            f"双侧嘴角收缩对称 (L={left_contraction:.1f}px, R={right_contraction:.1f}px, "
+            f"不对称{asymmetry:.1%})"
+        )
+    elif left_contraction < right_contraction:
+        # 左侧收缩量小 = 左侧肌肉弱 = 左侧面瘫
+        result["palsy_side"] = 1
+        result["interpretation"] = (
+            f"左侧嘴角收缩弱 (L={left_contraction:.1f}px < R={right_contraction:.1f}px, "
+            f"不对称{asymmetry:.1%}) → 左侧面瘫"
+        )
+    else:
+        result["palsy_side"] = 2
+        result["interpretation"] = (
+            f"右侧嘴角收缩弱 (R={right_contraction:.1f}px < L={left_contraction:.1f}px, "
+            f"不对称{asymmetry:.1%}) → 右侧面瘫"
+        )
+
     return result
+
+
+def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
+    """
+    计算动作严重度分数(医生标注标准)
+
+    计算依据: 嘴角收缩的不对称程度
+    """
+    # 优先使用嘴角收缩不对称度
+    corner_asymmetry = metrics.get("corner_contraction_asymmetry", 0)
+
+    if corner_asymmetry > 0:
+        if corner_asymmetry < 0.10:
+            return 1, f"正常 (收缩不对称{corner_asymmetry:.2%})"
+        elif corner_asymmetry < 0.20:
+            return 2, f"轻度异常 (收缩不对称{corner_asymmetry:.2%})"
+        elif corner_asymmetry < 0.35:
+            return 3, f"中度异常 (收缩不对称{corner_asymmetry:.2%})"
+        elif corner_asymmetry < 0.50:
+            return 4, f"重度异常 (收缩不对称{corner_asymmetry:.2%})"
+        else:
+            return 5, f"完全面瘫 (收缩不对称{corner_asymmetry:.2%})"
+
+    # 回退到lip_midline_offset
+    lip_offset_data = metrics.get("lip_midline_offset", {})
+    offset_norm = lip_offset_data.get("offset_norm")
+    if offset_norm is None:
+        offset_norm = lip_offset_data.get("offset_change_norm", 0) or 0
+    current_offset = lip_offset_data.get("current_offset", 0)
+
+    if offset_norm < 0.03:
+        return 1, f"正常 (偏移{offset_norm:.2%}, {current_offset:+.1f}px)"
+    elif offset_norm < 0.06:
+        return 2, f"轻度异常 (偏移{offset_norm:.2%})"
+    elif offset_norm < 0.10:
+        return 3, f"中度异常 (偏移{offset_norm:.2%})"
+    elif offset_norm < 0.15:
+        return 4, f"重度异常 (偏移{offset_norm:.2%})"
+    else:
+        return 5, f"完全面瘫 (偏移{offset_norm:.2%})"
 
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
@@ -716,6 +808,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
+    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
+    severity_score, severity_desc = compute_severity_score(metrics)
+
     # 存储动作特有指标
     result.action_specific = {
         "mouth_metrics": {
@@ -730,6 +825,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
+        "severity_score": severity_score,
+        "severity_desc": severity_desc,
     }
 
     if "baseline" in metrics:

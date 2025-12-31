@@ -176,8 +176,10 @@ def detect_palsy_side_from_closure(peak_closure_data: Dict[str, Any]) -> Dict[st
 
     # 计算不对称比例
     asymmetry = abs(left_closure - right_closure) / max_closure
-    result["confidence"] = min(1.0, asymmetry * 3)
+    result["confidence"] = min(1.0, asymmetry * 5)
     result["evidence"]["asymmetry_ratio"] = asymmetry
+    result["evidence"]["left_closure_pct"] = left_closure * 100
+    result["evidence"]["right_closure_pct"] = right_closure * 100
 
     if asymmetry < 0.01:  # 1%以内认为对称
         result["palsy_side"] = 0
@@ -330,6 +332,65 @@ def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) ->
             return 2, "轻微启动"
         else:
             return 1, "无法启动"
+
+
+def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
+    """
+    计算动作严重度分数(医生标注标准)
+
+    计算依据: 闭眼程度的对称性
+
+    修改: 调整阈值使判定更严格
+    """
+    # 优先使用闭合百分比
+    left_closure = metrics.get("left_closure_percent")
+    right_closure = metrics.get("right_closure_percent")
+
+    # 如果没有闭合百分比数据，尝试从area_closure获取
+    if left_closure is None or right_closure is None:
+        area_closure = metrics.get("area_closure", {})
+        left_ratio = area_closure.get("left_closure_ratio", 0)
+        right_ratio = area_closure.get("right_closure_ratio", 0)
+        left_closure = left_ratio * 100
+        right_closure = right_ratio * 100
+
+    # 如果仍然没有数据，使用面积比
+    if left_closure == 0 and right_closure == 0:
+        area_ratio = metrics.get("area_ratio", 1.0)
+        deviation = abs(area_ratio - 1.0)
+
+        if deviation <= 0.08:
+            return 1, f"对称性良好 (area_ratio={area_ratio:.3f})"
+        elif deviation <= 0.15:
+            return 2, f"轻度不对称 (area_ratio={area_ratio:.3f})"
+        elif deviation <= 0.25:
+            return 3, f"中度不对称 (area_ratio={area_ratio:.3f})"
+        elif deviation <= 0.40:
+            return 4, f"重度不对称 (area_ratio={area_ratio:.3f})"
+        else:
+            return 5, f"严重不对称 (area_ratio={area_ratio:.3f})"
+
+    max_closure = max(left_closure, right_closure)
+    min_closure = min(left_closure, right_closure)
+
+    # 检查是否有足够的闭眼动作
+    if max_closure < 20:
+        return 1, f"闭眼幅度过小 (L={left_closure:.1f}%, R={right_closure:.1f}%)"
+
+    # 计算对称性比值
+    symmetry_ratio = min_closure / max_closure if max_closure > 0 else 1.0
+
+    # 阈值调整 - 更严格
+    if symmetry_ratio >= 0.95:
+        return 1, f"正常 (对称性{symmetry_ratio:.2%})"
+    elif symmetry_ratio >= 0.85:
+        return 2, f"轻度异常 (对称性{symmetry_ratio:.2%})"
+    elif symmetry_ratio >= 0.70:
+        return 3, f"中度异常 (对称性{symmetry_ratio:.2%})"
+    elif symmetry_ratio >= 0.50:
+        return 4, f"重度异常 (对称性{symmetry_ratio:.2%})"
+    else:
+        return 5, f"完全面瘫 (对称性{symmetry_ratio:.2%})"
 
 
 def detect_synkinesis(baseline_result: Optional[ActionResult],
@@ -561,6 +622,9 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 获取面瘫侧别检测结果
     palsy_detection = metrics.get("palsy_detection", {})
 
+    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
+    severity_score, severity_desc = compute_severity_score(metrics)
+
     # 存储动作特有指标
     result.action_specific = {
         "close_eye_metrics": {
@@ -580,6 +644,8 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
+        "severity_score": severity_score,
+        "severity_desc": severity_desc,
     }
 
     if "left_closure_percent" in metrics:

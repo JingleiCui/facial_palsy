@@ -351,9 +351,12 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
             reduction_diff = abs(left_reduction - right_reduction)
             asymmetry = reduction_diff / max_reduction
             result["evidence"]["reduction_asymmetry"] = asymmetry
+            result["evidence"]["left_reduction"] = left_reduction
+            result["evidence"]["right_reduction"] = right_reduction
+            result["evidence"]["max_reduction"] = max_reduction
             result["confidence"] = min(1.0, asymmetry * 2)
 
-            if asymmetry < 0.10:
+            if asymmetry < 0.08:
                 result["palsy_side"] = 0
                 result["interpretation"] = (
                     f"双侧鼻翼收缩对称 (L缩短{left_reduction:.1f}px, R缩短{right_reduction:.1f}px), "
@@ -390,7 +393,7 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         result["evidence"]["distance_asymmetry"] = asymmetry
         result["confidence"] = min(1.0, asymmetry * 3)
 
-        if asymmetry < 0.10:
+        if asymmetry < 0.08:
             result["palsy_side"] = 0
             result["interpretation"] = f"双侧鼻翼-内眦距离对称 (L={left_dist:.1f}px, R={right_dist:.1f}px)"
         elif left_dist > right_dist:
@@ -402,6 +405,45 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
             result["interpretation"] = f"右侧距离大 (R={right_dist:.1f}px > L={left_dist:.1f}px) → 右侧面瘫"
 
     return result
+
+
+def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
+    """
+    计算动作严重度分数(医生标注标准)
+
+    计算依据: 鼻翼 - 内眦距离变化的对称性
+
+    修改: 调整阈值
+    """
+    ala_change = metrics.get("ala_canthus_change", {})
+
+    left_reduction = ala_change.get("left_reduction", 0)
+    right_reduction = ala_change.get("right_reduction", 0)
+
+    abs_left = abs(left_reduction)
+    abs_right = abs(right_reduction)
+    max_reduction = max(abs_left, abs_right)
+    min_reduction = min(abs_left, abs_right)
+
+    # 检查是否有足够的运动
+    if max_reduction < 3.0:
+        return 1, f"运动幅度过小 (L={left_reduction:.1f}px, R={right_reduction:.1f}px)"
+
+    # 计算对称性比值
+    symmetry_ratio = min_reduction / max_reduction if max_reduction > 0 else 1.0
+
+    # 阈值调整
+    if symmetry_ratio >= 0.90:
+        return 1, f"正常 (对称性{symmetry_ratio:.2%})"
+    elif symmetry_ratio >= 0.72:
+        return 2, f"轻度异常 (对称性{symmetry_ratio:.2%})"
+    elif symmetry_ratio >= 0.50:
+        return 3, f"中度异常 (对称性{symmetry_ratio:.2%})"
+    elif symmetry_ratio >= 0.30:
+        return 4, f"重度异常 (对称性{symmetry_ratio:.2%})"
+    else:
+        return 5, f"完全面瘫 (对称性{symmetry_ratio:.2%})"
+
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
     """
@@ -718,6 +760,9 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
+    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
+    severity_score, severity_desc = compute_severity_score(metrics)
+
     # 存储动作特有指标
     result.action_specific = {
         "ala_canthus_metrics": {
@@ -729,6 +774,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
+        "severity_score": severity_score,
+        "severity_desc": severity_desc,
     }
 
     if "baseline" in metrics:

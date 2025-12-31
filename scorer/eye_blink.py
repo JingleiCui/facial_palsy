@@ -429,7 +429,7 @@ def detect_palsy_side(dynamics: Dict[str, Any],
             result["evidence"]["closure_asymmetry"] = asymmetry
             result["confidence"] = min(1.0, asymmetry * 3)
 
-            if asymmetry < 0.015:
+            if asymmetry < 0.01:
                 result["palsy_side"] = 0
                 result["interpretation"] = (
                     f"双眼闭合对称 (L={peak_left_closure * 100:.1f}%, R={peak_right_closure * 100:.1f}%), "
@@ -475,30 +475,45 @@ def detect_palsy_side(dynamics: Dict[str, Any],
             )
         return result
 
-    # 方法3：闭合比例比较
-    result["method"] = "closure_ratio"
-
-    asymmetry = abs(left_closure - right_closure) / max_closure if max_closure > 0 else 0
-    result["confidence"] = min(1.0, asymmetry * 2.5)
-    result["evidence"]["asymmetry_ratio"] = asymmetry
-
-    if asymmetry < 0.15:
-        result["palsy_side"] = 0
-        result["interpretation"] = (
-            f"双眼闭合对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
-        )
-    elif left_closure < right_closure:
-        result["palsy_side"] = 1
-        result["interpretation"] = (
-            f"左眼闭合弱 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%) → 左侧面瘫"
-        )
-    else:
-        result["palsy_side"] = 2
-        result["interpretation"] = (
-            f"右眼闭合弱 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%) → 右侧面瘫"
-        )
-
     return result
+
+
+def compute_severity_score(dynamics: Dict[str, Any],
+                           peak_closure_data: Dict[str, Any] = None) -> Tuple[int, str]:
+    """
+    计算动作严重度分数 (医生标注标准)
+
+    计算依据: 眨眼时闭合程度的对称性
+    """
+    # 优先使用峰值帧数据
+    if peak_closure_data is not None:
+        left_closure = peak_closure_data.get("left_closure_ratio", 0) or 0
+        right_closure = peak_closure_data.get("right_closure_ratio", 0) or 0
+    else:
+        left_closure = dynamics.get("left_closure_ratio", 0) or 0
+        right_closure = dynamics.get("right_closure_ratio", 0) or 0
+
+    max_closure = max(left_closure, right_closure)
+    min_closure = min(left_closure, right_closure)
+
+    # 检查是否有足够的眨眼动作
+    if max_closure < 0.20:
+        return 1, f"眨眼幅度过小 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
+
+    # 计算对称性比值
+    symmetry_ratio = min_closure / max_closure if max_closure > 0.01 else 1.0
+
+    # 阈值调整
+    if symmetry_ratio >= 0.92:
+        return 1, f"正常 (对称性{symmetry_ratio:.2%})"
+    elif symmetry_ratio >= 0.78:
+        return 2, f"轻度异常 (对称性{symmetry_ratio:.2%})"
+    elif symmetry_ratio >= 0.58:
+        return 3, f"中度异常 (对称性{symmetry_ratio:.2%})"
+    elif symmetry_ratio >= 0.35:
+        return 4, f"重度异常 (对称性{symmetry_ratio:.2%})"
+    else:
+        return 5, f"完全面瘫 (对称性{symmetry_ratio:.2%})"
 
 
 def detect_synkinesis_from_blink(baseline_result: Optional[ActionResult],
@@ -630,6 +645,9 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis_from_blink(baseline_result, result)
     result.synkinesis_scores = synkinesis
 
+    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
+    severity_score, severity_desc = compute_severity_score(dynamics, peak_closure_data)
+
     # 存储动作特有指标
     result.action_specific = {
         "blink_dynamics": dynamics,
@@ -645,6 +663,8 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
         },
         "synkinesis": synkinesis,
         "palsy_detection": palsy_detection,
+        "severity_score": severity_score,
+        "severity_desc": severity_desc,
     }
 
     # 创建输出目录

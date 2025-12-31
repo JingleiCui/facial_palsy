@@ -14,13 +14,14 @@ collect_keyframes.py
 运行方式：PyCharm 直接点运行即可
 """
 
-import shutil
 import json
 import csv
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 from typing import Dict, List, Any, Optional, Tuple
+import shutil
+from collections import Counter
 
 # =============================================================================
 # 配置
@@ -252,6 +253,12 @@ def load_action_palsy_prediction(action_dir: Path) -> Dict[str, Any]:
             "method": palsy_detection.get("method", None),
         }
 
+        # 提取严重度分数 (医生标注标准: 1=正常, 5=面瘫)
+        severity_score = action_specific.get("severity_score", None)
+        severity_desc = action_specific.get("severity_desc", "")
+        result["severity_score"] = severity_score
+        result["severity_desc"] = severity_desc
+
         # 展平evidence字段
         evidence = palsy_detection.get("evidence", {})
         detailed_metrics = flatten_evidence(evidence)
@@ -470,6 +477,8 @@ def collect_one_exam(exam_dir: Path) -> Tuple[int, int, List[Dict[str, Any]]]:
             "metrics_summary": metrics_summary,
             "boundary_note": boundary_note,
             "detailed_metrics": detailed_metrics,
+            "severity_score": prediction.get("severity_score"),
+            "severity_desc": prediction.get("severity_desc", ""),
         }
         palsy_records.append(record)
 
@@ -539,41 +548,6 @@ def save_by_action_csv(records: List[Dict[str, Any]], output_dir: Path):
             writer.writerows(action_records)
 
     print(f"[OK] Per-action CSV files saved to: {output_dir}")
-
-
-def save_metrics_csv(records: List[Dict[str, Any]], output_dir: Path):
-    """按动作保存详细指标CSV"""
-    by_action = defaultdict(list)
-    for r in records:
-        by_action[r["action"]].append(r)
-
-    for action in ACTIONS:
-        if action == "NeutralFace" or action not in by_action:
-            continue
-
-        action_records = by_action[action]
-        action_records.sort(key=lambda x: x["exam_id"])
-
-        schema = ACTION_METRICS_SCHEMA.get(action, [])
-        fieldnames = ["exam_id", "hb", "gt", "pred", "result"] + schema
-
-        output_path = output_dir / f"metrics_{action}.csv"
-        with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.writer(f)
-            writer.writerow(fieldnames)
-
-            for r in action_records:
-                row = [r["exam_id"], r["hb"], r["gt"], r["pred"], r["result"]]
-                metrics = r.get("detailed_metrics", {})
-                for key in schema:
-                    val = metrics.get(key, "")
-                    if isinstance(val, float):
-                        row.append(f"{val:.4f}")
-                    else:
-                        row.append(val)
-                writer.writerow(row)
-
-    print(f"[OK] Metrics CSV files saved to: {output_dir}")
 
 
 def save_all_records_csv(records: List[Dict[str, Any]], output_path: Path):
@@ -740,6 +714,386 @@ def save_error_analysis(records: List[Dict[str, Any]], output_dir: Path):
     print(f"[OK] Error analysis saved to: {output_dir}")
 
 
+def save_severity_stats(records: List[Dict[str, Any]], output_path: Path, labels_db_path: str = None):
+    """
+    保存严重度分数统计 - 详细版
+
+    每个动作的每个分数都单独一行展示
+    """
+    from collections import Counter
+    import sqlite3
+
+    # 加载GT标签
+    gt_severity = {}
+    gt_hb_grade = {}
+
+    if labels_db_path:
+        try:
+            conn = sqlite3.connect(labels_db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT al.examination_id, at.action_name_en, al.severity_score 
+                FROM action_labels al
+                JOIN action_types at ON al.action_id = at.action_id
+                WHERE al.severity_score IS NOT NULL
+            """)
+            for row in cursor.fetchall():
+                exam_id, action_name, severity = row
+                gt_severity[(exam_id, action_name)] = severity
+
+            cursor.execute("""
+                SELECT examination_id, hb_grade
+                FROM examination_labels
+                WHERE hb_grade IS NOT NULL
+            """)
+            for row in cursor.fetchall():
+                exam_id, hb = row
+                gt_hb_grade[exam_id] = hb
+
+            conn.close()
+            print(f"[INFO] Loaded {len(gt_severity)} GT severity labels")
+            print(f"[INFO] Loaded {len(gt_hb_grade)} HB grades")
+
+        except Exception as e:
+            print(f"[WARN] Failed to load GT labels: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # 按动作分组
+    by_action = defaultdict(list)
+    for r in records:
+        exam_id = r["exam_id"]
+        action = r["action"]
+        by_action[action].append({
+            "exam_id": exam_id,
+            "hb": r.get("hb") or gt_hb_grade.get(exam_id),
+            "pred": r.get("severity_score"),
+            "gt": gt_severity.get((exam_id, action)),
+        })
+
+    # ===== 详细CSV输出 =====
+    with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Action", "Score", "GT_N", "Pred_N", "Correct", "Recall", "Precision"
+        ])
+
+        for action in ACTIONS:
+            if action == "NeutralFace":
+                continue
+
+            data = by_action.get(action, [])
+            if not data:
+                continue
+
+            paired = [(d["pred"], d["gt"]) for d in data if d["pred"] is not None and d["gt"] is not None]
+            gt_dist = Counter(d["gt"] for d in data if d["gt"] is not None)
+            pred_dist = Counter(d["pred"] for d in data if d["pred"] is not None)
+
+            # 构建混淆矩阵
+            conf = defaultdict(lambda: defaultdict(int))
+            for pred, gt in paired:
+                conf[gt][pred] += 1
+
+            # 每个分数一行
+            for score in range(1, 6):
+                gt_n = gt_dist.get(score, 0)
+                pred_n = pred_dist.get(score, 0)
+                correct = conf[score][score]
+
+                recall = f"{correct / gt_n:.1%}" if gt_n > 0 else "-"
+                precision = f"{correct / pred_n:.1%}" if pred_n > 0 else "-"
+
+                writer.writerow([
+                    action, score, gt_n, pred_n, correct, recall, precision
+                ])
+
+            # 动作汇总行
+            total_correct = sum(conf[s][s] for s in range(1, 6))
+            n_paired = len(paired)
+            writer.writerow([
+                f"{action}_TOTAL", "-",
+                sum(gt_dist.values()),
+                sum(pred_dist.values()),
+                total_correct,
+                f"{total_correct / n_paired:.1%}" if n_paired > 0 else "-",
+                "-"
+            ])
+            writer.writerow([])  # 空行分隔
+
+    print(f"[OK] Severity stats saved: {output_path}")
+
+    # ===== 详细TXT报告 =====
+    report_path = output_path.parent / "severity_detail.txt"
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("=" * 70 + "\n")
+        f.write("Severity Score 详细分析报告\n")
+        f.write("=" * 70 + "\n")
+
+        grand_total = {"paired": 0, "exact": 0, "within1": 0}
+
+        for action in ACTIONS:
+            if action == "NeutralFace":
+                continue
+
+            data = by_action.get(action, [])
+            if not data:
+                continue
+
+            paired = [(d["pred"], d["gt"]) for d in data if d["pred"] is not None and d["gt"] is not None]
+            gt_dist = Counter(d["gt"] for d in data if d["gt"] is not None)
+            pred_dist = Counter(d["pred"] for d in data if d["pred"] is not None)
+
+            if not paired:
+                f.write(f"\n{action}: 无配对数据\n")
+                continue
+
+            # 构建混淆矩阵
+            conf = defaultdict(lambda: defaultdict(int))
+            for pred, gt in paired:
+                conf[gt][pred] += 1
+
+            n_paired = len(paired)
+            exact = sum(conf[s][s] for s in range(1, 6))
+            within1 = sum(1 for p, g in paired if abs(p - g) <= 1)
+
+            grand_total["paired"] += n_paired
+            grand_total["exact"] += exact
+            grand_total["within1"] += within1
+
+            f.write(f"\n{'=' * 70}\n")
+            f.write(f"{action} (N={n_paired})\n")
+            f.write(f"{'=' * 70}\n\n")
+
+            # 每个分数的详细统计
+            f.write(f"{'Score':<8} {'GT_N':>6} {'Pred_N':>8} {'Correct':>9} {'Recall':>10} {'Precision':>11}\n")
+            f.write("-" * 55 + "\n")
+
+            for score in range(1, 6):
+                gt_n = gt_dist.get(score, 0)
+                pred_n = pred_dist.get(score, 0)
+                correct = conf[score][score]
+
+                if gt_n > 0 or pred_n > 0:
+                    recall = f"{correct / gt_n:.1%}" if gt_n > 0 else "-"
+                    precision = f"{correct / pred_n:.1%}" if pred_n > 0 else "-"
+
+                    # 标记问题
+                    flag = ""
+                    if gt_n > 0 and correct == 0:
+                        flag = " ← 全部漏检!"
+                    elif pred_n > 0 and correct == 0:
+                        flag = " ← 全部误报!"
+                    elif gt_n > 0 and correct / gt_n < 0.5:
+                        flag = " ← 召回率低"
+
+                    f.write(f"{score:<8} {gt_n:>6} {pred_n:>8} {correct:>9} {recall:>10} {precision:>11}{flag}\n")
+
+            f.write("-" * 55 + "\n")
+            f.write(f"{'Total':<8} {sum(gt_dist.values()):>6} {sum(pred_dist.values()):>8} {exact:>9} "
+                    f"{exact / n_paired:>9.1%} {'-':>11}\n")
+
+            # 汇总指标
+            f.write(f"\n准确率指标:\n")
+            f.write(f"  Exact Match (完全正确): {exact}/{n_paired} = {exact / n_paired:.1%}\n")
+            f.write(f"  Within ±1 (误差≤1):     {within1}/{n_paired} = {within1 / n_paired:.1%}\n")
+
+            # 混淆矩阵
+            f.write(f"\n混淆矩阵 (行=GT, 列=Pred):\n")
+            f.write(f"{'GT\\Pred':>8}")
+            for p in range(1, 6):
+                f.write(f"{p:>6}")
+            f.write("\n")
+
+            for gt in range(1, 6):
+                if gt_dist.get(gt, 0) == 0:
+                    continue
+                f.write(f"{gt:>8}")
+                for pred in range(1, 6):
+                    cnt = conf[gt][pred]
+                    if cnt > 0:
+                        f.write(f"{cnt:>6}")
+                    else:
+                        f.write(f"{'·':>6}")
+                f.write(f"  (GT={gt}: {gt_dist.get(gt, 0)}例)\n")
+
+            # 错误分析
+            errors = [(p, g) for p, g in paired if p != g]
+            if errors:
+                f.write(f"\n错误分析 ({len(errors)}例):\n")
+                error_types = Counter((g, p) for p, g in errors)
+                for (gt, pred), count in error_types.most_common(10):
+                    direction = "↑高估" if pred > gt else "↓低估"
+                    f.write(f"  GT={gt} → Pred={pred}: {count}例 ({direction}{abs(pred - gt)}分)\n")
+
+        # 总汇总
+        f.write(f"\n{'=' * 70}\n")
+        f.write(f"总体汇总\n")
+        f.write(f"{'=' * 70}\n")
+        if grand_total["paired"] > 0:
+            f.write(f"总配对数: {grand_total['paired']}\n")
+            f.write(
+                f"Exact Match: {grand_total['exact']}/{grand_total['paired']} = {grand_total['exact'] / grand_total['paired']:.1%}\n")
+            f.write(
+                f"Within ±1:   {grand_total['within1']}/{grand_total['paired']} = {grand_total['within1'] / grand_total['paired']:.1%}\n")
+
+    print(f"[OK] Detail report saved: {report_path}")
+
+    # ===== 控制台输出 =====
+    print(f"\n" + "=" * 80)
+    print("Severity Score 详细统计")
+    print("=" * 80)
+
+    for action in ACTIONS:
+        if action == "NeutralFace":
+            continue
+
+        data = by_action.get(action, [])
+        paired = [(d["pred"], d["gt"]) for d in data if d["pred"] is not None and d["gt"] is not None]
+
+        if not paired:
+            continue
+
+        gt_dist = Counter(d["gt"] for d in data if d["gt"] is not None)
+        pred_dist = Counter(d["pred"] for d in data if d["pred"] is not None)
+
+        conf = defaultdict(lambda: defaultdict(int))
+        for pred, gt in paired:
+            conf[gt][pred] += 1
+
+        n_paired = len(paired)
+        exact = sum(conf[s][s] for s in range(1, 6))
+        within1 = sum(1 for p, g in paired if abs(p - g) <= 1)
+
+        print(f"\n{action} (N={n_paired}, Exact={exact / n_paired:.1%}, ±1={within1 / n_paired:.1%})")
+        print("-" * 60)
+        print(f"{'Score':<6} {'GT':>5} {'Pred':>6} {'OK':>5} {'Recall':>8} {'Prec':>8} {'Status'}")
+        print("-" * 60)
+
+        for score in range(1, 6):
+            gt_n = gt_dist.get(score, 0)
+            pred_n = pred_dist.get(score, 0)
+            correct = conf[score][score]
+
+            if gt_n == 0 and pred_n == 0:
+                continue
+
+            recall = f"{correct / gt_n:.0%}" if gt_n > 0 else "-"
+            precision = f"{correct / pred_n:.0%}" if pred_n > 0 else "-"
+
+            # 状态标记
+            if gt_n > 0 and correct == 0:
+                status = "❌ 全漏"
+            elif pred_n > 0 and correct == 0:
+                status = "⚠️ 全误"
+            elif gt_n > 0 and correct / gt_n >= 0.8:
+                status = "✓ 良好"
+            elif gt_n > 0 and correct / gt_n >= 0.5:
+                status = "△ 一般"
+            elif gt_n > 0:
+                status = "✗ 较差"
+            else:
+                status = "-"
+
+            print(f"{score:<6} {gt_n:>5} {pred_n:>6} {correct:>5} {recall:>8} {precision:>8} {status}")
+
+    # 总汇总
+    total_paired = sum(len([(d["pred"], d["gt"]) for d in by_action.get(a, [])
+                            if d["pred"] is not None and d["gt"] is not None])
+                       for a in ACTIONS if a != "NeutralFace")
+
+    if grand_total["paired"] > 0:
+        print("\n" + "=" * 80)
+        print(f"总体: N={grand_total['paired']}, "
+              f"Exact={grand_total['exact'] / grand_total['paired']:.1%}, "
+              f"±1={grand_total['within1'] / grand_total['paired']:.1%}")
+        print("=" * 80)
+
+
+def copy_classified_images(records: List[Dict[str, Any]], output_dir: Path):
+    """
+    按预测结果分类复制关键帧图片
+
+    目录结构:
+    output_dir/
+      Action/
+        OK/
+          exam_id_peak_raw.jpg
+          exam_id_peak_indicators.jpg
+        WRONG/
+        FN/
+        FP/
+        both_sym/
+    """
+    categories = ["OK", "WRONG", "FN", "FP", "both_sym"]
+
+    # 创建目录结构
+    for action in ACTIONS:
+        if action == "NeutralFace":
+            continue
+        for cat in categories:
+            cat_dir = output_dir / action / cat
+            cat_dir.mkdir(parents=True, exist_ok=True)
+
+    # 统计复制数量
+    copy_stats = defaultdict(lambda: defaultdict(int))
+
+    # 复制图片
+    for r in records:
+        action = r["action"]
+        if action == "NeutralFace":
+            continue
+
+        result = r["result"]
+        if result not in categories:
+            continue
+
+        exam_id = r["exam_id"]
+
+        # 源目录
+        src_action_dir = SRC_ROOT / exam_id / action
+        if not src_action_dir.exists():
+            continue
+
+        # 目标目录
+        dst_cat_dir = output_dir / action / result
+
+        # 复制图片
+        for img_base in ["peak_raw", "peak_indicators"]:
+            src_path = None
+            for ext in ["jpg", "jpeg", "png", "webp"]:
+                candidate = src_action_dir / f"{img_base}.{ext}"
+                if candidate.exists():
+                    src_path = candidate
+                    break
+
+            if src_path and src_path.exists():
+                dst_name = f"{exam_id}_{img_base}{src_path.suffix}"
+                dst_path = dst_cat_dir / dst_name
+                try:
+                    shutil.copy2(src_path, dst_path)
+                    if img_base == "peak_raw":  # 只统计一次
+                        copy_stats[action][result] += 1
+                except Exception as e:
+                    print(f"[WARN] Copy failed: {src_path} -> {dst_path}: {e}")
+
+    # 打印统计
+    total_copied = sum(sum(v.values()) for v in copy_stats.values())
+    print(f"\n[OK] Classified images copied: {total_copied * 2} files to {output_dir}")
+
+    print(f"\n分类图片统计:")
+    print(f"{'Action':<20} {'OK':>5} {'WRONG':>6} {'FN':>4} {'FP':>4} {'both_sym':>8}")
+    print("-" * 52)
+    for action in ACTIONS:
+        if action == "NeutralFace":
+            continue
+        stats = copy_stats.get(action, {})
+        if sum(stats.values()) > 0:
+            print(f"{action:<20} {stats.get('OK', 0):>5} {stats.get('WRONG', 0):>6} "
+                  f"{stats.get('FN', 0):>4} {stats.get('FP', 0):>4} {stats.get('both_sym', 0):>8}")
+
+
 def print_threshold_reference():
     """打印阈值参考"""
     print("\n" + "=" * 60)
@@ -818,22 +1172,32 @@ def main():
 
     # 保存文件
     save_by_action_csv(all_palsy_records, DST_ROOT)
-    save_metrics_csv(all_palsy_records, DST_ROOT)
     save_all_records_csv(all_palsy_records, DST_ROOT / "palsy_all_records.csv")
     save_summary_csv(stats, DST_ROOT / "palsy_summary.csv")
     save_confusion_matrix(all_palsy_records, DST_ROOT / "palsy_confusion.txt")
     save_error_analysis(all_palsy_records, DST_ROOT / "error_cases")
+
+    # 尝试从数据库加载GT severity标签
+    labels_db = Path("/Users/cuijinglei/PycharmProjects/medicalProject/facial_palsy/facialPalsy.db")  # 修改为实际路径
+    if labels_db.exists():
+        save_severity_stats(all_palsy_records, DST_ROOT / "severity_summary.csv", str(labels_db))
+    else:
+        save_severity_stats(all_palsy_records, DST_ROOT / "severity_summary.csv")
+
+    classified_dir = DST_ROOT / "classified_images"
+    copy_classified_images(all_palsy_records, classified_dir)
 
     print("\n" + "=" * 60)
     print("完成!")
     print("=" * 60)
     print(f"输出目录: {DST_ROOT}")
     print(f"  - palsy_<Action>.csv      : 每个动作的基本预测")
-    print(f"  - metrics_<Action>.csv    : 每个动作的详细指标 (新增)")
     print(f"  - palsy_all_records.csv   : 所有记录汇总")
     print(f"  - palsy_summary.csv       : 统计摘要")
     print(f"  - palsy_confusion.txt     : 混淆矩阵")
-    print(f"  - error_cases/            : 错误案例分析 (新增)")
+    print(f"  - error_cases/            : 错误案例分析")
+    print(f"  - severity_summary.csv    : 严重度分数统计")
+    print(f"  - classified_images/      : 按结果分类的关键帧图片")
 
 
 if __name__ == "__main__":

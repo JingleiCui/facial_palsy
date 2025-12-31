@@ -2422,7 +2422,7 @@ def compute_lip_midline_offset_from_face_midline(landmarks, w: int, h: int,
         offset_norm = abs(current_offset) / icd if icd > 1e-6 else 0
         result["offset_norm"] = float(offset_norm)
 
-        if offset_norm < 0.03:  # 3%以内认为对称
+        if offset_norm < 0.025:  # 以内认为对称
             result["palsy_side_suggestion"] = 0
         elif current_offset > 0:
             # 偏向患者左侧 = 被左侧拉 = 左侧健侧 = 右侧面瘫
