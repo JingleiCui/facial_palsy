@@ -271,10 +271,6 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
         aoe_change = oral.AOE_angle - baseline_oral.AOE_angle
         bof_change = oral.BOF_angle - baseline_oral.BOF_angle
 
-        # 嘴角位移（总位移）
-        left_displacement = dist(left_corner, baseline_left) * scale
-        right_displacement = dist(right_corner, baseline_right) * scale
-
         # 嘴宽变化
         scaled_width = mouth["width"] * scale
         width_change = scaled_width - baseline_mouth["width"]
@@ -290,8 +286,6 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
             "bof_change": float(bof_change),
         }
 
-        metrics["left_corner_displacement"] = float(left_displacement)
-        metrics["right_corner_displacement"] = float(right_displacement)
         metrics["width_change"] = float(width_change)
         metrics["width_ratio"] = float(scaled_width / baseline_mouth["width"]) if baseline_mouth["width"] > 1e-9 else 1.0
 
