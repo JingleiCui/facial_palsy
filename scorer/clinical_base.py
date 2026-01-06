@@ -82,15 +82,17 @@ class LM:
     UPPER_LIP_L = [267, 269, 270, 409, 291, 308, 415, 310, 311, 312]
     LOWER_LIP_L = [317, 402, 318, 324, 308, 291, 375, 321, 405, 314]
     LIP_L = [267, 269, 270, 409, 291, 308, 415, 310, 311, 312,
-             317, 402, 318, 324, 375, 321, 405, 314]  # 合并去重
+             317, 402, 318, 324, 375, 321, 405, 314]
     INNER_LIP_L = [13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14]
+    MOUTH_CORNER_L = 291
 
     # 患者右侧嘴唇（图像左侧，x值较小）
     UPPER_LIP_R = [37, 39, 40, 185, 61, 78, 191, 80, 81, 82]
     LOWER_LIP_R = [87, 178, 88, 95, 78, 61, 146, 91, 181, 84]
     LIP_R = [37, 39, 40, 185, 61, 78, 191, 80, 81, 82,
-             87, 178, 88, 95, 146, 91, 181, 84]  # 合并去重
+             87, 178, 88, 95, 146, 91, 181, 84]
     INNER_LIP_R = [13,  82,  81,  80, 191, 78,  95,  88, 178,  87, 14]
+    MOUTH_CORNER_R = 61
 
     # ========== 口角角度 ==========
     ORAL_CORNER_R = 78  # A点: 右嘴角
@@ -811,31 +813,20 @@ def compute_lip_seal_distance(landmarks, w: int, h: int) -> Dict[str, Any]:
     计算唇密封距离 (用于BlowCheek关键帧检测)
 
     计算方法:
-    - 上唇: LIP_TOP_CENTER (0) 到 LIP_TOP (13) 的距离
-    - 下唇: LIP_BOT (14) 到 LIP_BOT_CENTER (17) 的距离
-    - 总距离: 上唇距离 + 上唇到下唇距离 + 下唇距离
+    - 上唇:  LIP_TOP (13) 到 下唇: LIP_BOT (14) 的距离
+    - 总距离: 上唇到下唇距离
 
     鼓腮时嘴唇紧闭，此距离最小
     """
-    upper_outer = pt2d(landmarks[LM.LIP_TOP_CENTER], w, h)  # 0
     upper_inner = pt2d(landmarks[LM.LIP_TOP], w, h)  # 13
     lower_inner = pt2d(landmarks[LM.LIP_BOT], w, h)  # 14
-    lower_outer = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)  # 17
 
-    upper_dist = dist(upper_outer, upper_inner)
     middle_dist = dist(upper_inner, lower_inner)
-    lower_dist = dist(lower_inner, lower_outer)
-    total_dist = upper_dist + middle_dist + lower_dist
 
     return {
-        "upper_distance": upper_dist,
         "middle_distance": middle_dist,
-        "lower_distance": lower_dist,
-        "total_distance": total_dist,
-        "upper_outer": upper_outer,
         "upper_inner": upper_inner,
         "lower_inner": lower_inner,
-        "lower_outer": lower_outer
     }
 
 

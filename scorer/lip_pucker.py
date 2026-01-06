@@ -138,8 +138,8 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
     base_icd = max(base_icd, 1e-6)
 
     # 门控阈值（你可以按数据再调）
-    mouth_h_thr = 0.32  # mouth_height / ICD 过大 => 张口
-    seal_thr = 0.3  # lip_seal_total / ICD 过大 => 唇不闭合
+    mouth_h_thr = THR.MOUTH_HEIGHT
+    seal_thr = THR.MOUTH_SEAL
 
     best_score = -1e18
     best_idx = 0
@@ -166,7 +166,7 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
         # 唇密封（越小越闭合）
         seal = compute_lip_seal_distance(lm, w, h)
-        seal_ratio = float(seal["total_distance"]) / base_icd
+        seal_ratio = float(seal["middle_distance"]) / base_icd
 
         # 唇部深度：对齐后取唇部平均z（越小越靠前）
         cur_z = _mean_lip_z_aligned(lm, w, h, baseline_landmarks=baseline_landmarks)

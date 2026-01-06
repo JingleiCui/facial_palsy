@@ -212,9 +212,40 @@ def load_ground_truth(exam_dir: Path) -> Dict[str, Any]:
             "has_palsy": gt.get("has_palsy", None),
             "palsy_side": gt.get("palsy_side", None),
             "hb_grade": gt.get("hb_grade", None),
+            "sunnybrook_score": gt.get("sunnybrook_score", None),  # 新增
         }
     except Exception as e:
         print(f"[WARN] Failed to load summary.json: {exam_dir} - {e}")
+        return {}
+
+
+def load_session_diagnosis(exam_dir: Path) -> Dict[str, Any]:
+    """从 summary.json 加载 Session 级诊断预测结果"""
+    summary_path = exam_dir / "summary.json"
+    if not summary_path.exists():
+        return {}
+
+    try:
+        with open(summary_path, 'r', encoding='utf-8') as f:
+            summary = json.load(f)
+
+        diagnosis = summary.get("diagnosis", {})
+        if not diagnosis:
+            return {}
+
+        return {
+            "has_palsy": diagnosis.get("has_palsy", None),
+            "palsy_side": diagnosis.get("palsy_side", None),
+            "hb_grade": diagnosis.get("hb_grade", None),
+            "sunnybrook_score": diagnosis.get("sunnybrook_score", None),
+            "confidence": diagnosis.get("confidence", None),
+            "palsy_side_confidence": diagnosis.get("palsy_side_confidence", None),
+            "resting_score": diagnosis.get("resting_score", None),
+            "voluntary_score": diagnosis.get("voluntary_score", None),
+            "synkinesis_score": diagnosis.get("synkinesis_score", None),
+        }
+    except Exception as e:
+        print(f"[WARN] Failed to load diagnosis from summary.json: {exam_dir} - {e}")
         return {}
 
 
@@ -404,14 +435,23 @@ def identify_boundary_case(action: str, metrics: Dict[str, Any]) -> Optional[str
 # =============================================================================
 # 核心收集函数
 # =============================================================================
-def collect_one_exam(exam_dir: Path) -> Tuple[int, int, List[Dict[str, Any]]]:
-    """处理单个检查目录"""
+def collect_one_exam(exam_dir: Path) -> Tuple[int, int, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """处理单个检查目录
+
+    Returns:
+        (copied, skipped, palsy_records, session_record)
+        - session_record: Session级诊断记录，用于统计整体级别预测准确率
+    """
     exam_id = exam_dir.name
 
     ground_truth = load_ground_truth(exam_dir)
     gt_side = ground_truth.get("palsy_side")
     gt_has_palsy = ground_truth.get("has_palsy")
     gt_hb = ground_truth.get("hb_grade")
+    gt_sunnybrook = ground_truth.get("sunnybrook_score")
+
+    # 加载Session级诊断预测
+    session_pred = load_session_diagnosis(exam_dir)
 
     copied = 0
     skipped = 0
@@ -482,7 +522,30 @@ def collect_one_exam(exam_dir: Path) -> Tuple[int, int, List[Dict[str, Any]]]:
         }
         palsy_records.append(record)
 
-    return copied, skipped, palsy_records
+    # 构建Session级诊断记录
+    session_record = None
+    if session_pred:
+        session_record = {
+            "exam_id": exam_id,
+            # Ground Truth
+            "gt_has_palsy": gt_has_palsy,
+            "gt_palsy_side": gt_side,
+            "gt_hb_grade": gt_hb,
+            "gt_sunnybrook": gt_sunnybrook,
+            # Prediction
+            "pred_has_palsy": session_pred.get("has_palsy"),
+            "pred_palsy_side": session_pred.get("palsy_side"),
+            "pred_hb_grade": session_pred.get("hb_grade"),
+            "pred_sunnybrook": session_pred.get("sunnybrook_score"),
+            "pred_confidence": session_pred.get("confidence"),
+            "pred_palsy_side_confidence": session_pred.get("palsy_side_confidence"),
+            # Sunnybrook详细分数
+            "pred_resting_score": session_pred.get("resting_score"),
+            "pred_voluntary_score": session_pred.get("voluntary_score"),
+            "pred_synkinesis_score": session_pred.get("synkinesis_score"),
+        }
+
+    return copied, skipped, palsy_records, session_record
 
 
 def compute_statistics(all_records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -520,6 +583,300 @@ def compute_statistics(all_records: List[Dict[str, Any]]) -> Dict[str, Dict[str,
         s["palsy_cases"] = palsy_cases
 
     return stats
+
+
+def compute_session_diagnosis_statistics(session_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    计算Session级诊断的准确率统计
+
+    统计指标:
+    - has_palsy: 是否面瘫的准确率
+    - palsy_side: 面瘫侧别的准确率（严格/宽松）
+    - hb_grade: HB分级的准确率（精确匹配/±1级）
+    - sunnybrook: Sunnybrook评分的MAE和相关性
+    """
+    if not session_records:
+        return {}
+
+    stats = {
+        "total": len(session_records),
+        "has_palsy": {"correct": 0, "total": 0, "accuracy": None},
+        "palsy_side": {
+            "correct": 0, "wrong_side": 0, "fn": 0, "fp": 0,
+            "total_palsy": 0, "strict_acc": None, "relaxed_acc": None
+        },
+        "hb_grade": {
+            "exact_match": 0, "within_1": 0, "total": 0,
+            "exact_acc": None, "within_1_acc": None, "mae": None
+        },
+        "sunnybrook": {
+            "total": 0, "mae": None, "rmse": None, "correlation": None,
+            "errors": []
+        }
+    }
+
+    # 用于计算Sunnybrook统计的列表
+    sb_gt_list = []
+    sb_pred_list = []
+    hb_errors = []
+
+    for r in session_records:
+        gt_has_palsy = r.get("gt_has_palsy")
+        pred_has_palsy = r.get("pred_has_palsy")
+        gt_side = r.get("gt_palsy_side")
+        pred_side = r.get("pred_palsy_side")
+        gt_hb = r.get("gt_hb_grade")
+        pred_hb = r.get("pred_hb_grade")
+        gt_sb = r.get("gt_sunnybrook")
+        pred_sb = r.get("pred_sunnybrook")
+
+        # === 1. has_palsy 准确率 ===
+        if gt_has_palsy is not None and pred_has_palsy is not None:
+            stats["has_palsy"]["total"] += 1
+            # 转换为bool比较
+            gt_bool = bool(gt_has_palsy)
+            pred_bool = bool(pred_has_palsy)
+            if gt_bool == pred_bool:
+                stats["has_palsy"]["correct"] += 1
+
+        # === 2. palsy_side 准确率 ===
+        if gt_side is not None and pred_side is not None:
+            if gt_side == 0 and pred_side == 0:
+                # 都是对称，不计入面瘫侧别统计
+                pass
+            elif gt_side == 0 and pred_side != 0:
+                stats["palsy_side"]["fp"] += 1  # False Positive
+                stats["palsy_side"]["total_palsy"] += 1
+            elif gt_side != 0 and pred_side == 0:
+                stats["palsy_side"]["fn"] += 1  # False Negative
+                stats["palsy_side"]["total_palsy"] += 1
+            elif gt_side == pred_side:
+                stats["palsy_side"]["correct"] += 1  # 正确
+                stats["palsy_side"]["total_palsy"] += 1
+            else:
+                stats["palsy_side"]["wrong_side"] += 1  # 错误侧别
+                stats["palsy_side"]["total_palsy"] += 1
+
+        # === 3. HB Grade 准确率 ===
+        if gt_hb is not None and pred_hb is not None:
+            stats["hb_grade"]["total"] += 1
+            hb_diff = abs(gt_hb - pred_hb)
+            hb_errors.append(hb_diff)
+            if hb_diff == 0:
+                stats["hb_grade"]["exact_match"] += 1
+            if hb_diff <= 1:
+                stats["hb_grade"]["within_1"] += 1
+
+        # === 4. Sunnybrook 评分误差 ===
+        if gt_sb is not None and pred_sb is not None:
+            stats["sunnybrook"]["total"] += 1
+            sb_gt_list.append(gt_sb)
+            sb_pred_list.append(pred_sb)
+            stats["sunnybrook"]["errors"].append(pred_sb - gt_sb)
+
+    # === 计算汇总指标 ===
+
+    # has_palsy accuracy
+    if stats["has_palsy"]["total"] > 0:
+        stats["has_palsy"]["accuracy"] = stats["has_palsy"]["correct"] / stats["has_palsy"]["total"]
+
+    # palsy_side accuracy
+    total_palsy = stats["palsy_side"]["total_palsy"]
+    if total_palsy > 0:
+        stats["palsy_side"]["strict_acc"] = stats["palsy_side"]["correct"] / total_palsy
+        # 宽松准确率：FN也算对（预测对称但实际有面瘫）
+        stats["palsy_side"]["relaxed_acc"] = (
+                                                     stats["palsy_side"]["correct"] + stats["palsy_side"]["fn"]
+                                             ) / total_palsy
+
+    # HB Grade accuracy
+    if stats["hb_grade"]["total"] > 0:
+        stats["hb_grade"]["exact_acc"] = stats["hb_grade"]["exact_match"] / stats["hb_grade"]["total"]
+        stats["hb_grade"]["within_1_acc"] = stats["hb_grade"]["within_1"] / stats["hb_grade"]["total"]
+        stats["hb_grade"]["mae"] = sum(hb_errors) / len(hb_errors)
+
+    # Sunnybrook statistics
+    if stats["sunnybrook"]["total"] > 0:
+        import numpy as np
+        sb_gt = np.array(sb_gt_list)
+        sb_pred = np.array(sb_pred_list)
+        errors = sb_pred - sb_gt
+
+        stats["sunnybrook"]["mae"] = float(np.mean(np.abs(errors)))
+        stats["sunnybrook"]["rmse"] = float(np.sqrt(np.mean(errors ** 2)))
+
+        # Pearson相关系数
+        if len(sb_gt) > 1 and np.std(sb_gt) > 0 and np.std(sb_pred) > 0:
+            stats["sunnybrook"]["correlation"] = float(np.corrcoef(sb_gt, sb_pred)[0, 1])
+
+        # 清理errors列表（只保留统计，不保存原始数据）
+        stats["sunnybrook"]["errors"] = None
+
+    return stats
+
+
+def print_session_diagnosis_statistics(stats: Dict[str, Any]):
+    """打印Session级诊断统计结果"""
+    if not stats:
+        print("\n[WARN] No session diagnosis statistics available")
+        return
+
+    print("\n" + "=" * 70)
+    print("Session级诊断预测准确率统计")
+    print("=" * 70)
+    print(f"总检查数: {stats['total']}")
+
+    # 1. 是否面瘫
+    hp = stats["has_palsy"]
+    if hp["total"] > 0:
+        print(f"\n1. 是否面瘫 (has_palsy):")
+        print(f"   准确率: {hp['accuracy']:.1%} ({hp['correct']}/{hp['total']})")
+
+    # 2. 面瘫侧别
+    ps = stats["palsy_side"]
+    if ps["total_palsy"] > 0:
+        print(f"\n2. 面瘫侧别 (palsy_side):")
+        print(f"   严格准确率: {ps['strict_acc']:.1%} ({ps['correct']}/{ps['total_palsy']})")
+        print(f"   宽松准确率: {ps['relaxed_acc']:.1%} (含FN)")
+        print(f"   详情: 正确={ps['correct']}, 错侧={ps['wrong_side']}, FN={ps['fn']}, FP={ps['fp']}")
+
+    # 3. HB Grade
+    hb = stats["hb_grade"]
+    if hb["total"] > 0:
+        print(f"\n3. HB分级 (hb_grade):")
+        print(f"   精确匹配: {hb['exact_acc']:.1%} ({hb['exact_match']}/{hb['total']})")
+        print(f"   ±1级准确: {hb['within_1_acc']:.1%} ({hb['within_1']}/{hb['total']})")
+        print(f"   MAE: {hb['mae']:.2f} 级")
+
+    # 4. Sunnybrook
+    sb = stats["sunnybrook"]
+    if sb["total"] > 0:
+        print(f"\n4. Sunnybrook评分:")
+        print(f"   样本数: {sb['total']}")
+        print(f"   MAE: {sb['mae']:.1f} 分")
+        print(f"   RMSE: {sb['rmse']:.1f} 分")
+        if sb["correlation"] is not None:
+            print(f"   Pearson相关系数: {sb['correlation']:.3f}")
+
+    print("=" * 70)
+
+
+def save_session_diagnosis_csv(session_records: List[Dict[str, Any]], output_path: Path):
+    """保存Session级诊断记录到CSV"""
+    if not session_records:
+        return
+
+    fieldnames = [
+        "exam_id",
+        "gt_has_palsy", "pred_has_palsy", "has_palsy_match",
+        "gt_palsy_side", "pred_palsy_side", "palsy_side_match",
+        "gt_hb_grade", "pred_hb_grade", "hb_diff",
+        "gt_sunnybrook", "pred_sunnybrook", "sunnybrook_error",
+        "pred_confidence", "pred_palsy_side_confidence",
+        "pred_resting_score", "pred_voluntary_score", "pred_synkinesis_score"
+    ]
+
+    rows = []
+    for r in session_records:
+        gt_hp = r.get("gt_has_palsy")
+        pred_hp = r.get("pred_has_palsy")
+        gt_side = r.get("gt_palsy_side")
+        pred_side = r.get("pred_palsy_side")
+        gt_hb = r.get("gt_hb_grade")
+        pred_hb = r.get("pred_hb_grade")
+        gt_sb = r.get("gt_sunnybrook")
+        pred_sb = r.get("pred_sunnybrook")
+
+        row = {
+            "exam_id": r.get("exam_id"),
+            "gt_has_palsy": gt_hp,
+            "pred_has_palsy": pred_hp,
+            "has_palsy_match": "✓" if gt_hp is not None and pred_hp is not None and bool(gt_hp) == bool(
+                pred_hp) else "✗",
+            "gt_palsy_side": gt_side,
+            "pred_palsy_side": pred_side,
+            "palsy_side_match": "✓" if gt_side == pred_side else (
+                "FN" if pred_side == 0 and gt_side != 0 else ("FP" if pred_side != 0 and gt_side == 0 else "✗")),
+            "gt_hb_grade": gt_hb,
+            "pred_hb_grade": pred_hb,
+            "hb_diff": abs(gt_hb - pred_hb) if gt_hb is not None and pred_hb is not None else None,
+            "gt_sunnybrook": gt_sb,
+            "pred_sunnybrook": pred_sb,
+            "sunnybrook_error": pred_sb - gt_sb if gt_sb is not None and pred_sb is not None else None,
+            "pred_confidence": r.get("pred_confidence"),
+            "pred_palsy_side_confidence": r.get("pred_palsy_side_confidence"),
+            "pred_resting_score": r.get("pred_resting_score"),
+            "pred_voluntary_score": r.get("pred_voluntary_score"),
+            "pred_synkinesis_score": r.get("pred_synkinesis_score"),
+        }
+        rows.append(row)
+
+    # 按exam_id排序
+    rows.sort(key=lambda x: x["exam_id"])
+
+    with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[OK] Session diagnosis CSV saved: {output_path}")
+
+
+def save_session_diagnosis_summary(stats: Dict[str, Any], output_path: Path):
+    """保存Session级诊断统计摘要到文件"""
+    if not stats:
+        return
+
+    lines = [
+        "=" * 70,
+        "Session级诊断预测准确率统计",
+        "=" * 70,
+        f"总检查数: {stats['total']}",
+        "",
+    ]
+
+    # 1. 是否面瘫
+    hp = stats["has_palsy"]
+    if hp["total"] > 0:
+        lines.append("1. 是否面瘫 (has_palsy):")
+        lines.append(f"   准确率: {hp['accuracy']:.1%} ({hp['correct']}/{hp['total']})")
+        lines.append("")
+
+    # 2. 面瘫侧别
+    ps = stats["palsy_side"]
+    if ps["total_palsy"] > 0:
+        lines.append("2. 面瘫侧别 (palsy_side):")
+        lines.append(f"   严格准确率: {ps['strict_acc']:.1%} ({ps['correct']}/{ps['total_palsy']})")
+        lines.append(f"   宽松准确率: {ps['relaxed_acc']:.1%} (含FN)")
+        lines.append(f"   详情: 正确={ps['correct']}, 错侧={ps['wrong_side']}, FN={ps['fn']}, FP={ps['fp']}")
+        lines.append("")
+
+    # 3. HB Grade
+    hb = stats["hb_grade"]
+    if hb["total"] > 0:
+        lines.append("3. HB分级 (hb_grade):")
+        lines.append(f"   精确匹配: {hb['exact_acc']:.1%} ({hb['exact_match']}/{hb['total']})")
+        lines.append(f"   ±1级准确: {hb['within_1_acc']:.1%} ({hb['within_1']}/{hb['total']})")
+        lines.append(f"   MAE: {hb['mae']:.2f} 级")
+        lines.append("")
+
+    # 4. Sunnybrook
+    sb = stats["sunnybrook"]
+    if sb["total"] > 0:
+        lines.append("4. Sunnybrook评分:")
+        lines.append(f"   样本数: {sb['total']}")
+        lines.append(f"   MAE: {sb['mae']:.1f} 分")
+        lines.append(f"   RMSE: {sb['rmse']:.1f} 分")
+        if sb["correlation"] is not None:
+            lines.append(f"   Pearson相关系数: {sb['correlation']:.3f}")
+        lines.append("")
+
+    lines.append("=" * 70)
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+
+    print(f"[OK] Session diagnosis summary saved: {output_path}")
 
 
 # =============================================================================
@@ -686,7 +1043,7 @@ def save_error_analysis(records: List[Dict[str, Any]], output_dir: Path):
              f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "=" * 80]
 
     for error_type, cases in error_cases.items():
-        lines.extend([f"\n\n{'='*40}", f"【{error_type}】 共 {len(cases)} 例", "=" * 40])
+        lines.extend([f"\n\n{'=' * 40}", f"【{error_type}】 共 {len(cases)} 例", "=" * 40])
 
         by_action = defaultdict(list)
         for c in cases:
@@ -1119,6 +1476,7 @@ def main():
     total_copied = 0
     total_skipped = 0
     all_palsy_records = []
+    all_session_records = []  # 新增：收集Session诊断记录
 
     print("=" * 60)
     print("开始收集关键帧和面瘫预测统计")
@@ -1126,19 +1484,24 @@ def main():
 
     for exam_dir in find_exam_dirs(SRC_ROOT):
         total_exam += 1
-        c, s, records = collect_one_exam(exam_dir)
+        c, s, records, session_record = collect_one_exam(exam_dir)  # 修改：解包4个值
         total_copied += c
         total_skipped += s
         all_palsy_records.extend(records)
 
+        # 收集Session诊断记录
+        if session_record:
+            all_session_records.append(session_record)
+
         if total_exam % 20 == 0:
-            print(f"[INFO] exams={total_exam}, records={len(all_palsy_records)}")
+            print(f"[INFO] exams={total_exam}, records={len(all_palsy_records)}, sessions={len(all_session_records)}")
 
     print(f"\n图片收集: exams={total_exam}, copied={total_copied}, skipped={total_skipped}")
+    print(f"Session诊断记录: {len(all_session_records)}")
 
-    # 计算统计
+    # ========== 动作级统计 ==========
     print("\n" + "=" * 60)
-    print("计算面瘫侧别预测统计...")
+    print("计算动作级面瘫侧别预测统计...")
     print("=" * 60)
 
     stats = compute_statistics(all_palsy_records)
@@ -1152,7 +1515,8 @@ def main():
             s = stats[action]
             strict_acc = f"{s['side_accuracy']:.1%}" if s['side_accuracy'] is not None else "N/A"
             relaxed_acc = f"{s['relaxed_accuracy']:.1%}" if s['relaxed_accuracy'] is not None else "N/A"
-            print(f"{action:<20} {s['total']:>5} {s['OK']:>5} {s['WRONG']:>6} {s['FN']:>4} {strict_acc:>8} {relaxed_acc:>8}")
+            print(
+                f"{action:<20} {s['total']:>5} {s['OK']:>5} {s['WRONG']:>6} {s['FN']:>4} {strict_acc:>8} {relaxed_acc:>8}")
 
     # 打印汇总
     print("-" * 65)
@@ -1164,13 +1528,23 @@ def main():
     if total_palsy > 0:
         overall_strict = total_ok / total_palsy
         overall_relaxed = (total_ok + total_fn) / total_palsy
-        print(f"{'TOTAL (excl.Neutral)':<20} {'-':>5} {total_ok:>5} {total_wrong:>6} {total_fn:>4} {overall_strict:>7.1%} {overall_relaxed:>8.1%}")
+        print(
+            f"{'TOTAL (excl.Neutral)':<20} {'-':>5} {total_ok:>5} {total_wrong:>6} {total_fn:>4} {overall_strict:>7.1%} {overall_relaxed:>8.1%}")
 
     print("\n说明:")
     print("  Strict  = OK / (OK + WRONG + FN)  -- 严格匹配")
     print("  Relaxed = (OK + FN) / (OK + WRONG + FN)  -- 宽松匹配 (预测对称也算正确)")
 
-    # 保存文件
+    # ========== Session级诊断统计（新增）==========
+    if all_session_records:
+        session_stats = compute_session_diagnosis_statistics(all_session_records)
+        print_session_diagnosis_statistics(session_stats)
+
+        # 保存Session诊断结果
+        save_session_diagnosis_csv(all_session_records, DST_ROOT / "session_diagnosis.csv")
+        save_session_diagnosis_summary(session_stats, DST_ROOT / "session_diagnosis_summary.txt")
+
+    # 保存动作级文件
     save_by_action_csv(all_palsy_records, DST_ROOT)
     save_all_records_csv(all_palsy_records, DST_ROOT / "palsy_all_records.csv")
     save_summary_csv(stats, DST_ROOT / "palsy_summary.csv")
@@ -1191,13 +1565,15 @@ def main():
     print("完成!")
     print("=" * 60)
     print(f"输出目录: {DST_ROOT}")
-    print(f"  - palsy_<Action>.csv      : 每个动作的基本预测")
-    print(f"  - palsy_all_records.csv   : 所有记录汇总")
-    print(f"  - palsy_summary.csv       : 统计摘要")
-    print(f"  - palsy_confusion.txt     : 混淆矩阵")
-    print(f"  - error_cases/            : 错误案例分析")
-    print(f"  - severity_summary.csv    : 严重度分数统计")
-    print(f"  - classified_images/      : 按结果分类的关键帧图片")
+    print(f"  - palsy_<Action>.csv        : 每个动作的基本预测")
+    print(f"  - palsy_all_records.csv     : 所有记录汇总")
+    print(f"  - palsy_summary.csv         : 统计摘要")
+    print(f"  - palsy_confusion.txt       : 混淆矩阵")
+    print(f"  - error_cases/              : 错误案例分析")
+    print(f"  - severity_summary.csv      : 严重度分数统计")
+    print(f"  - classified_images/        : 按结果分类的关键帧图片")
+    print(f"  - session_diagnosis.csv     : Session级诊断预测记录 (新增)")
+    print(f"  - session_diagnosis_summary.txt : Session级诊断统计摘要 (新增)")
 
 
 if __name__ == "__main__":

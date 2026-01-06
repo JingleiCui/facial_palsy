@@ -34,10 +34,11 @@ from clinical_base import (
     draw_palsy_side_label, compute_lip_midline_symmetry,
     compute_lip_midline_offset_from_face_midline,
 )
+from diagnosis_visualization import add_diagnosis_overlay, draw_diagnosis_badge
 import matplotlib
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 
 ACTION_NAME = "BlowCheek"
 ACTION_NAME_CN = "鼓腮"
@@ -288,15 +289,15 @@ def find_peak_frame(
     # ========== 使用统一阈值配置 ==========
     if THR is not None:
         if seal_thr is None:
-            seal_thr = THR.BLOW_CHEEK_SEAL
+            seal_thr = THR.MOUTH_SEAL
         if mouth_thr is None:
-            mouth_thr = THR.BLOW_CHEEK_MOUTH
+            mouth_thr = THR.MOUTH_HEIGHT
         if smooth_win is None:
             smooth_win = THR.BLOW_CHEEK_SMOOTH_WIN
         if inner_area_inc_thr is None:
-            inner_area_inc_thr = THR.BLOW_CHEEK_INNER_AREA_INC
+            inner_area_inc_thr = THR.MOUTH_INNER_AREA_INC
         if inner_area_base_eps is None:
-            inner_area_base_eps = THR.BLOW_CHEEK_INNER_AREA_BASE_EPS
+            inner_area_base_eps = THR.MOUTH_INNER_AREA_BASE_EPS
 
     n = len(landmarks_seq)
     if n == 0:
@@ -400,6 +401,7 @@ def find_peak_frame(
     left_delta = np.full(n, np.nan, dtype=np.float64)
     right_delta = np.full(n, np.nan, dtype=np.float64)
     mean_delta = np.full(n, np.nan, dtype=np.float64)
+    max_delta = np.full(n, np.nan, dtype=np.float64)
     score_raw = np.full(n, np.nan, dtype=np.float64)
 
     inner_area_norm_arr = np.full(n, np.nan, dtype=np.float64)
@@ -438,7 +440,7 @@ def find_peak_frame(
         # 闭唇：lip seal
         try:
             seal = compute_lip_seal_distance(lm, w, h)
-            seal_total = float(_get(seal, "total_distance", np.nan))
+            seal_total = float(_get(seal, "middle_distance", np.nan))
             if np.isfinite(seal_total) and np.isfinite(icd):
                 seal_norm_arr[i] = seal_total / icd
         except Exception:
@@ -472,7 +474,8 @@ def find_peak_frame(
 
             if np.isfinite(left_delta[i]) and np.isfinite(right_delta[i]):
                 mean_delta[i] = 0.5 * (left_delta[i] + right_delta[i])
-                score_raw[i] = mean_delta[i]
+                max_delta[i] = max(left_delta[i], right_delta[i])
+                score_raw[i] = max_delta[i]
 
     # =============== 平滑 score（避免抖动） ===============
     def _smooth_nan(x: np.ndarray, win: int):
@@ -637,7 +640,7 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=Non
         "mouth_width": mouth["width"],
         "mouth_height": mouth["height"],
         "lip_seal": lip_seal,
-        "lip_seal_total_distance": lip_seal["total_distance"],
+        "lip_seal_distance": lip_seal["middle_distance"],
         "midline_x": float(midline_x),
         "left_to_midline": float(left_to_midline),
         "right_to_midline": float(right_to_midline),
@@ -676,7 +679,7 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=Non
 
         metrics["baseline"] = {
             "mouth_width": baseline_mouth["width"],
-            "lip_seal_total": baseline_seal["total_distance"],
+            "lip_seal_total": baseline_seal["middle_distance"],
             "AOE": baseline_oral.AOE_angle,
             "BOF": baseline_oral.BOF_angle,
         }
@@ -687,8 +690,8 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=Non
         }
 
         scaled_width = mouth["width"] * scale
-        scaled_seal = lip_seal["total_distance"] * scale
-        metrics["seal_change"] = scaled_seal - baseline_seal["total_distance"]
+        scaled_seal = lip_seal["middle_distance"] * scale
+        metrics["seal_change"] = scaled_seal - baseline_seal["middle_distance"]
         metrics["mouth_width_change"] = scaled_width - baseline_mouth["width"]
 
         # ========== 计算嘴唇中线相对于面中线的偏移变化 ==========
@@ -967,7 +970,7 @@ def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: i
     cv2.putText(img, f"CheekDepth Mean: {md:+.4f}", (30, y),
                 FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
     y += LINE_HEIGHT
-    cv2.putText(img, f"LipSealDist: {metrics.get('lip_seal_total_distance', 0):.2f}px", (30, y),
+    cv2.putText(img, f"LipSealDist: {metrics.get('lip_seal_distance', 0):.2f}px", (30, y),
                 FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
     y += LINE_HEIGHT
 
@@ -1217,7 +1220,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
-    print(f"    [OK] {ACTION_NAME}: Lip Seal={metrics['lip_seal']['total_distance']:.1f}px")
+    print(f"    [OK] {ACTION_NAME}: Lip Seal={metrics['lip_seal']['middle_distance']:.1f}px")
     print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
     print(f"         Voluntary Score: {result.voluntary_movement_score}/5 ({interpretation})")
 

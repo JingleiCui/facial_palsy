@@ -41,6 +41,25 @@ from sunnybrook_scorer import (
     compute_sunnybrook_composite, SUNNYBROOK_EXPRESSION_MAPPING
 )
 
+from session_diagnosis import (
+    SessionDiagnosis,
+    compute_session_diagnosis,
+    sunnybrook_to_hb,
+    voluntary_to_severity,
+    compute_action_severity,
+    standardize_action_output,
+    HB_DESCRIPTIONS,
+    SEVERITY_DESCRIPTIONS,
+)
+
+from diagnosis_visualization import (
+    draw_diagnosis_badge,
+    draw_diagnosis_panel,
+    draw_palsy_indicator_on_face,
+    add_diagnosis_overlay,
+    DiagnosisColors,
+)
+
 from thresholds import THR
 
 # 导入动作模块
@@ -68,7 +87,7 @@ TARGET_EXAM_ID = None
 # 调试筛选：只分析特定患者/特定检查（其余跳过）
 # =============================================================================
 # 1) 只跑指定患者（常用）
-TARGET_PATIENT_IDS = []  # "XW000264", "XW000304", "XW000312"]
+TARGET_PATIENT_IDS = []
 
 # 2) 只跑指定检查ID（优先级更高）
 TARGET_EXAM_IDS = []
@@ -596,143 +615,43 @@ def _palsy_side_to_text(side_code: Any) -> str:
     return {0: "无", 1: "左", 2: "右"}.get(side_int, "无")
 
 
-def infer_palsy_and_side(action_results: Dict[str, ActionResult]) -> Dict[str, Any]:
+def compute_full_diagnosis(
+        action_results,
+        sunnybrook_score_obj
+):
     """
-    综合 11 个动作的"是否面瘫 + 患侧投票"。
+    计算完整的Session级诊断
 
-    优先使用每个动作模块的 palsy_detection 结果（保存在 action_specific 中），
-    这样可以确保报告和 indicators.json 的结果一致。
+    这是对 infer_palsy_and_side 的替换，整合了:
+    - 患侧投票
+    - Sunnybrook评分
+    - HB分级推导
+    - 一致性检查
 
-    返回结构直接给HTML使用：
-    - has_palsy / palsy_side / confidence
-    - left_score / right_score / votes / top_evidence
+    Returns:
+        SessionDiagnosis 对象
     """
-    weights = {
-        "SpontaneousEyeBlink": 1.0,
-        "VoluntaryEyeBlink": 1.1,
-        "CloseEyeSoftly": 1.4,
-        "CloseEyeHardly": 1.6,
-        "RaiseEyebrow": 1.0,
-        "Smile": 1.3,
-        "ShowTeeth": 1.3,
-        "LipPucker": 1.0,
-        "ShrugNose": 1.0,
-        "BlowCheek": 1.1,
-        "NeutralFace": 0.4,  # 静息只提示异常，不定向
-    }
+    from session_diagnosis import compute_session_diagnosis
 
-    def _clip01(x: float) -> float:
-        return float(max(0.0, min(1.0, x)))
-
-    def _vote_record(action: str, side: int, strength: float, region: str, reason: str, metric: Dict[str, Any] = None):
-        return {
-            "action": action,
-            "side": int(side),  # 0=中立,1=左弱,2=右弱
-            "side_text": _palsy_side_to_text(side) if side != 0 else "中立",
-            "strength": float(strength),
-            "weight": float(weights.get(action, 1.0)),
-            "region": str(region),
-            "reason": str(reason),
-            "metric": metric or {}
-        }
-
-    votes: List[Dict[str, Any]] = []
-
-    # ========== 优先使用各动作模块的 palsy_detection 结果 ==========
-    for act_name, res in action_results.items():
-        if not res or not res.action_specific:
-            continue
-
-        palsy_det = res.action_specific.get("palsy_detection", {})
-        if not palsy_det:
-            continue
-
-        palsy_side = palsy_det.get("palsy_side", 0)
-        confidence = palsy_det.get("confidence", 0.0)
-        method = palsy_det.get("method", "")
-        interpretation = palsy_det.get("interpretation", "")
-        evidence = palsy_det.get("evidence", {})
-
-        if palsy_side != 0 and confidence > 0.05:
-            # 根据动作类型确定区域
-            if act_name in ["SpontaneousEyeBlink", "VoluntaryEyeBlink", "CloseEyeSoftly", "CloseEyeHardly"]:
-                region = "眼"
-            elif act_name == "RaiseEyebrow":
-                region = "额"
-            elif act_name in ["Smile", "ShowTeeth"]:
-                region = "口"
-            elif act_name in ["ShrugNose", "BlowCheek", "LipPucker"]:
-                region = "中面"
-            elif act_name == "NeutralFace":
-                region = "静息"
-            else:
-                region = "其他"
-
-            votes.append(_vote_record(
-                act_name, palsy_side, confidence, region,
-                f"{method}: {interpretation}",
-                evidence
-            ))
-
-    # ========== 汇总 ==========
-    left_score = 0.0
-    right_score = 0.0
-    for v in votes:
-        w = float(v["weight"])
-        s = float(v["strength"])
-        if v["side"] == 1:
-            left_score += w * s
-        elif v["side"] == 2:
-            right_score += w * s
-
-    total = left_score + right_score
-    if total < 0.3:
-        has_palsy = False
-        palsy_side = 0
-        palsy_side_text = "无"
-        confidence = 1.0 - total
-    else:
-        has_palsy = True
-        if left_score > right_score * 1.2:
-            palsy_side = 1
-            palsy_side_text = "左"
-        elif right_score > left_score * 1.2:
-            palsy_side = 2
-            palsy_side_text = "右"
-        else:
-            palsy_side = 0
-            palsy_side_text = "不确定"
-        confidence = _clip01(abs(left_score - right_score) / max(total, 1e-9))
-
-    # 排序证据
-    votes_sorted = sorted(votes, key=lambda x: float(x["weight"]) * float(x["strength"]), reverse=True)
-    top_evidence = votes_sorted[:5]
-
-    return {
-        "has_palsy": has_palsy,
-        "palsy_side": palsy_side,
-        "palsy_side_text": palsy_side_text,
-        "confidence": confidence,
-        "left_score": left_score,
-        "right_score": right_score,
-        "votes": votes,
-        "top_evidence": top_evidence,
-    }
+    return compute_session_diagnosis(
+        action_results=action_results,
+        sunnybrook_score_obj=sunnybrook_score_obj
+    )
 
 
 def generate_html_report(exam_id: str, patient_id: str,
                          action_results: Dict[str, ActionResult],
                          sunnybrook: Optional[SunnybrookScore],
                          ground_truth: Dict[str, Any],
-                         prediction: Optional[Dict[str, Any]],
+                         diagnosis,
                          output_dir: Path) -> None:
     """生成详细HTML报告（含：Sunnybrook + 11动作综合投票与证据叠加图）"""
 
     action_name_map = {
-        "NeutralFace": "静息面",
+        "NeutralFace": "静息",
         "SpontaneousEyeBlink": "自然眨眼",
         "VoluntaryEyeBlink": "自主眨眼",
-        "CloseEyeSoftly": "轻闭眼",
+        "CloseEyeSoftly": "轻轻闭眼",
         "CloseEyeHardly": "用力闭眼",
         "RaiseEyebrow": "皱额/抬眉",
         "Smile": "微笑",
@@ -742,249 +661,312 @@ def generate_html_report(exam_id: str, patient_id: str,
         "LipPucker": "撅嘴",
     }
 
-    open_mouth_used = "ShowTeeth" if "ShowTeeth" in action_results else "Smile"
-    voluntary_used_effective = {"RaiseEyebrow", "CloseEyeSoftly", open_mouth_used, "ShrugNose", "LipPucker"}
-    syn_used_effective = voluntary_used_effective.copy()
-
-    action_focus = {
-        "NeutralFace": "静息对称性与基线：睑裂、鼻唇沟、口角下垂/偏斜等。",
-        "SpontaneousEyeBlink": "自然眨眼是否完整/对称；是否伴随口部联动。",
-        "VoluntaryEyeBlink": "自主眨眼启动能力与闭合幅度对称性；联动表现。",
-        "CloseEyeSoftly": "轻闭眼闭合不全（滞睑/轻度无力）最敏感。",
-        "CloseEyeHardly": "用力闭眼反映眼轮匝肌力量，常用于区分中重度。",
-        "RaiseEyebrow": "额肌功能：抬眉幅度左右差异，反映上面部运动。",
-        "Smile": "口角牵拉/上抬幅度左右差异，反映下/中面部运动。",
-        "ShrugNose": "鼻翼/鼻唇沟牵拉幅度左右差异，反映中面部运动与联动。",
-        "ShowTeeth": "露齿微笑（Sunnybrook的OpenMouthSmile）：口角牵拉与上唇提升。",
-        "BlowCheek": "闭唇与鼓腮充气能力（漏气/一侧塌陷）；辅助下脸评估。",
-        "LipPucker": "口轮匝肌收缩（撅嘴）对称性；口角偏斜/下垂可作为弱证据。",
-    }
-
-    vote_by_action: Dict[str, Dict[str, Any]] = {}
-    if prediction and isinstance(prediction.get("votes"), list):
-        for v in prediction["votes"]:
-            act = v.get("action")
-            if not act:
-                continue
-            score = float(v.get("weight", 1.0)) * float(v.get("strength", 0.0))
-            if act not in vote_by_action or score > float(vote_by_action[act].get("_score", -1.0)):
-                v2 = dict(v)
-                v2["_score"] = score
-                vote_by_action[act] = v2
-
+    # Ground Truth
     gt_has = "是" if int(ground_truth.get("has_palsy", 0) or 0) == 1 else "否"
     gt_side_code = ground_truth.get("palsy_side", 0)
-    gt_side_text = _palsy_side_to_text(gt_side_code)
+    gt_side_text = {0: "无", 1: "左", 2: "右"}.get(gt_side_code, "无")
+    gt_hb = ground_truth.get('hb_grade', '—')
+    gt_sb = ground_truth.get('sunnybrook_score', '—')
 
-    pred_has = "—"
-    pred_side_text = "—"
-    pred_conf = "—"
-    pred_left = 0.0
-    pred_right = 0.0
-    pred_top = []
-    if prediction:
-        pred_has = "是" if prediction.get("has_palsy") else "否"
-        pred_side_text = prediction.get("palsy_side_text", "无")
-        pred_conf = f"{float(prediction.get('confidence', 0.0)):.2f}"
-        pred_left = float(prediction.get("left_score", 0.0))
-        pred_right = float(prediction.get("right_score", 0.0))
-        pred_top = prediction.get("top_evidence", []) or []
+    # Prediction (from SessionDiagnosis)
+    if diagnosis:
+        pred_has = "是" if diagnosis.has_palsy else "否"
+        pred_side = diagnosis.palsy_side
+        pred_side_text = diagnosis.palsy_side_text
+        pred_hb = diagnosis.hb_grade
+        pred_hb_desc = diagnosis.hb_description
+        pred_sb = diagnosis.sunnybrook_score
+        pred_conf = diagnosis.confidence
+        pred_left = diagnosis.left_score
+        pred_right = diagnosis.right_score
+        top_evidence = diagnosis.top_evidence
+        checks = diagnosis.consistency_checks
+        adjustments = diagnosis.adjustments_made
+        interpretation = diagnosis.interpretation
+    else:
+        pred_has = "—"
+        pred_side_text = "—"
+        pred_hb = "—"
+        pred_hb_desc = ""
+        pred_sb = "—"
+        pred_conf = 0
+        pred_left = 0
+        pred_right = 0
+        top_evidence = []
+        checks = []
+        adjustments = []
+        interpretation = ""
 
-    def _collect_extra_synkinesis():
-        extras = []
-        for act, r in action_results.items():
-            if act == "NeutralFace":
-                continue
-            if act in syn_used_effective:
-                continue
-            if not getattr(r, "synkinesis_scores", None):
-                continue
-            eye = int(r.synkinesis_scores.get("eye_synkinesis", 0) or 0)
-            mouth = int(r.synkinesis_scores.get("mouth_synkinesis", 0) or 0)
-            total = max(eye, mouth)
-            if total <= 0:
-                continue
-            extras.append((act, eye, mouth, total))
-        extras.sort(key=lambda x: x[3], reverse=True)
-        return extras
+    # 比较结果
+    def _match_badge(pred, gt, label):
+        if pred == "—" or gt == "—":
+            return f'<span class="badge badge-gray">{label}: ?</span>'
+        elif str(pred) == str(gt):
+            return f'<span class="badge badge-green">{label}: ✓</span>'
+        else:
+            return f'<span class="badge badge-red">{label}: ✗</span>'
 
-    extra_syn = _collect_extra_synkinesis()
+    match_palsy = _match_badge(pred_has, gt_has, "面瘫")
+    match_side = _match_badge(pred_side_text, gt_side_text, "患侧")
+    match_hb = _match_badge(str(pred_hb) if pred_hb != "—" else "—", str(gt_hb), "HB")
 
-    def _bar(value: float, max_value: float) -> str:
+    # 进度条辅助函数
+    def _bar(value, max_value, color="#e74c3c"):
         v = max(0.0, float(value))
         mv = max(1e-9, float(max_value))
         pct = max(0.0, min(100.0, 100.0 * v / mv))
-        return f'<div class="bar"><div class="barfill" style="width:{pct:.1f}%"></div></div>'
+        return f'<div class="bar"><div class="barfill" style="width:{pct:.1f}%; background:{color}"></div></div>'
 
     html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>面部指标分析报告 - {exam_id}</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 1600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }}
-        h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-        h2 {{ color: #34495e; margin-top: 30px; }}
-        .summary {{ background: #ecf0f1; padding: 15px; border-radius: 8px; margin: 15px 0; }}
-        .metric-box {{ display: inline-block; background: #3498db; color: white; padding: 10px 15px; border-radius: 6px; margin: 5px; }}
-        table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
-        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
-        th {{ background: #3498db; color: white; }}
-        .action-section {{ background: #fafafa; border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; margin: 15px 0; }}
-        .images {{ display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-start; }}
-        .images img {{ max-width: 480px; border-radius: 6px; border: 1px solid #ddd; }}
-        .tip {{ background: #fff8e1; border-left: 5px solid #f1c40f; padding: 10px; margin: 10px 0; }}
-        .bar {{ width: 260px; height: 12px; background: #e5e7eb; border-radius: 10px; overflow: hidden; display: inline-block; vertical-align: middle; }}
-        .barfill {{ height: 100%; background: #e74c3c; }}
-        .small {{ font-size: 12px; color: #555; }}
-        .tag {{ display:inline-block; padding:2px 8px; border-radius: 10px; background:#eef2ff; margin-left:6px; font-size: 12px; }}
-    </style>
-</head>
-<body>
-<div class="container">
-    <h1>🏥 面部指标分析报告</h1>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>面部指标分析报告 - {exam_id}</title>
+        <style>
+            body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 20px; background: #f0f2f5; }}
+            .container {{ max-width: 1600px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+            h1 {{ color: #1a365d; border-bottom: 3px solid #3182ce; padding-bottom: 12px; }}
+            h2 {{ color: #2c5282; margin-top: 35px; border-left: 4px solid #3182ce; padding-left: 12px; }}
+            h3 {{ color: #4a5568; }}
 
-    <div class="summary">
-        <div><b>检查ID:</b> {exam_id}</div>
-        <div><b>患者ID:</b> {patient_id}</div>
-        <div><b>分析时间:</b> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
-        <div><b>处理动作数:</b> {len(action_results)}</div>
-    </div>
+            /* 诊断卡片 */
+            .diagnosis-card {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 12px; padding: 25px; margin: 20px 0; }}
+            .diagnosis-card h2 {{ color: white; border: none; margin-top: 0; }}
+            .diagnosis-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-top: 20px; }}
+            .metric-card {{ background: rgba(255,255,255,0.15); border-radius: 10px; padding: 18px; text-align: center; backdrop-filter: blur(5px); }}
+            .metric-label {{ font-size: 13px; opacity: 0.9; margin-bottom: 8px; }}
+            .metric-value {{ font-size: 28px; font-weight: bold; }}
+            .metric-sub {{ font-size: 12px; opacity: 0.8; margin-top: 5px; }}
 
-    <h2>📋 医生标注 (Ground Truth)</h2>
-    <div class="summary">
-        <div class="metric-box">面瘫: {gt_has}</div>
-        <div class="metric-box">患侧: {gt_side_code} ({gt_side_text})</div>
-        <div class="metric-box">HB分级: {ground_truth.get('hb_grade', '—')}</div>
-        <div class="metric-box">Sunnybrook评分: {ground_truth.get('sunnybrook_score', '—')}</div>
-    </div>
+            /* 比较区域 */
+            .comparison {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0; }}
+            .compare-box {{ background: #f7fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 20px; }}
+            .compare-box h3 {{ margin-top: 0; color: #2d3748; }}
+            .compare-box.ground-truth {{ border-left: 4px solid #38a169; }}
+            .compare-box.prediction {{ border-left: 4px solid #3182ce; }}
 
-    <h2>🧠 综合判定（11动作投票 + 证据叠加图）</h2>
-    <div class="summary">
-        <div class="metric-box">预测面瘫: {pred_has}</div>
-        <div class="metric-box">预测患侧: {pred_side_text}</div>
-        <div class="metric-box">置信度: {pred_conf}</div>
-        <div style="margin-top:10px;">
-            <div><b>左侧累计证据:</b> {pred_left:.2f} {_bar(pred_left, max(pred_left, pred_right, 1.0))}</div>
-            <div><b>右侧累计证据:</b> {pred_right:.2f} {_bar(pred_right, max(pred_left, pred_right, 1.0))}</div>
-            <div class="small">说明：证据来自10个运动动作的"方向+强度+权重"投票；静息仅用于异常提示，不强行定向。</div>
+            /* 徽章 */
+            .badge {{ display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; margin: 3px; }}
+            .badge-green {{ background: #c6f6d5; color: #22543d; }}
+            .badge-red {{ background: #fed7d7; color: #822727; }}
+            .badge-gray {{ background: #e2e8f0; color: #4a5568; }}
+            .badge-blue {{ background: #bee3f8; color: #2a4365; }}
+            .badge-yellow {{ background: #fefcbf; color: #744210; }}
+
+            /* 证据条 */
+            .bar {{ width: 200px; height: 12px; background: #e2e8f0; border-radius: 6px; overflow: hidden; display: inline-block; vertical-align: middle; }}
+            .barfill {{ height: 100%; background: #e53e3e; transition: width 0.3s; }}
+
+            /* 一致性检查 */
+            .check-list {{ list-style: none; padding: 0; }}
+            .check-list li {{ padding: 8px 12px; margin: 5px 0; border-radius: 6px; display: flex; align-items: center; }}
+            .check-list li.passed {{ background: #f0fff4; border-left: 3px solid #38a169; }}
+            .check-list li.failed {{ background: #fff5f5; border-left: 3px solid #e53e3e; }}
+            .check-list li.warning {{ background: #fffaf0; border-left: 3px solid #dd6b20; }}
+            .check-icon {{ margin-right: 10px; font-size: 16px; }}
+
+            /* 表格 */
+            table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
+            th, td {{ border: 1px solid #e2e8f0; padding: 10px; text-align: center; }}
+            th {{ background: #3182ce; color: white; }}
+            tr:nth-child(even) {{ background: #f7fafc; }}
+
+            /* 动作卡片 */
+            .action-section {{ background: #fafafa; border: 1px solid #e2e8f0; border-radius: 10px; padding: 20px; margin: 20px 0; }}
+            .action-section:hover {{ box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
+            .images {{ display: flex; gap: 12px; flex-wrap: wrap; justify-content: flex-start; margin-top: 15px; }}
+            .images img {{ max-width: 480px; border-radius: 8px; border: 1px solid #e2e8f0; }}
+
+            /* 提示框 */
+            .tip {{ background: #fffff0; border-left: 4px solid #ecc94b; padding: 12px 15px; margin: 15px 0; border-radius: 0 6px 6px 0; }}
+            .tip.info {{ background: #ebf8ff; border-color: #3182ce; }}
+            .tip.warning {{ background: #fffaf0; border-color: #dd6b20; }}
+            .tip.error {{ background: #fff5f5; border-color: #e53e3e; }}
+
+            /* 解释文本 */
+            .interpretation {{ background: #f7fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; white-space: pre-line; font-family: monospace; font-size: 13px; }}
+
+            .small {{ font-size: 12px; color: #718096; }}
+            .tag {{ display: inline-block; padding: 2px 8px; border-radius: 12px; background: #ebf4ff; margin-left: 6px; font-size: 11px; color: #3182ce; }}
+
+            /* 响应式 */
+            @media (max-width: 768px) {{
+                .comparison {{ grid-template-columns: 1fr; }}
+                .diagnosis-grid {{ grid-template-columns: repeat(2, 1fr); }}
+            }}
+        </style>
+    </head>
+    <body>
+    <div class="container">
+        <h1>🏥 面瘫智能评估报告</h1>
+
+        <div style="background: #f7fafc; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+            <div><b>检查ID:</b> {exam_id}</div>
+            <div><b>患者ID:</b> {patient_id}</div>
+            <div><b>分析时间:</b> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
+            <div><b>处理动作数:</b> {len(action_results)}</div>
         </div>
-    </div>
 
-    <div class="tip">
-        <b>Top 证据（按权重×强度排序）</b><br/>
-        {"".join([f"• {action_name_map.get(e.get('action', ''), e.get('action', ''))}：{e.get('side_text', '')}（{e.get('region', '')}）— {e.get('reason', '')}<br/>" for e in pred_top]) if pred_top else "暂无（未提供综合投票结果）"}
-    </div>
+        <!-- ==================== Session诊断摘要卡片 ==================== -->
+        <div class="diagnosis-card">
+            <h2>🎯 Session诊断结果</h2>
+            <div class="diagnosis-grid">
+                <div class="metric-card">
+                    <div class="metric-label">面瘫判定</div>
+                    <div class="metric-value">{pred_has}</div>
+                    <div class="metric-sub">置信度: {pred_conf:.0%}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">患侧</div>
+                    <div class="metric-value">{pred_side_text}</div>
+                    <div class="metric-sub">L:{pred_left:.2f} R:{pred_right:.2f}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">HB分级</div>
+                    <div class="metric-value">Grade {pred_hb}</div>
+                    <div class="metric-sub">{pred_hb_desc.split('(')[0] if pred_hb_desc else ''}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Sunnybrook</div>
+                    <div class="metric-value">{pred_sb}</div>
+                    <div class="metric-sub">{diagnosis.voluntary_score if diagnosis else 0} - {diagnosis.resting_score if diagnosis else 0} - {diagnosis.synkinesis_score if diagnosis else 0}</div>
+                </div>
+            </div>
+        </div>
 
-    <h2>🧾 动作清单与用途</h2>
-    <table>
-        <tr><th>动作</th><th>中文</th><th>参与Resting</th><th>参与Voluntary(5项)</th><th>参与Synkinesis(5项)</th><th>关注点</th></tr>
-        {"".join([
-        f"<tr>"
-        f"<td>{a}</td>"
-        f"<td>{action_name_map.get(a, a)}</td>"
-        f"<td>{'✓' if a == 'NeutralFace' else ''}</td>"
-        f"<td>{'✓' if a in voluntary_used_effective else ''}</td>"
-        f"<td>{'✓' if a in syn_used_effective else ''}</td>"
-        f"<td style='text-align:left'>{action_focus.get(a, '')}</td>"
-        f"</tr>"
-        for a in action_name_map.keys()
-    ])}
-    </table>
+        <!-- ==================== GT vs Prediction 比较 ==================== -->
+        <h2>📊 Ground Truth vs Prediction</h2>
+        <div class="comparison">
+            <div class="compare-box ground-truth">
+                <h3>📋 医生标注 (Ground Truth)</h3>
+                <table>
+                    <tr><td><b>面瘫</b></td><td>{gt_has}</td></tr>
+                    <tr><td><b>患侧</b></td><td>{gt_side_code} ({gt_side_text})</td></tr>
+                    <tr><td><b>HB分级</b></td><td>{gt_hb}</td></tr>
+                    <tr><td><b>Sunnybrook</b></td><td>{gt_sb}</td></tr>
+                </table>
+            </div>
+            <div class="compare-box prediction">
+                <h3>🤖 系统预测 (Prediction)</h3>
+                <table>
+                    <tr><td><b>面瘫</b></td><td>{pred_has}</td></tr>
+                    <tr><td><b>患侧</b></td><td>{pred_side} ({pred_side_text})</td></tr>
+                    <tr><td><b>HB分级</b></td><td>{pred_hb}</td></tr>
+                    <tr><td><b>Sunnybrook</b></td><td>{pred_sb}</td></tr>
+                </table>
+            </div>
+        </div>
 
-    <div class="tip small">
-        Sunnybrook正式统计只使用：Resting(静息1项) + Voluntary(5项) + Synkinesis(5项)。
-        本报告会把其余录制动作（眨眼/用力闭眼/鼓腮等）全部展示出来，但会明确标注"未参与Sunnybrook计分"。
-    </div>
+        <div style="text-align: center; margin: 15px 0;">
+            <b>匹配结果:</b> {match_palsy} {match_side} {match_hb}
+        </div>
 
-    <h2>📊 Sunnybrook 面神经分级评分</h2>
-"""
+        <!-- ==================== 一致性检查 ==================== -->
+        <h2>✅ 一致性检查</h2>
+        <ul class="check-list">
+    """
 
+    # 添加一致性检查结果
+    for check in checks:
+        status_class = "passed" if check.passed else ("warning" if check.severity == "warning" else "failed")
+        icon = "✓" if check.passed else ("⚠" if check.severity == "warning" else "✗")
+        html += f'<li class="{status_class}"><span class="check-icon">{icon}</span><b>{check.rule_name}:</b> {check.message}</li>'
+
+    if not checks:
+        html += '<li class="passed"><span class="check-icon">✓</span>所有一致性检查通过</li>'
+
+    html += """
+        </ul>
+    """
+
+    # 如果有调整，显示调整说明
+    if adjustments:
+        html += '<div class="tip warning"><b>已做出的调整:</b><ul>'
+        for adj in adjustments:
+            html += f'<li>{adj}</li>'
+        html += '</ul></div>'
+
+    # 诊断解释
+    if interpretation:
+        html += f"""
+        <h2>📝 诊断解释</h2>
+        <div class="interpretation">{interpretation}</div>
+    """
+
+    # 证据投票
+    html += """
+        <h2>🗳️ 动作投票证据</h2>
+        <div style="margin-bottom: 15px;">
+            <div><b>左侧累计证据:</b> {pred_left:.2f} {_bar(pred_left, max(pred_left, pred_right, 1.0), '#3182ce')}</div>
+            <div><b>右侧累计证据:</b> {pred_right:.2f} {_bar(pred_right, max(pred_left, pred_right, 1.0), '#e53e3e')}</div>
+        </div>
+    """
+
+    # Top证据
+    if top_evidence:
+        html += """
+        <div class="tip info">
+            <b>Top 5 证据:</b><br/>
+    """
+        for i, e in enumerate(top_evidence[:5]):
+            html += f'<span class="badge badge-blue">{i + 1}</span> {e.action_cn} ({e.region}): {e.side_text}侧弱, 权重×置信={e.weighted_score:.2f}<br/>'
+        html += '</div>'
+
+    # Sunnybrook详细评分
     if sunnybrook:
         html += f"""
-    <div class="summary">
-        <div class="metric-box">Resting Symmetry: {sunnybrook.resting_score}</div>
-        <div class="metric-box">Voluntary Movement: {sunnybrook.voluntary_score}</div>
-        <div class="metric-box">Synkinesis: {sunnybrook.synkinesis_score}</div>
-        <div class="metric-box">Composite: {sunnybrook.composite_score}</div>
-        <div class="metric-box">Grade {sunnybrook.grade}: {sunnybrook.grade_description}</div>
-        <div class="small">公式: Composite = Voluntary({sunnybrook.voluntary_score}) - Resting({sunnybrook.resting_score}) - Synkinesis({sunnybrook.synkinesis_score}) = {sunnybrook.composite_score}</div>
-    </div>
+        <h2>📊 Sunnybrook详细评分</h2>
+        <div style="background: #f7fafc; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+            <span class="badge badge-blue">Resting: {sunnybrook.resting_score}</span>
+            <span class="badge badge-green">Voluntary: {sunnybrook.voluntary_score}</span>
+            <span class="badge badge-yellow">Synkinesis: {sunnybrook.synkinesis_score}</span>
+            <span class="badge" style="background: #667eea; color: white;">Composite: {sunnybrook.composite_score}</span>
+            <div class="small" style="margin-top: 10px;">公式: {sunnybrook.voluntary_score} - {sunnybrook.resting_score} - {sunnybrook.synkinesis_score} = {sunnybrook.composite_score}</div>
+        </div>
 
-    <h2>1️⃣ Resting Symmetry (静息对称性)</h2>
-    <table>
-        <tr><th>部位</th><th>状态</th><th>测量值</th><th>评分</th><th>说明</th></tr>
-        {"".join([
-            f"<tr>"
-            f"<td>{it.region_cn}</td>"
-            f"<td>{it.status_cn}</td>"
-            f"<td>{(f'{it.measurement:.1f}°' if it.region == 'Mouth' else f'{it.measurement:.3f}')}</td>"
-            f"<td class='score-{it.score}'>{it.score}</td>"
-            f"<td>{it.threshold_info}</td>"
-            f"</tr>"
-            for it in (
-                sunnybrook.resting_symmetry.eye,
-                sunnybrook.resting_symmetry.cheek,
-                sunnybrook.resting_symmetry.mouth
-            )
-        ])}
-        <tr>
-          <td colspan="5">
-            <b>Total (Raw Score × 5):</b>
-            {sunnybrook.resting_symmetry.raw_score} × 5 = {sunnybrook.resting_symmetry.total_score}
-            （判断患侧: {sunnybrook.resting_symmetry.affected_side}）
-          </td>
-        </tr>
-    </table>
+        <h3>1️⃣ Resting Symmetry (静息对称性)</h3>
+        <table>
+            <tr><th>部位</th><th>状态</th><th>测量值</th><th>评分</th></tr>
+    """
+        for it in [sunnybrook.resting_symmetry.eye, sunnybrook.resting_symmetry.cheek,
+                   sunnybrook.resting_symmetry.mouth]:
+            html += f"<tr><td>{it.region_cn}</td><td>{it.status_cn}</td><td>{it.measurement:.3f}</td><td>{it.score}</td></tr>"
+        html += f"""
+            <tr><td colspan="4"><b>Total:</b> {sunnybrook.resting_symmetry.raw_score} × 5 = {sunnybrook.resting_symmetry.total_score}</td></tr>
+        </table>
 
-    <h2>2️⃣ Symmetry of Voluntary Movement (主动运动对称性)</h2>
-    <div class="tip small">
-        计分只使用5个动作：抬眉、轻闭眼、露齿微笑（ShowTeeth优先）、皱鼻、撅嘴。其余运动动作（眨眼、用力闭眼、鼓腮等）仅展示，不参与Sunnybrook分数。
-    </div>
-    <table>
-        <tr><th>表情</th><th>对应动作</th><th>左侧测量</th><th>右侧测量</th><th>比值</th><th>评分 (1-5)</th></tr>
-        {"".join([f"<tr><td>{it.expression_cn}</td><td>{it.expression}</td><td>{it.left_value:.3f}</td><td>{it.right_value:.3f}</td><td>{it.ratio:.3f}</td><td>{it.score}</td></tr>" for it in sunnybrook.voluntary_movement.items])}
-        <tr><td colspan="6"><b>Total (Sum × 4):</b> {sunnybrook.voluntary_movement.raw_sum} × 4 = {sunnybrook.voluntary_movement.total_score}</td></tr>
-    </table>
+        <h3>2️⃣ Voluntary Movement (主动运动)</h3>
+        <table>
+            <tr><th>表情</th><th>左侧</th><th>右侧</th><th>比值</th><th>评分</th></tr>
+    """
+        for it in sunnybrook.voluntary_movement.items:
+            html += f"<tr><td>{it.expression_cn}</td><td>{it.left_value:.3f}</td><td>{it.right_value:.3f}</td><td>{it.ratio:.3f}</td><td>{it.score}</td></tr>"
+        html += f"""
+            <tr><td colspan="5"><b>Total:</b> {sunnybrook.voluntary_movement.raw_sum} × 4 = {sunnybrook.voluntary_movement.total_score}</td></tr>
+        </table>
 
-    <h2>3️⃣ Synkinesis (联动运动)</h2>
-    <div class="tip small">
-        Sunnybrook正式联动分数只统计5项（与Voluntary相同）。下面会额外展示其它动作的联动检测结果，但不计入0-15总分。
-    </div>
-    <table>
-        <tr><th>表情</th><th>眼部联动</th><th>嘴部联动</th><th>单项总分(0-3)</th></tr>
-        {"".join([f"<tr><td>{it.expression_cn}</td><td>{it.eye_synkinesis}</td><td>{it.mouth_synkinesis}</td><td>{it.total_score}</td></tr>" for it in sunnybrook.synkinesis.items])}
-        <tr><td colspan="4"><b>Total:</b> {sunnybrook.synkinesis_score} (0-15)</td></tr>
-    </table>
-"""
-        if extra_syn:
-            html += """
-    <h3>扩展联动结果（不计入Sunnybrook）</h3>
-    <table>
-        <tr><th>动作</th><th>眼部联动</th><th>嘴部联动</th><th>单项总分(0-3)</th></tr>
-"""
-            for act, eye, mouth, total in extra_syn:
-                html += f"<tr><td>{action_name_map.get(act, act)}</td><td>{eye}</td><td>{mouth}</td><td>{total}</td></tr>"
-            html += "</table>"
-    else:
-        html += '<div class="tip">未能计算Sunnybrook评分（缺少NeutralFace或关键动作结果）。</div>'
+        <h3>3️⃣ Synkinesis (联动运动)</h3>
+        <table>
+            <tr><th>表情</th><th>眼联动</th><th>嘴联动</th><th>评分</th></tr>
+    """
+        for it in sunnybrook.synkinesis.items:
+            html += f"<tr><td>{it.expression_cn}</td><td>{it.eye_synkinesis}</td><td>{it.mouth_synkinesis}</td><td>{it.total_score}</td></tr>"
+        html += f"""
+            <tr><td colspan="4"><b>Total:</b> {sunnybrook.synkinesis_score}</td></tr>
+        </table>
+    """
 
-    html += "<h2>📹 各动作详细分析</h2>"
+    # 各动作详细分析
+    html += """
+        <h2>📹 各动作详细分析</h2>
+    """
 
     action_order = [
-        "NeutralFace",
-        "SpontaneousEyeBlink",
-        "VoluntaryEyeBlink",
-        "CloseEyeSoftly",
-        "CloseEyeHardly",
-        "RaiseEyebrow",
-        "Smile",
-        "ShrugNose",
-        "ShowTeeth",
-        "BlowCheek",
-        "LipPucker",
+        "NeutralFace", "SpontaneousEyeBlink", "VoluntaryEyeBlink",
+        "CloseEyeSoftly", "CloseEyeHardly", "RaiseEyebrow",
+        "Smile", "ShrugNose", "ShowTeeth", "BlowCheek", "LipPucker",
     ]
+
     for action_name in action_order:
         if action_name not in action_results:
             continue
@@ -992,69 +974,64 @@ def generate_html_report(exam_id: str, patient_id: str,
         cn = action_name_map.get(action_name, action_name)
         action_dir = output_dir / action_name
 
-        v = vote_by_action.get(action_name)
-        if v:
-            vote_line = (
-                f"本动作投票：{v.get('side_text', '中立')} <span class='tag'>{v.get('region', '')}</span> "
-                f"强度={float(v.get('strength', 0.0)):.2f} 权重={float(v.get('weight', 1.0)):.2f}<br/>"
-                f"<span class='small'>{v.get('reason', '')}</span>"
-            )
-        else:
-            vote_line = "本动作投票：—（无/中立）"
+        # 获取动作的诊断信息
+        action_spec = getattr(result, 'action_specific', {}) or {}
+        palsy_det = action_spec.get('palsy_detection', {})
+        act_palsy_side = palsy_det.get('palsy_side', 0)
+        act_confidence = palsy_det.get('confidence', 0)
+        act_severity = action_spec.get('severity_score', 0)
+        act_voluntary = action_spec.get('voluntary_score', result.voluntary_movement_score or 0)
 
-        def _img_tag(rel_path: str, alt: str) -> str:
+        palsy_text = {0: "Symmetric", 1: "Left Palsy", 2: "Right Palsy"}.get(act_palsy_side, "Unknown")
+        palsy_badge_class = "badge-green" if act_palsy_side == 0 else "badge-red"
+
+        def _img_tag(rel_path, alt):
             p = action_dir / rel_path
             if p.exists():
                 return f'<img src="{action_name}/{rel_path}" alt="{alt}"/>'
             return ""
 
-        raw_img = _img_tag("peak_raw.jpg", "原始帧")
-        ind_img = _img_tag("peak_indicators.jpg", "指标可视化")
-        rest_img = _img_tag("resting_symmetry.jpg", "Resting Symmetry")
-        ear_curve = _img_tag("ear_curve.png", "EAR曲线")
-        eye_curve = _img_tag("eye_curve.png", "眼睛曲线")
-        cheek_curve = _img_tag("cheek_curve.png", "鼓腮曲线")
-        brow_curve = _img_tag("brow_curve.png", "眉眼距曲线")
-
-        oral_asym = result.oral_angle.angle_asymmetry if result.oral_angle else 0.0
-
         html += f"""
-    <div class="action-section">
-        <h3>{action_name} - {cn}</h3>
-        <div class="tip">{vote_line}</div>
-        <table>
-            <tr><th>指标</th><th>数值</th></tr>
-            <tr><td>峰值帧</td><td>{result.peak_frame_idx} / {result.total_frames}</td></tr>
-            <tr><td>ICD</td><td>{(result.icd or 0.0):.1f}px</td></tr>
-            <tr><td>EAR Left / Right</td><td>{(result.left_ear or 0.0):.4f} / {(result.right_ear or 0.0):.4f}</td></tr>
-            <tr><td>Eye Area Left / Right</td><td>{(result.left_eye_area or 0.0):.1f}px² / {(result.right_eye_area or 0.0):.1f}px²</td></tr>
-            <tr><td>Eye Area Ratio</td><td>{(result.eye_area_ratio or 0.0):.3f}</td></tr>
-            <tr><td>Palpebral H Ratio</td><td>{(result.palpebral_height_ratio or 0.0):.3f}</td></tr>
-            <tr><td>Brow H Ratio</td><td>{(result.brow_height_ratio or 0.0):.3f}</td></tr>
-            <tr><td>Mouth Width</td><td>{(result.mouth_width or 0.0):.1f}px</td></tr>
-            <tr><td>NLF Ratio</td><td>{(result.nlf_ratio or 0.0):.3f}</td></tr>
-            <tr><td>AOE/BOF (Right/Left)</td><td>{(result.oral_angle.AOE_angle if result.oral_angle else 0.0):+.2f}° / {(result.oral_angle.BOF_angle if result.oral_angle else 0.0):+.2f}°</td></tr>
-            <tr><td>Oral Asymmetry</td><td>{oral_asym:.2f}°</td></tr>
-            <tr><td>Voluntary Score</td><td>{result.voluntary_movement_score or 0}/5 {"<span class='tag'>计分动作</span>" if action_name in voluntary_used_effective else "<span class='tag'>展示</span>"}</td></tr>
-        </table>
-
-        <div class="images">
-            {raw_img}
-            {ind_img}
-            {brow_curve}
-            {ear_curve}
-            {eye_curve}
-            {cheek_curve}
-            {rest_img}
+        <div class="action-section">
+            <h3>{action_name} - {cn}</h3>
+            <div style="margin-bottom: 10px;">
+                <span class="badge {palsy_badge_class}">{palsy_text}</span>
+                <span class="badge badge-blue">Severity: {act_severity}/5</span>
+                <span class="badge badge-yellow">Voluntary: {act_voluntary}/5</span>
+                <span class="small">Confidence: {act_confidence:.0%}</span>
+            </div>
+            <table>
+                <tr><th>指标</th><th>数值</th><th>指标</th><th>数值</th></tr>
+                <tr>
+                    <td>峰值帧</td><td>{result.peak_frame_idx}/{result.total_frames}</td>
+                    <td>ICD</td><td>{(result.icd or 0):.1f}px</td>
+                </tr>
+                <tr>
+                    <td>EAR Left</td><td>{(result.left_ear or 0):.4f}</td>
+                    <td>EAR Right</td><td>{(result.right_ear or 0):.4f}</td>
+                </tr>
+                <tr>
+                    <td>Eye Area Ratio</td><td>{(result.eye_area_ratio or 0):.3f}</td>
+                    <td>Brow H Ratio</td><td>{(result.brow_height_ratio or 0):.3f}</td>
+                </tr>
+                <tr>
+                    <td>Mouth Width</td><td>{(result.mouth_width or 0):.1f}px</td>
+                    <td>NLF Ratio</td><td>{(result.nlf_ratio or 0):.3f}</td>
+                </tr>
+            </table>
+            <div class="images">
+                {_img_tag("peak_raw.jpg", "原始帧")}
+                {_img_tag("peak_indicators.jpg", "指标可视化")}
+                {_img_tag("peak_selection_curve.png", "峰值选择曲线")}
+            </div>
         </div>
-    </div>
-"""
+    """
 
     html += """
-</div>
-</body>
-</html>
-"""
+    </div>
+    </body>
+    </html>
+    """
 
     report_path = output_dir / "report.html"
     report_path.write_text(html, encoding="utf-8")
@@ -1283,25 +1260,27 @@ def process_examination(examination: Dict[str, Any], db_path: str,
     # 计算Sunnybrook评分
     sunnybrook = calculate_sunnybrook_from_results(action_results)
 
-    prediction = infer_palsy_and_side(action_results)
+    # 计算完整Session诊断（替换原来的 infer_palsy_and_side）
+    diagnosis = compute_full_diagnosis(action_results, sunnybrook)
 
-    # summary 里也建议存一份
+    # summary 更新
     summary = {
         "exam_id": exam_id,
         "patient_id": patient_id,
         "analysis_time": datetime.now().isoformat(),
         "ground_truth": labels,
         "sunnybrook": sunnybrook.to_dict() if sunnybrook else None,
+        "diagnosis": diagnosis.to_dict() if diagnosis else None,  # 新增
         "actions": {name: result.to_dict() for name, result in action_results.items()},
-        "prediction": prediction,
     }
 
+    # 生成HTML报告
     generate_html_report(
         exam_id, patient_id,
         action_results,
         sunnybrook,
         labels,
-        prediction,
+        diagnosis,  # 传入完整诊断
         exam_output_dir
     )
 
