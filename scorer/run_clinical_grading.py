@@ -69,12 +69,15 @@ TARGET_EXAM_ID = None
 # 调试筛选：只分析特定患者/特定检查（其余跳过）
 # =============================================================================
 # 1) 只跑指定患者（常用）
-TARGET_PATIENT_IDS = ["XW000124", "XW000132"]
+TARGET_PATIENT_IDS = []
 
 # 2) 只跑指定检查ID（优先级更高）
 TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
+# "NeutralFace",
+"CloseEyeSoftly",
+"CloseEyeHardly",
 ]
 
 # ENABLED_ACTIONS = [
@@ -128,227 +131,38 @@ ALL_ACTIONS = [
 ]
 
 
-def find_peak_frame_generic(landmarks_seq, frames_seq, w, h, action_name, baseline_landmarks=None):
-    """通用峰值帧查找
-
-    说明：
-    - 优先调用各动作模块自带的峰值检测逻辑（与最新版动作代码保持一致）
-    """
-    if action_name == "NeutralFace":
-        return neutral_face.find_peak_frame(landmarks_seq, frames_seq, w, h)
-    elif action_name == "Smile":
-        return smile.find_peak_frame(landmarks_seq, frames_seq, w, h)
-    elif action_name == "ShowTeeth":
-        return show_teeth.find_peak_frame(landmarks_seq, frames_seq, w, h)
-    elif action_name in ["VoluntaryEyeBlink", "SpontaneousEyeBlink"]:
-        return eye_blink.find_peak_frame_blink(landmarks_seq, frames_seq, w, h)
-    elif action_name in ["CloseEyeSoftly", "CloseEyeHardly"]:
-        return close_eye.find_peak_frame_close_eye(landmarks_seq, frames_seq, w, h)
-    elif action_name == "RaiseEyebrow":
-        return raise_eyebrow.find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
-    elif action_name == "LipPucker":
-        return lip_pucker.find_peak_frame(landmarks_seq, frames_seq, w, h)
-    elif action_name == "BlowCheek":
-        return blow_cheek.find_peak_frame(landmarks_seq, frames_seq, w, h)
-    elif action_name == "ShrugNose":
-        return shrug_nose.find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
-    else:
-        # 默认: 使用NeutralFace的方法
-        return neutral_face.find_peak_frame(landmarks_seq, frames_seq, w, h)
-
-
 def process_action_generic(landmarks_seq, frames_seq, w, h, video_info, output_dir,
                            action_name, baseline_result=None, baseline_landmarks=None):
-    """动作处理入口（与最新版动作代码对齐）
-
-    所有动作全部调用各自模块的 process / process_xxx 函数
     """
-    if action_name == "NeutralFace":
-        return neutral_face.process(landmarks_seq, frames_seq, w, h, video_info, output_dir)
-
-    # --- Smile ---
-    elif action_name == "Smile":
-        return smile.process(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result, baseline_landmarks
-        )
-
-    # --- ShowTeeth (独立模块) ---
-    elif action_name == "ShowTeeth":
-        return show_teeth.process(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result, baseline_landmarks
-        )
-
-    # --- Eye Blink ---
-    elif action_name == "VoluntaryEyeBlink":
-        return eye_blink.process_voluntary_blink(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result, baseline_landmarks
-        )
-    elif action_name == "SpontaneousEyeBlink":
-        return eye_blink.process_spontaneous_blink(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result, baseline_landmarks
-        )
-
-    # --- Close Eye ---
-    elif action_name == "CloseEyeSoftly":
-        return close_eye.process_close_eye_softly(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result=baseline_result,
-            baseline_landmarks=baseline_landmarks
-        )
-    elif action_name == "CloseEyeHardly":
-        return close_eye.process_close_eye_hardly(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result=baseline_result,
-            baseline_landmarks=baseline_landmarks
-        )
-
-    # --- Other Voluntary Movements ---
-    elif action_name == "RaiseEyebrow":
-        return raise_eyebrow.process(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result=baseline_result,
-            baseline_landmarks=baseline_landmarks
-        )
-    elif action_name == "LipPucker":
-        return lip_pucker.process(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result=baseline_result,
-            baseline_landmarks=baseline_landmarks
-        )
-    elif action_name == "BlowCheek":
-        return blow_cheek.process(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result=baseline_result,
-            baseline_landmarks=baseline_landmarks
-        )
-    elif action_name == "ShrugNose":
-        return shrug_nose.process(
-            landmarks_seq, frames_seq, w, h, video_info, output_dir,
-            baseline_result=baseline_result,
-            baseline_landmarks=baseline_landmarks
-        )
-
-    # fallback
-    return process_generic_action(
-        landmarks_seq, frames_seq, w, h, video_info, output_dir,
-        action_name, baseline_result, baseline_landmarks
-    )
-
-
-def process_generic_action(landmarks_seq, frames_seq, w, h, video_info, output_dir,
-                           action_name, baseline_result=None, baseline_landmarks=None):
-    """通用动作处理（用于没有专门模块的动作）"""
-    if not landmarks_seq or not frames_seq:
-        return None
-
-    # 找峰值帧
-    peak_idx = find_peak_frame_generic(landmarks_seq, frames_seq, w, h, action_name, baseline_landmarks)
-    peak_landmarks = landmarks_seq[peak_idx]
-    peak_frame = frames_seq[peak_idx]
-
-    if peak_landmarks is None:
-        return None
-
-    # 动作名称映射
-    action_cn_map = {
-        "RaiseEyebrow": "皱额",
-        "CloseEyeSoftly": "轻闭眼",
-        "CloseEyeHardly": "用力闭眼",
-        "LipPucker": "撅嘴",
-        "BlowCheek": "鼓腮",
-        "ShrugNose": "皱鼻",
+    动作处理的统一入口。
+    根据 action_name 分发到各自独立的、规范化的处理模块。
+    """
+    # 动作处理器映射
+    PROCESSOR_MAP = {
+        "NeutralFace": neutral_face.process,
+        "Smile": smile.process,
+        "ShowTeeth": show_teeth.process,
+        "RaiseEyebrow": raise_eyebrow.process,
+        "CloseEyeSoftly": close_eye.process_close_eye_softly,
+        "CloseEyeHardly": close_eye.process_close_eye_hardly,
+        "VoluntaryEyeBlink": eye_blink.process_voluntary_blink,
+        "SpontaneousEyeBlink": eye_blink.process_spontaneous_blink,
+        "LipPucker": lip_pucker.process,
+        "BlowCheek": blow_cheek.process,
+        "ShrugNose": shrug_nose.process,
     }
 
-    result = ActionResult(
-        action_name=action_name,
-        action_name_cn=action_cn_map.get(action_name, action_name),
-        video_path=video_info.get("file_path", ""),
-        total_frames=len(frames_seq),
-        peak_frame_idx=peak_idx,
-        image_size=(w, h),
-        fps=video_info.get("fps", 30.0)
+    processor = PROCESSOR_MAP.get(action_name)
+    if not processor:
+        print(f"    [!] 未找到动作 '{action_name}' 的处理器，跳过。")
+        return None
+
+    # 调用相应的 process 函数
+    return processor(
+        landmarks_seq, frames_seq, w, h, video_info, output_dir,
+        baseline_result=baseline_result,
+        baseline_landmarks=baseline_landmarks
     )
-
-    # 提取通用指标
-    extract_common_indicators(peak_landmarks, w, h, result, baseline_landmarks)
-
-    # 计算Voluntary Movement评分
-    if baseline_result:
-        # 根据动作类型选择比较指标
-        if action_name == "RaiseEyebrow":
-            ratio = result.brow_height_ratio
-        elif action_name in ["CloseEyeSoftly", "CloseEyeHardly"]:
-            # 闭眼程度比较
-            ratio = result.left_ear / result.right_ear if result.right_ear > 1e-9 else 1.0
-        elif action_name == "LipPucker":
-            baseline_width = baseline_result.mouth_width
-            if baseline_width > 1e-9:
-                ratio = result.mouth_width / baseline_width
-            else:
-                ratio = 1.0
-        else:
-            ratio = 1.0
-
-        score, interp = compute_voluntary_score_from_ratio(ratio)
-        result.voluntary_movement_score = score
-
-    # 检测联动
-    if baseline_result:
-        synkinesis = {}
-
-        # 检测眼部联动（用于嘴部动作）
-        if action_name in ["LipPucker", "BlowCheek", "ShrugNose"]:
-            l_ear_change = abs(result.left_ear - baseline_result.left_ear)
-            r_ear_change = abs(result.right_ear - baseline_result.right_ear)
-            avg_change = (l_ear_change + r_ear_change) / 2
-
-            if avg_change > 0.15:
-                synkinesis["eye_synkinesis"] = 3
-            elif avg_change > 0.10:
-                synkinesis["eye_synkinesis"] = 2
-            elif avg_change > 0.05:
-                synkinesis["eye_synkinesis"] = 1
-            else:
-                synkinesis["eye_synkinesis"] = 0
-
-        # 检测嘴部联动（用于眼部动作）
-        if action_name in ["RaiseEyebrow", "CloseEyeSoftly", "CloseEyeHardly"]:
-            mouth_change = abs(result.mouth_width - baseline_result.mouth_width)
-            if baseline_result.mouth_width > 1e-9:
-                mouth_ratio = mouth_change / baseline_result.mouth_width
-                if mouth_ratio > 0.20:
-                    synkinesis["mouth_synkinesis"] = 3
-                elif mouth_ratio > 0.10:
-                    synkinesis["mouth_synkinesis"] = 2
-                elif mouth_ratio > 0.05:
-                    synkinesis["mouth_synkinesis"] = 1
-                else:
-                    synkinesis["mouth_synkinesis"] = 0
-
-        result.synkinesis_scores = synkinesis
-
-    # 创建输出目录
-    action_dir = output_dir / action_name
-    action_dir.mkdir(parents=True, exist_ok=True)
-
-    # 保存原始帧
-    cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
-
-    # 简单可视化
-    vis = visualize_generic_action(peak_frame, peak_landmarks, w, h, result)
-    cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
-
-    # 保存JSON
-    with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
-        json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
-
-    print(f"    [OK] {action_name}: EAR L={result.left_ear:.3f} R={result.right_ear:.3f}")
-
-    return result
 
 
 def visualize_generic_action(frame, landmarks, w, h, result):
@@ -1112,7 +926,7 @@ def process_examination(examination: Dict[str, Any], db_path: str,
     labels = db_fetch_labels(db_path, exam_id)
 
     print(f"找到 {len(videos)} 个动作视频")
-    print(f"医生标注: {labels}")
+    print(f"医生标注: {labels}\n")
 
     exam_output_dir = output_dir / exam_id
     exam_output_dir.mkdir(parents=True, exist_ok=True)

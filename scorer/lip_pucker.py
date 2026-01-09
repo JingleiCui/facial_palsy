@@ -93,35 +93,20 @@ def _mean_lip_z_aligned(landmarks, w: int, h: int, baseline_landmarks=None) -> f
     return float(np.mean(cur_aligned[:, 2]))
 
 
-def _save_lip_z_curve_png(png_path, z_delta_norm, peak_idx: int):
-    """画嘴唇区域 z 轴运动曲线（相对基线的 delta_z/ICD）"""
-    if not z_delta_norm:
-        return
-    plt.figure()
-    plt.plot(list(range(len(z_delta_norm))), z_delta_norm)
-    plt.axvline(int(peak_idx), linestyle="--")
-    plt.title("Lip region depth curve (baseline_z - current_z) / ICD")
-    plt.xlabel("Frame")
-    plt.ylabel("Delta depth (normalized)")
-    plt.tight_layout()
-    plt.savefig(str(png_path), dpi=150)
-    plt.close()
-
-
 # =============================================================================
 # 曲线绘制函数
 # =============================================================================
-
-def _save_lip_protrusion_curve_png(png_path,
-                                   peak_debug: Dict[str, Any],
-                                   palsy_detection: Dict[str, Any] = None) -> None:
+def plot_lip_pucker_peak_selection(
+        peak_debug: Dict[str, Any],
+        fps: float,
+        output_path: Path,
+        palsy_detection: Dict[str, Any] = None
+) -> None:
     """
-    绘制撅嘴 protrusion 曲线
+    绘制撅嘴（LipPucker）关键帧选择的可解释性曲线。
+    选择标准：嘴唇前突（protrusion）和嘴宽收缩（width ratio）的综合分数。
     """
-    import matplotlib
-    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-
     from clinical_base import add_valid_region_shading, get_palsy_side_text
 
     protrusion = peak_debug.get("protrusion", [])
@@ -130,62 +115,58 @@ def _save_lip_protrusion_curve_png(png_path,
     valid_mask = peak_debug.get("valid", None)
     peak_idx = peak_debug.get("peak_idx", 0)
 
-    if not protrusion:
+    if not score:
         return
 
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+    n_frames = len(score)
+    frames = np.arange(n_frames)
+    time_sec = frames / fps if fps > 0 else frames
+    x_label = 'Time (seconds)' if fps > 0 else 'Frame'
+    peak_time = peak_idx / fps if fps > 0 else peak_idx
 
-    n = len(protrusion)
-    xs = np.arange(n)
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-    protrusion_arr = np.array([v if v is not None else np.nan for v in protrusion])
-    width_ratio_arr = np.array([v if v is not None else np.nan for v in width_ratio])
-    score_arr = np.array([v if v is not None else np.nan for v in score])
-
-    # ===== 上图：Protrusion 曲线 =====
+    # 上图：Protrusion 和 Score
     ax1 = axes[0]
-
     if valid_mask is not None:
-        add_valid_region_shading(ax1, valid_mask, xs)
+        add_valid_region_shading(ax1, valid_mask, time_sec)
 
-    ax1.plot(xs, protrusion_arr, 'b-', label="Lip protrusion", linewidth=2)
-    ax1.plot(xs, score_arr, 'g--', label="Combined score", linewidth=1.5, alpha=0.7)
+    ax1.plot(time_sec, protrusion, 'b-', label='Lip Protrusion', linewidth=2, alpha=0.7)
+    ax1.plot(time_sec, score, 'g-', label='Combined Score (Selection)', linewidth=2.5)
 
-    if 0 <= peak_idx < n:
-        ax1.axvline(peak_idx, linestyle="--", color='black', linewidth=2)
-        if np.isfinite(score_arr[peak_idx]):
-            ax1.scatter([peak_idx], [score_arr[peak_idx]], color='red', s=150,
-                        zorder=5, marker='*', edgecolors='black', linewidths=2)
+    ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
+    if 0 <= peak_idx < n_frames:
+        peak_score = score[peak_idx]
+        ax1.scatter([peak_time], [peak_score], color='red', s=150, zorder=5,
+                    edgecolors='black', linewidths=1.5, marker='*', label=f'Peak (Score: {peak_score:.3f})')
 
-    title = "LipPucker: Lip protrusion relative to nose (higher = more protrusion)"
+    title = "LipPucker Peak Selection: Max Protrusion & Puckering Score"
     if palsy_detection:
         palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
         title += f' | Detected: {palsy_text}'
 
-    ax1.set_title(title, fontsize=12, fontweight='bold')
-    ax1.set_xlabel("Frame")
-    ax1.set_ylabel("Protrusion / Score")
-    ax1.legend(loc='upper right')
-    ax1.grid(True, alpha=0.3)
+    ax1.set_title(title, fontsize=13, fontweight='bold')
+    ax1.set_ylabel('Score / Protrusion', fontsize=11)
+    ax1.legend()
+    ax1.grid(True, alpha=0.4)
 
-    # ===== 下图：Width ratio 曲线 =====
+    # 下图：Width Ratio
     ax2 = axes[1]
+    if valid_mask is not None:
+        add_valid_region_shading(ax2, valid_mask, time_sec)
 
-    ax2.plot(xs, width_ratio_arr, 'orange', linewidth=2, label='Mouth width ratio')
-    ax2.axhline(y=1.0, color='gray', linestyle='--', linewidth=1, label='Baseline width')
+    ax2.plot(time_sec, width_ratio, 'orange', label='Mouth Width Ratio', linewidth=2)
+    ax2.axhline(y=1.0, color='gray', linestyle=':', label='Baseline Width')
 
-    if 0 <= peak_idx < n:
-        ax2.axvline(peak_idx, linestyle='--', color='black', linewidth=2)
-
-    ax2.set_title('Mouth Width Ratio (< 1.0 = narrower = puckering)', fontsize=11)
-    ax2.set_xlabel('Frame')
-    ax2.set_ylabel('Width Ratio')
-    ax2.legend(loc='upper right')
-    ax2.grid(True, alpha=0.3)
-    ax2.set_ylim(0.5, 1.2)
+    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
+    ax2.set_title('Mouth Width Ratio (lower is better)', fontsize=11)
+    ax2.set_xlabel(x_label, fontsize=11)
+    ax2.set_ylabel('Width Ratio', fontsize=11)
+    ax2.legend()
+    ax2.grid(True, alpha=0.4)
 
     plt.tight_layout()
-    plt.savefig(str(png_path), dpi=150)
+    plt.savefig(str(output_path), dpi=150)
     plt.close()
 
 
@@ -952,15 +933,13 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     if not landmarks_seq or not frames_seq:
         return None
 
-    # 找峰值帧 (嘴宽最小)
-    peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks=baseline_landmarks)
+    peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
     if peak_landmarks is None:
         return None
 
-    # 创建结果对象
     result = ActionResult(
         action_name=ACTION_NAME,
         action_name_cn=ACTION_NAME_CN,
@@ -971,83 +950,51 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         fps=video_info.get("fps", 30.0)
     )
 
-    # 提取通用指标
     extract_common_indicators(peak_landmarks, w, h, result, baseline_landmarks)
-
-    # 计算撅嘴特有指标
     metrics = compute_lip_pucker_metrics(peak_landmarks, w, h, baseline_landmarks)
-
-    # 检测面瘫侧别
     palsy_detection = detect_palsy_side(metrics)
-
-    # 计算Voluntary Movement评分
     score, interpretation = compute_voluntary_score(metrics, baseline_landmarks)
     result.voluntary_movement_score = score
-
-    # 检测联动
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
-
-    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
     severity_score, severity_desc = compute_severity_score(metrics)
 
-    # 存储动作特有指标
     result.action_specific = {
-        "mouth_metrics": {
-            "width": metrics["mouth_width"],
-            "height": metrics["mouth_height"],
-            "width_height_ratio": metrics["width_height_ratio"],
-        },
+        "mouth_metrics": {"width": metrics["mouth_width"], "height": metrics["mouth_height"]},
         "oral_angle": metrics["oral_angle"],
-        "midline_x": metrics.get("midline_x", 0),
-        "left_to_midline": metrics.get("left_to_midline", 0),
-        "right_to_midline": metrics.get("right_to_midline", 0),
         "palsy_detection": palsy_detection,
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
         "severity_score": severity_score,
         "severity_desc": severity_desc,
+        "peak_debug": peak_debug,
     }
 
     if "baseline" in metrics:
         result.action_specific["baseline"] = metrics["baseline"]
-
     if "movement" in metrics:
         result.action_specific["movement"] = metrics["movement"]
 
-    if "width_change" in metrics:
-        result.action_specific["changes"] = {
-            "width_change": metrics["width_change"],
-            "width_ratio": metrics.get("width_ratio", 1.0),
-        }
-
-    # 创建输出目录
     action_dir = output_dir / ACTION_NAME
     action_dir.mkdir(parents=True, exist_ok=True)
-
-    # 保存原始帧
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
-    # 保存可视化
     vis = visualize_lip_pucker(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
-    # 保存嘴唇Z轴曲线（相对基线）
-    if peak_debug and "lip_z_delta_norm" in peak_debug:
-        _save_lip_z_curve_png(action_dir / "mouth_z_curve.png",
-                              peak_debug["lip_z_delta_norm"],
-                              peak_idx)
+    # !! 新增：调用绘图函数
+    if peak_debug:
+        plot_lip_pucker_peak_selection(
+            peak_debug,
+            video_info.get("fps", 30.0),
+            action_dir / "peak_selection_curve.png",
+            palsy_detection
+        )
 
-    # 也把 debug 写进 json（可解释性）
-    result.action_specific["peak_debug"] = peak_debug
-
-    # 保存JSON
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
     print(f"    [OK] {ACTION_NAME}: Width={metrics['mouth_width']:.1f}px")
-    if "width_change_percent" in metrics:
-        print(f"         Width Change: {metrics['width_change_percent']:+.1f}%")
     print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
     print(f"         Voluntary Score: {result.voluntary_movement_score}/5 ({interpretation})")
 

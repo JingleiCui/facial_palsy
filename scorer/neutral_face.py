@@ -12,6 +12,7 @@ NeutralFace 动作处理模块
 
 import cv2
 import numpy as np
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -32,31 +33,24 @@ from sunnybrook_scorer import (
 from thresholds import THR
 
 ACTION_NAME = "NeutralFace"
-ACTION_NAME_CN = "静息面"
+ACTION_NAME_CN = "静息"
 
 
-def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
+def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> Tuple[int, Dict[str, Any]]:
     """
-    找静息峰值帧
-
+    找静息峰值帧，并返回用于可视化的调试信息。
     标准：
     1. 眼睛睁开（EAR > 阈值）
     2. 嘴巴闭合（嘴高/嘴宽 < 阈值）
     3. 眉毛稳定（眉毛不要在运动过程中）
     4. 稳定区间（避免眨眼、张嘴或眉毛运动的瞬间）
     """
-    from thresholds import THR
-
     n_frames = len(landmarks_seq)
     if n_frames == 0:
-        return 0
+        return 0, {}
 
-    # 计算每帧的评分
-    scores = []
-    ear_values = []
-    mouth_ratios = []
-    brow_heights_left = []  # 左眉高度（眉眼距）
-    brow_heights_right = []  # 右眉高度（眉眼距）
+    scores, ear_values, mouth_ratios, stability_scores = [], [], [], []
+    brow_heights_left, brow_heights_right = [], []
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
@@ -67,78 +61,56 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> in
             brow_heights_right.append(0)
             continue
 
-        # 眼睛睁开程度
         l_ear = compute_ear(lm, w, h, True)
         r_ear = compute_ear(lm, w, h, False)
         min_ear = min(l_ear, r_ear)
-        avg_ear = (l_ear + r_ear) / 2
 
-        # 嘴巴闭合程度
         mouth = compute_mouth_metrics(lm, w, h)
-        mouth_ratio = mouth["height"] / mouth["width"] if mouth["width"] > 1e-9 else 0
+        mouth_ratio = mouth["height"] / max(mouth["width"], 1e-9)
 
-        # 眉毛高度（眉眼距）
-        # 使用简单的眉毛中心到眼睛内眦的Y轴距离
         left_brow_height = compute_brow_height(lm, w, h, left=True)
         right_brow_height = compute_brow_height(lm, w, h, left=False)
 
-        ear_values.append(avg_ear)
+        ear_values.append((l_ear + r_ear) / 2)
         mouth_ratios.append(mouth_ratio)
         brow_heights_left.append(left_brow_height)
         brow_heights_right.append(right_brow_height)
 
-        # 评分：眼睛越睁开越好，嘴巴越闭越好
         score = 0.0
-
-        # 眼睛分数（EAR > 0.20 为睁开，越大越好）
         if min_ear > 0.20:
             score += min_ear * 10
         else:
-            score -= (0.20 - min_ear) * 20  # 惩罚闭眼
+            score -= (0.20 - min_ear) * 20
 
-        # 嘴巴分数（高宽比 < 0.15 为闭合，越小越好）
         if mouth_ratio < 0.15:
             score += (0.15 - mouth_ratio) * 10
         else:
-            score -= (mouth_ratio - 0.15) * 20  # 惩罚张嘴
-
+            score -= (mouth_ratio - 0.15) * 20
         scores.append(score)
 
-    # 寻找稳定区间（避免快速变化的帧）
-    # 使用滑动窗口计算稳定性
-    window_size = min(5, n_frames // 3)
-    if window_size < 3:
-        window_size = 3
-
-    stability_scores = []
+    window_size = min(5, n_frames // 3 if n_frames > 3 else 3)
     for i in range(n_frames):
         start = max(0, i - window_size // 2)
         end = min(n_frames, i + window_size // 2 + 1)
 
-        window_ears = ear_values[start:end]
-        window_mouths = mouth_ratios[start:end]
-        window_brow_left = brow_heights_left[start:end]
-        window_brow_right = brow_heights_right[start:end]
+        ear_std = np.std(ear_values[start:end]) if len(ear_values[start:end]) > 1 else 0
+        mouth_std = np.std(mouth_ratios[start:end]) if len(mouth_ratios[start:end]) > 1 else 0
+        brow_std = np.std(brow_heights_left[start:end] + brow_heights_right[start:end]) if len(
+            brow_heights_left[start:end]) > 1 else 0
 
-        # 计算窗口内的变化（标准差）
-        ear_std = np.std(window_ears) if len(window_ears) > 1 else 0
-        mouth_std = np.std(window_mouths) if len(window_mouths) > 1 else 0
-        brow_left_std = np.std(window_brow_left) if len(window_brow_left) > 1 else 0
-        brow_right_std = np.std(window_brow_right) if len(window_brow_right) > 1 else 0
-        brow_std = (brow_left_std + brow_right_std) / 2  # 平均眉毛变化
-
-        # 变化越小，稳定性越好
-        # 加入眉毛稳定性权重
         stability = 1.0 / (1.0 + ear_std * 10 + mouth_std * 5 + brow_std * 3)
         stability_scores.append(stability)
 
-    # 最终分数 = 基础分数 * 稳定性
     final_scores = [s * stab for s, stab in zip(scores, stability_scores)]
-
-    # 找最高分
     best_idx = int(np.argmax(final_scores))
 
-    return best_idx
+    peak_debug = {
+        "final_scores": final_scores,
+        "base_scores": scores,
+        "stability_scores": stability_scores,
+        "peak_idx": best_idx,
+    }
+    return best_idx, peak_debug
 
 
 def extract_action_specific_indicators(landmarks, w: int, h: int,
@@ -170,7 +142,7 @@ def extract_action_specific_indicators(landmarks, w: int, h: int,
 
 def detect_resting_palsy(result: ActionResult) -> Dict[str, Any]:
     """
-    检测静息状态下的面瘫侧别 - 增强版
+    检测静息状态下的面瘫侧别
 
     原理：即使在静息状态，面瘫侧也可能表现出：
     1. 眼睑裂不对称（高度或面积）
@@ -390,6 +362,48 @@ def visualize_indicators(frame: np.ndarray, landmarks, w: int, h: int,
     return img
 
 
+def plot_neutral_face_peak_selection(
+        peak_debug: Dict[str, Any],
+        fps: float,
+        output_path: Path
+) -> None:
+    """
+    绘制NeutralFace关键帧选择的可解释性曲线。
+    选择标准：综合稳定性得分最高的帧。
+    """
+    import matplotlib.pyplot as plt
+
+    final_scores = peak_debug.get("final_scores", [])
+    if not final_scores:
+        return
+
+    peak_idx = peak_debug.get("peak_idx", 0)
+    n_frames = len(final_scores)
+    frames = np.arange(n_frames)
+    time_sec = frames / fps if fps > 0 else frames
+    x_label = 'Time (seconds)' if fps > 0 else 'Frame'
+    peak_time = peak_idx / fps if fps > 0 else peak_idx
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(time_sec, final_scores, 'g-', label='Stability Score', linewidth=2)
+
+    # 标注峰值
+    plt.axvline(x=peak_time, color='black', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Peak Frame {peak_idx}')
+    if 0 <= peak_idx < n_frames:
+        peak_score = final_scores[peak_idx]
+        plt.scatter([peak_time], [peak_score], color='red', s=150, zorder=5,
+                    edgecolors='black', linewidths=1.5, marker='*', label=f'Selected Peak (Score: {peak_score:.2f})')
+
+    plt.title('NeutralFace Peak Selection: Maximum Stability Score', fontsize=14, fontweight='bold')
+    plt.xlabel(x_label, fontsize=11)
+    plt.ylabel('Stability Score (higher is better)', fontsize=11)
+    plt.legend()
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150)
+    plt.close()
+
+
 def visualize_resting_symmetry(frame: np.ndarray, landmarks, w: int, h: int,
                                result: ActionResult,
                                resting: RestingSymmetry) -> np.ndarray:
@@ -474,29 +488,18 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
             video_info: Dict[str, Any], output_dir: Path) -> Optional[ActionResult]:
     """
     处理NeutralFace动作
-
-    Args:
-        landmarks_seq: landmarks序列
-        frames_seq: 帧序列
-        w, h: 图像尺寸
-        video_info: 视频信息
-        output_dir: 输出目录
-
-    Returns:
-        ActionResult 或 None
     """
     if not landmarks_seq or not frames_seq:
         return None
 
-    # 找峰值帧
-    peak_idx = find_peak_frame(landmarks_seq, frames_seq, w, h)
+    # 找峰值帧，并获取调试信息
+    peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
     if peak_landmarks is None:
         return None
 
-    # 创建结果对象
     result = ActionResult(
         action_name=ACTION_NAME,
         action_name_cn=ACTION_NAME_CN,
@@ -507,63 +510,44 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         fps=video_info.get("fps", 30.0)
     )
 
-    # 提取通用指标
     extract_common_indicators(peak_landmarks, w, h, result)
-
-    # 检测静息状态面瘫
     resting_palsy = detect_resting_palsy(result)
+
+    extract_action_specific_indicators(peak_landmarks, w, h, result)
     result.action_specific["resting_palsy_detection"] = resting_palsy
     result.action_specific["palsy_detection"] = resting_palsy
 
-    # ========== 存储 baseline ICD 和关键距离 ==========
-    icd_base = compute_icd(peak_landmarks, w, h)
-    left_eye_area, _ = compute_eye_area(peak_landmarks, w, h, left=True)
-    right_eye_area, _ = compute_eye_area(peak_landmarks, w, h, left=False)
-    left_palp_width = compute_palpebral_width(peak_landmarks, w, h, left=True)
-    right_palp_width = compute_palpebral_width(peak_landmarks, w, h, left=False)
-
-    baseline_distances = {
-        "icd": icd_base,
-        "left_palpebral_height": compute_palpebral_height(peak_landmarks, w, h, left=True),
-        "right_palpebral_height": compute_palpebral_height(peak_landmarks, w, h, left=False),
-        "left_palpebral_width": left_palp_width,
-        "right_palpebral_width": right_palp_width,
-        "left_eye_area": left_eye_area,
-        "right_eye_area": right_eye_area,
-        "left_brow_eye_distance": compute_brow_eye_distance(peak_landmarks, w, h, left=True),
-        "right_brow_eye_distance": compute_brow_eye_distance(peak_landmarks, w, h, left=False),
-        "mouth_width": result.mouth_width,
-        "mouth_height": result.mouth_height,
-        "left_nlf_length": result.left_nlf_length,
-        "right_nlf_length": result.right_nlf_length,
-    }
-
-    # 提取动作特有指标
-    extract_action_specific_indicators(peak_landmarks, w, h, result)
-
-    # 计算Resting Symmetry
     resting = compute_resting_symmetry_from_result(result)
     result.action_specific["resting_symmetry"] = resting.to_dict()
 
-    # ========== 存储 baseline 距离 ==========
+    # 存储 baseline 距离
+    baseline_distances = {
+        "icd": compute_icd(peak_landmarks, w, h),
+        "left_palpebral_height": compute_palpebral_height(peak_landmarks, w, h, left=True),
+        "right_palpebral_height": compute_palpebral_height(peak_landmarks, w, h, left=False),
+        # ... 其他您需要的基线指标
+    }
     result.action_specific["baseline_distances"] = baseline_distances
 
     # 创建输出目录
     action_dir = output_dir / ACTION_NAME
     action_dir.mkdir(parents=True, exist_ok=True)
 
-    # 保存原始帧
-    cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
-
     # 保存可视化
+    cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
     vis_indicators = visualize_indicators(peak_frame, peak_landmarks, w, h, result)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis_indicators)
-
     vis_resting = visualize_resting_symmetry(peak_frame, peak_landmarks, w, h, result, resting)
     cv2.imwrite(str(action_dir / "resting_symmetry.jpg"), vis_resting)
 
+    # 调用绘图函数
+    plot_neutral_face_peak_selection(
+        peak_debug,
+        video_info.get("fps", 30.0),
+        action_dir / "peak_selection_curve.png"
+    )
+
     # 保存JSON
-    import json
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 

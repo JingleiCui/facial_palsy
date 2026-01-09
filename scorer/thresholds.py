@@ -41,14 +41,14 @@ class Thresholds:
     # =========================================================================
 
     # 闭合度阈值（1 - current_area/baseline_area）
-    EYE_CLOSURE_RATIO_CLOSED: float = 0.90  # 闭合度 > 认为眼睛闭合
+    EYE_CLOSURE_RATIO_CLOSED: float = 0.70  # 闭合度 > 认为眼睛闭合
     EYE_CLOSURE_RATIO_PARTIAL: float = 0.50  # 闭合度 > 认为部分闭合
     EYE_CLOSURE_RATIO_MINIMAL: float = 0.20  # 闭合度 > 认为有闭眼动作
 
     # 眼睛对称性阈值（|left - right| / max(left, right)）
-    EYE_SYMMETRY_NORMAL: float = 0.15  # 不对称比 < 15% 认为对称
-    EYE_SYMMETRY_MILD: float = 0.25  # 不对称比 < 25% 认为轻度不对称
-    EYE_SYMMETRY_MODERATE: float = 0.40  # 不对称比 < 40% 认为中度不对称
+    EYE_SYMMETRY_NORMAL: float = 0.08  # 不对称比 < 8% 认为对称
+    EYE_SYMMETRY_MILD: float = 0.20  # 不对称比 < 20% 认为轻度不对称
+    EYE_SYMMETRY_MODERATE: float = 0.30  # 不对称比 < 30% 认为中度不对称
 
     # 眼睛同步性阈值
     EYE_SYNC_PEARSON_GOOD: float = 0.85  # Pearson相关 > 0.85 认为同步良好
@@ -126,7 +126,7 @@ class Thresholds:
     # =========================================================================
 
     # 闭眼判断 EAR 阈值
-    CLOSE_EYE_EAR_CLOSED: float = 0.10  # EAR < 此值认为眼睛闭合
+    CLOSE_EYE_EAR_CLOSED: float = 0.2  # EAR < 此值认为眼睛闭合
 
     # 闭眼程度对称性阈值
     CLOSE_EYE_SYMMETRY: float = 0.10  # |L_EAR - R_EAR| / max(L,R) > 此值认为不对称

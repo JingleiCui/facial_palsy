@@ -44,6 +44,64 @@ ACTION_NAME = "BlowCheek"
 ACTION_NAME_CN = "鼓腮"
 
 
+def plot_cheek_bulge_curve(
+        peak_debug: Dict[str, Any],
+        fps: float,
+        output_path: Path,
+        palsy_detection: Dict[str, Any] = None
+) -> None:
+    """
+    绘制鼓腮（BlowCheek）关键帧选择的可解释性曲线。
+    选择标准：左右脸颊相对鼻尖的凸出程度（bulge）最大。
+    """
+    import matplotlib.pyplot as plt
+    from clinical_base import add_valid_region_shading, get_palsy_side_text
+
+    left_bulge = peak_debug.get("left_bulge", [])
+    right_bulge = peak_debug.get("right_bulge", [])
+    score = peak_debug.get("score", [])
+    valid_mask = peak_debug.get("valid", None)
+    peak_idx = peak_debug.get("peak_idx", 0)
+
+    if not score:
+        return
+
+    n_frames = len(score)
+    frames = np.arange(n_frames)
+    time_sec = frames / fps if fps > 0 else frames
+    x_label = 'Time (seconds)' if fps > 0 else 'Frame'
+    peak_time = peak_idx / fps if fps > 0 else peak_idx
+
+    plt.figure(figsize=(12, 6))
+
+    if valid_mask is not None:
+        add_valid_region_shading(plt.gca(), valid_mask, time_sec)
+
+    plt.plot(time_sec, left_bulge, 'b-', label='Left Cheek Bulge', linewidth=2, alpha=0.6)
+    plt.plot(time_sec, right_bulge, 'r-', label='Right Cheek Bulge', linewidth=2, alpha=0.6)
+    plt.plot(time_sec, score, 'g-', label='Combined Score (Selection)', linewidth=2.5)
+
+    plt.axvline(x=peak_time, color='black', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Peak Frame {peak_idx}')
+    if 0 <= peak_idx < n_frames:
+        peak_score = score[peak_idx]
+        plt.scatter([peak_time], [peak_score], color='red', s=150, zorder=5,
+                    edgecolors='black', linewidths=1.5, marker='*', label=f'Selected Peak (Score: {peak_score:.3f})')
+
+    title = "BlowCheek Peak Selection: Max Cheek Bulge"
+    if palsy_detection:
+        palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
+        title += f' | Detected: {palsy_text}'
+
+    plt.title(title, fontsize=14, fontweight='bold')
+    plt.xlabel(x_label, fontsize=11)
+    plt.ylabel('Bulge Score (higher is better)', fontsize=11)
+    plt.legend()
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150)
+    plt.close()
+
+
 def _safe_pt3d(landmarks, idx: int, w: int, h: int):
     try:
         p = np.array(pt3d(landmarks[idx], w, h), dtype=np.float64)  # (x_px, y_px, z_px)
@@ -366,234 +424,84 @@ def _inner_lip_area_norm(lm, w: int, h: int, icd: float) -> float:
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
                     baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
     """
-    鼓腮峰值帧选择 - 使用相对鼻尖的深度变化（不依赖静息帧baseline）
-
-    原理：
-    - rel_z = mean_z(cheek_region) - z(nose_tip)
-    - 鼓腮时脸颊凸出，rel_z 变小（更靠近相机）
-    - bulge = (base_rel_z - current_rel_z) / ICD
-    - 选择 max_bulge 最大的帧
-
-    内部baseline：用视频前 BASELINE_FRAMES 帧的中位数
-
-    Args:
-        landmarks_seq: 关键点序列
-        frames_seq: 帧图像序列（未使用，保留接口兼容）
-        w, h: 图像尺寸
-        baseline_landmarks: 静息帧关键点（本方法不需要，但保留接口兼容）
-
-    Returns:
-        (peak_idx, peak_debug): 峰值帧索引和调试信息
+    鼓腮峰值帧选择 - 使用脸颊相对鼻尖的深度变化。
     """
     n = len(landmarks_seq)
     if n == 0:
-        return 0, {"error": "empty_sequence"}
+        return 0, {}
 
     # 配置参数
     BASELINE_FRAMES = getattr(THR, 'BLOW_CHEEK_BASELINE_FRAMES', 10)
-    MOUTH_THR = THR.MOUTH_HEIGHT
-    INNER_AREA_INC_THR = THR.MOUTH_INNER_AREA_INC
-    INNER_AREA_BASE_EPS = THR.MOUTH_INNER_AREA_BASE_EPS
+    MOUTH_SEAL_THR = THR.MOUTH_SEAL
 
-    # ========== 辅助函数 ==========
-    def _safe_pt3d(landmarks, idx: int):
-        """安全获取3D点"""
-        try:
-            if landmarks is None or idx < 0 or idx >= len(landmarks):
-                return None
-            return np.asarray(pt3d(landmarks[idx], w, h), dtype=np.float64)
-        except Exception:
-            return None
+    # 辅助函数
+    def _get_rel_z(lm, region_indices):
+        nose_z = pt3d(lm[LM.NOSE_TIP], w, h)[2]
+        region_pts_3d = [pt3d(lm[i], w, h) for i in region_indices]
+        region_z = np.mean([p[2] for p in region_pts_3d])
+        return region_z - nose_z
 
-    def _get_nose_z(landmarks) -> float:
-        """获取鼻尖Z坐标"""
-        p = _safe_pt3d(landmarks, LM.NOSE_TIP)
-        return float(p[2]) if p is not None else np.nan
+    def _get_seal_norm(lm, icd):
+        upper = pt2d(lm[LM.LIP_TOP], w, h)
+        lower = pt2d(lm[LM.LIP_BOT], w, h)
+        return dist(upper, lower) / max(icd, 1e-9)
 
-    def _get_cheek_mean_z(landmarks, indices: List[int]) -> float:
-        """获取脸颊区域平均Z坐标"""
-        zs = []
-        for idx in indices:
-            p = _safe_pt3d(landmarks, idx)
-            if p is not None:
-                zs.append(float(p[2]))
-        return float(np.mean(zs)) if zs else np.nan
-
-    def _inner_lip_area_norm(lm, icd: float) -> float:
-        """嘴唇内圈面积归一化（用于门控）"""
-        try:
-            pts = pts2d(lm, LM.INNER_LIP, w, h)
-            area = float(abs(polygon_area(pts)))
-            return area / max(icd * icd, 1e-9)
-        except Exception:
-            return np.nan
-
-    # ========== 第一遍扫描：收集所有帧的指标 ==========
-    icd_arr = np.full(n, np.nan, dtype=np.float64)
-    nose_z_arr = np.full(n, np.nan, dtype=np.float64)
-    left_cheek_z_arr = np.full(n, np.nan, dtype=np.float64)
-    right_cheek_z_arr = np.full(n, np.nan, dtype=np.float64)
-    left_rel_z_arr = np.full(n, np.nan, dtype=np.float64)  # 左脸颊相对鼻尖
-    right_rel_z_arr = np.full(n, np.nan, dtype=np.float64)  # 右脸颊相对鼻尖
-    mouth_norm_arr = np.full(n, np.nan, dtype=np.float64)
-    inner_area_norm_arr = np.full(n, np.nan, dtype=np.float64)
-
+    # 扫描所有帧
+    icd_arr, left_rel_z, right_rel_z, seal_norm = [np.nan] * n, [np.nan] * n, [np.nan] * n, [np.nan] * n
     for i, lm in enumerate(landmarks_seq):
-        if lm is None:
-            continue
-
+        if lm is None: continue
         try:
-            icd = float(max(compute_icd(lm, w, h), 1e-6))
+            icd = compute_icd(lm, w, h)
+            icd_arr[i] = icd
+            left_rel_z[i] = _get_rel_z(lm, LM.BLOW_CHEEK_L)
+            right_rel_z[i] = _get_rel_z(lm, LM.BLOW_CHEEK_R)
+            seal_norm[i] = _get_seal_norm(lm, icd)
         except Exception:
             continue
 
-        icd_arr[i] = icd
+    # 建立内部baseline
+    valid_init = np.isfinite(left_rel_z[:BASELINE_FRAMES]) & np.isfinite(right_rel_z[:BASELINE_FRAMES]) & np.isfinite(
+        icd_arr[:BASELINE_FRAMES])
+    if np.sum(valid_init) < 3:
+        valid_init = np.isfinite(left_rel_z) & np.isfinite(right_rel_z) & np.isfinite(icd_arr)
 
-        # 鼻尖和脸颊Z坐标
-        nose_z = _get_nose_z(lm)
-        left_z = _get_cheek_mean_z(lm, LM.BLOW_CHEEK_L)
-        right_z = _get_cheek_mean_z(lm, LM.BLOW_CHEEK_R)
+    if np.sum(valid_init) == 0: return 0, {"error": "no valid frames"}
 
-        nose_z_arr[i] = nose_z
-        left_cheek_z_arr[i] = left_z
-        right_cheek_z_arr[i] = right_z
+    base_l_rel_z = np.median([x for x in left_rel_z[:BASELINE_FRAMES] if np.isfinite(x)])
+    base_r_rel_z = np.median([x for x in right_rel_z[:BASELINE_FRAMES] if np.isfinite(x)])
+    base_icd = np.median([x for x in icd_arr[:BASELINE_FRAMES] if np.isfinite(x)])
 
-        # 相对鼻尖的深度 (cheek_z - nose_z)
-        if np.isfinite(nose_z) and np.isfinite(left_z):
-            left_rel_z_arr[i] = left_z - nose_z
-        if np.isfinite(nose_z) and np.isfinite(right_z):
-            right_rel_z_arr[i] = right_z - nose_z
-
-        # 张口程度（门控用）
-        try:
-            mouth = compute_mouth_metrics(lm, w, h)
-            mouth_h = float(mouth.get("height", 0) if isinstance(mouth, dict) else getattr(mouth, "height", 0))
-            mouth_norm_arr[i] = mouth_h / icd
-        except Exception:
-            pass
-
-        # 嘴唇内圈面积（门控用）
-        inner_area_norm_arr[i] = _inner_lip_area_norm(lm, icd)
-
-    # ========== 建立视频内部baseline（前N帧中位数） ==========
-    valid_init_mask = (np.isfinite(left_rel_z_arr[:BASELINE_FRAMES]) &
-                       np.isfinite(right_rel_z_arr[:BASELINE_FRAMES]) &
-                       np.isfinite(icd_arr[:BASELINE_FRAMES]))
-    valid_init_idx = np.where(valid_init_mask)[0]
-
-    if len(valid_init_idx) < 3:
-        # 退化：用全视频有效帧的中位数
-        all_valid = (np.isfinite(left_rel_z_arr) &
-                     np.isfinite(right_rel_z_arr) &
-                     np.isfinite(icd_arr))
-        valid_init_idx = np.where(all_valid)[0]
-
-    if len(valid_init_idx) == 0:
-        # 完全退化：返回第一帧
-        return 0, {"error": "no_valid_frames", "method": "nose_relative_bulge"}
-
-    base_left_rel_z = float(np.median(left_rel_z_arr[valid_init_idx]))
-    base_right_rel_z = float(np.median(right_rel_z_arr[valid_init_idx]))
-    base_icd = float(np.median(icd_arr[valid_init_idx]))
-
-    # 内圈面积baseline（用于门控）
-    init_inner_valid = np.isfinite(inner_area_norm_arr[valid_init_idx])
-    if init_inner_valid.sum() > 0:
-        base_inner_area = float(np.median(inner_area_norm_arr[valid_init_idx][init_inner_valid]))
-    else:
-        base_inner_area = INNER_AREA_BASE_EPS
-    base_inner_area = max(base_inner_area, INNER_AREA_BASE_EPS)
-
-    # ========== 计算 bulge 曲线 ==========
-    left_bulge = np.full(n, np.nan, dtype=np.float64)
-    right_bulge = np.full(n, np.nan, dtype=np.float64)
-    mean_bulge = np.full(n, np.nan, dtype=np.float64)
-    max_bulge = np.full(n, np.nan, dtype=np.float64)
-    inner_area_inc_arr = np.full(n, np.nan, dtype=np.float64)
-
+    # 计算bulge和score
+    left_bulge, right_bulge, score = [np.nan] * n, [np.nan] * n, [np.nan] * n
     for i in range(n):
-        # bulge = (base_rel - current_rel) / ICD
-        # 鼓腮时 current_rel 变小（脸颊更靠近相机），所以 bulge 变大
-        if np.isfinite(left_rel_z_arr[i]):
-            left_bulge[i] = (base_left_rel_z - left_rel_z_arr[i]) / base_icd
-
-        if np.isfinite(right_rel_z_arr[i]):
-            right_bulge[i] = (base_right_rel_z - right_rel_z_arr[i]) / base_icd
-
+        if np.isfinite(left_rel_z[i]):
+            left_bulge[i] = (base_l_rel_z - left_rel_z[i]) / base_icd
+        if np.isfinite(right_rel_z[i]):
+            right_bulge[i] = (base_r_rel_z - right_rel_z[i]) / base_icd
         if np.isfinite(left_bulge[i]) and np.isfinite(right_bulge[i]):
-            mean_bulge[i] = 0.5 * (left_bulge[i] + right_bulge[i])
-            max_bulge[i] = max(left_bulge[i], right_bulge[i])
+            score[i] = left_bulge[i] + right_bulge[i]
 
-        # 内圈面积增幅（门控用）
-        if np.isfinite(inner_area_norm_arr[i]):
-            inner_area_inc_arr[i] = (inner_area_norm_arr[i] / base_inner_area) - 1.0
+    # 门控：嘴唇闭合
+    valid = np.isfinite(seal_norm) & (np.array(seal_norm) <= MOUTH_SEAL_THR)
 
-    # ========== 门控：闭唇 + 不张口 ==========
-    mouth_ok = np.isfinite(mouth_norm_arr) & (mouth_norm_arr <= MOUTH_THR)
-    inner_ok = np.isfinite(inner_area_inc_arr) & (inner_area_inc_arr <= INNER_AREA_INC_THR)
+    # 选峰值
+    peak_idx = 0
+    if np.sum(valid) > 0:
+        valid_scores = np.array(score)[valid]
+        valid_indices = np.where(valid)[0]
+        if len(valid_scores) > 0 and not np.all(np.isnan(valid_scores)):
+            peak_idx = int(valid_indices[np.nanargmax(valid_scores)])
+    elif len(score) > 0 and not np.all(np.isnan(score)):  # Fallback
+        peak_idx = int(np.nanargmax(score))
 
-    valid = np.isfinite(max_bulge) & mouth_ok & inner_ok
-
-    # 退化策略1：放宽内圈面积门控
-    if valid.sum() < 3:
-        valid = np.isfinite(max_bulge) & mouth_ok
-
-    # 退化策略2：只要求有 bulge 值
-    if valid.sum() < 1:
-        valid = np.isfinite(max_bulge)
-
-    # 选峰值帧
-    fallback = None
-    if valid.sum() < 1:
-        fallback = "no_valid_fallback_to_first"
-        peak_idx = 0
-    else:
-        cand = np.where(valid)[0]
-        peak_idx = int(cand[int(np.nanargmax(max_bulge[cand]))])
-
-    # ========== 构建调试信息 ==========
     peak_debug = {
-        # 原始Z坐标
-        "nose_z": [float(v) if np.isfinite(v) else None for v in nose_z_arr],
-        "left_cheek_z": [float(v) if np.isfinite(v) else None for v in left_cheek_z_arr],
-        "right_cheek_z": [float(v) if np.isfinite(v) else None for v in right_cheek_z_arr],
-
-        # 相对鼻尖的深度
-        "left_rel_z": [float(v) if np.isfinite(v) else None for v in left_rel_z_arr],
-        "right_rel_z": [float(v) if np.isfinite(v) else None for v in right_rel_z_arr],
-
-        # bulge 曲线（用于选峰值和判断患侧）
-        "left_bulge": [float(v) if np.isfinite(v) else None for v in left_bulge],
-        "right_bulge": [float(v) if np.isfinite(v) else None for v in right_bulge],
-        "mean_bulge": [float(v) if np.isfinite(v) else None for v in mean_bulge],
-        "max_bulge": [float(v) if np.isfinite(v) else None for v in max_bulge],
-
-        # 门控曲线
-        "mouth_norm": [float(v) if np.isfinite(v) else None for v in mouth_norm_arr],
-        "inner_lip_area_inc": [float(v) if np.isfinite(v) else None for v in inner_area_inc_arr],
-
-        # baseline信息
-        "baseline": {
-            "frames_used": int(len(valid_init_idx)),
-            "left_rel_z": float(base_left_rel_z),
-            "right_rel_z": float(base_right_rel_z),
-            "icd": float(base_icd),
-            "inner_area": float(base_inner_area),
-        },
-
-        # 阈值
-        "thresholds": {
-            "mouth_thr": float(MOUTH_THR),
-            "inner_area_inc_thr": float(INNER_AREA_INC_THR),
-        },
-
-        # 选帧结果
+        "left_bulge": left_bulge,
+        "right_bulge": right_bulge,
+        "score": score,
         "valid": [bool(v) for v in valid],
-        "peak_idx": int(peak_idx),
-        "fallback": fallback,
-        "method": "nose_relative_bulge",
+        "peak_idx": peak_idx,
+        "baseline": {"left_rel_z": base_l_rel_z, "right_rel_z": base_r_rel_z},
     }
-
     return peak_idx, peak_debug
 
 
@@ -1116,16 +1024,13 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     if not landmarks_seq or not frames_seq:
         return None
 
-    # 找峰值帧
-    peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks=baseline_landmarks)
-    # peak_idx += 8
+    peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
     if peak_landmarks is None:
         return None
 
-    # 创建结果对象
     result = ActionResult(
         action_name=ACTION_NAME,
         action_name_cn=ACTION_NAME_CN,
@@ -1136,83 +1041,41 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         fps=video_info.get("fps", 30.0)
     )
 
-    # 提取通用指标
     extract_common_indicators(peak_landmarks, w, h, result, baseline_landmarks)
-
-    # 计算鼓腮特有指标
     metrics = compute_blow_cheek_metrics(peak_landmarks, w, h, baseline_landmarks)
-
-    # 检测面瘫侧别
     palsy_detection = detect_palsy_side(metrics)
-
-    # 计算Voluntary Movement评分
     score, interpretation = compute_voluntary_score(metrics, baseline_landmarks)
     result.voluntary_movement_score = score
-
-    # 检测联动
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
-
-    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
     severity_score, severity_desc = compute_severity_score(metrics)
 
     result.action_specific = {
-        "mouth_width": metrics["mouth_width"],
-        "mouth_height": metrics["mouth_height"],
+        "mouth_metrics": {"width": metrics["mouth_width"], "height": metrics["mouth_height"]},
         "oral_angle": metrics["oral_angle"],
-        "cheek_depth": metrics.get("cheek_depth", {}),
         "palsy_detection": palsy_detection,
-        "midline_x": metrics.get("midline_x", 0),
-        "left_to_midline": metrics.get("left_to_midline", 0),
-        "right_to_midline": metrics.get("right_to_midline", 0),
+        "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
         "severity_score": severity_score,
         "severity_desc": severity_desc,
+        "peak_debug": peak_debug,
     }
 
-    if "baseline" in metrics:
-        result.action_specific["baseline"] = metrics["baseline"]
-
-    if "movement" in metrics:
-        result.action_specific["movement"] = metrics["movement"]
-        result.action_specific["changes"] = {
-            "mouth_width_change": metrics.get("mouth_width_change", 0),
-        }
-
-    # 创建输出目录
     action_dir = output_dir / ACTION_NAME
     action_dir.mkdir(parents=True, exist_ok=True)
-
-    # 保存原始帧
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
-    # 保存左右脸颊深度曲线（可解释性）
-    if peak_debug:
-        left_series = peak_debug.get("left_delta_norm", [])
-        right_series = peak_debug.get("right_delta_norm", [])
-        mean_series = peak_debug.get("mean_delta_norm", [])
-        valid_mask = peak_debug.get("valid", None)
-        score_raw = peak_debug.get("score_raw", [])
+    # 调用绘图函数
+    plot_cheek_bulge_curve(
+        peak_debug,
+        video_info.get("fps", 30.0),
+        action_dir / "peak_selection_curve.png",
+        palsy_detection
+    )
 
-        _save_cheek_depth_curve_png(
-            action_dir / "cheek_depth_curve.png",
-            left_series, right_series, mean_series,
-            score_raw,
-            peak_idx,
-            valid_mask=valid_mask,
-            palsy_detection=palsy_detection
-        )
-
-        # 保存可视化（添加患侧信息）
     vis = visualize_blow_cheek(peak_frame, peak_landmarks, metrics, w, h, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
-    # 写入 debug，方便你回看为什么选中这帧
-    if result.action_specific is None:
-        result.action_specific = {}
-    result.action_specific["peak_debug"] = peak_debug
-
-    # 保存JSON
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 

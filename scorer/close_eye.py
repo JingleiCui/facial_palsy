@@ -171,7 +171,7 @@ def detect_palsy_side_from_closure(peak_closure_data: Dict[str, Any]) -> Dict[st
 
     max_closure = max(left_closure, right_closure)
 
-    if max_closure < 0.25:  # 闭合不足25%
+    if max_closure < THR.EYE_CLOSURE_RATIO_PARTIAL:  # 闭合不足
         result["interpretation"] = f"闭眼幅度过小 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
         result["evidence"]["status"] = "insufficient_closure"
         return result
@@ -183,7 +183,7 @@ def detect_palsy_side_from_closure(peak_closure_data: Dict[str, Any]) -> Dict[st
     result["evidence"]["left_closure_pct"] = left_closure * 100
     result["evidence"]["right_closure_pct"] = right_closure * 100
 
-    if asymmetry < 0.01:  # 1%以内认为对称
+    if asymmetry < THR.EYE_SYMMETRY_NORMAL:  # 以内认为对称
         result["palsy_side"] = 0
         result["interpretation"] = (
             f"双眼闭合对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%, "
