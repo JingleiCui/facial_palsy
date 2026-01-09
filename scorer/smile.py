@@ -49,33 +49,64 @@ ACTION_NAME_CN = "微笑"
 
 
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
-                    baseline_landmarks=None) -> int:
+                    baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
     """
     找微笑峰值帧 - 使用嘴角到眼部水平线距离
 
     改进:
     - 微笑时嘴角上提，到眼部水平线的距离减小
     - 取距离之和最小的帧作为峰值帧
+    - 返回peak_debug用于可视化曲线
+
+    Returns:
+        (peak_idx, peak_debug): 峰值帧索引和调试信息
     """
+    n_frames = len(landmarks_seq)
+    if n_frames == 0:
+        return 0, {"error": "empty_sequence"}
+
+    # 收集时序数据
+    left_dist_seq = []
+    right_dist_seq = []
+    total_dist_seq = []
+
     min_total_dist = float('inf')
     min_idx = 0
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
+            left_dist_seq.append(np.nan)
+            right_dist_seq.append(np.nan)
+            total_dist_seq.append(np.nan)
             continue
 
         # 计算左右嘴角到眼部水平线的距离
         left_result = compute_mouth_corner_to_eye_line_distance(lm, w, h, left=True)
         right_result = compute_mouth_corner_to_eye_line_distance(lm, w, h, left=False)
 
-        # 取两侧距离之和最小的帧
-        total_dist = left_result["distance"] + right_result["distance"]
+        left_dist = left_result["distance"]
+        right_dist = right_result["distance"]
+        total_dist = left_dist + right_dist
+
+        left_dist_seq.append(left_dist)
+        right_dist_seq.append(right_dist)
+        total_dist_seq.append(total_dist)
 
         if total_dist < min_total_dist:
             min_total_dist = total_dist
             min_idx = i
 
-    return min_idx
+    # 构建peak_debug字典
+    peak_debug = {
+        "left_dist": left_dist_seq,
+        "right_dist": right_dist_seq,
+        "total_dist": total_dist_seq,
+        "peak_idx": min_idx,
+        "peak_value": float(min_total_dist) if np.isfinite(min_total_dist) else None,
+        "selection_criterion": "min_total_eye_line_distance",
+    }
+
+    return min_idx, peak_debug
 
 
 def extract_smile_sequences(landmarks_seq: List, w: int, h: int) -> Dict[str, List[float]]:
@@ -129,95 +160,57 @@ def extract_smile_sequences(landmarks_seq: List, w: int, h: int) -> Dict[str, Li
 
 
 def plot_smile_peak_selection(
-        sequences: Dict[str, List[float]],
+        peak_debug: Dict[str, Any],  # 改为接收peak_debug
         fps: float,
-        peak_idx: int,
         output_path: Path,
-        action_name: str = ACTION_NAME,
-        valid_mask: List[bool] = None,
         palsy_detection: Dict[str, Any] = None
 ) -> None:
     """
-    绘制微笑关键帧选择的可解释性曲线
-
-    改进: 添加嘴角到眼线距离曲线作为关键帧选择依据
+    绘制微笑关键帧选择的可解释性曲线。
+    选择标准：嘴角到眼部水平线距离最小的帧。
     """
-    fig, axes = plt.subplots(3, 1, figsize=(16, 12))  # 改为3个子图
 
-    n_frames = len(sequences["Mouth Width"])
+    left_dist = peak_debug.get("left_dist", [])
+    right_dist = peak_debug.get("right_dist", [])
+    total_dist = peak_debug.get("total_dist", [])
+    peak_idx = peak_debug.get("peak_idx", 0)
+
+    if not total_dist:
+        return
+
+    n_frames = len(total_dist)
     frames = np.arange(n_frames)
     time_sec = frames / fps if fps > 0 else frames
     x_label = 'Time (seconds)' if fps > 0 else 'Frame'
     peak_time = peak_idx / fps if fps > 0 else peak_idx
 
-    # 上图: 嘴角到眼线距离（关键帧选择依据）
-    ax1 = axes[0]
+    plt.figure(figsize=(12, 6))
 
-    if valid_mask is not None:
-        add_valid_region_shading(ax1, valid_mask, time_sec)
+    # 绘制左右距离和总距离
+    plt.plot(time_sec, left_dist, 'b-', label='Left Eye-Line Distance', linewidth=2, alpha=0.6)
+    plt.plot(time_sec, right_dist, 'r-', label='Right Eye-Line Distance', linewidth=2, alpha=0.6)
+    plt.plot(time_sec, total_dist, 'g-', label='Total Distance (Selection)', linewidth=2.5)
 
-    if "Total Eye-Line Dist" in sequences:
-        total_dist = sequences["Total Eye-Line Dist"]
-        left_dist = sequences["Left Eye-Line Dist"]
-        right_dist = sequences["Right Eye-Line Dist"]
+    # 标记峰值
+    plt.axvline(x=peak_time, color='black', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Peak Frame {peak_idx}')
+    if 0 <= peak_idx < n_frames and np.isfinite(total_dist[peak_idx]):
+        peak_value = total_dist[peak_idx]
+        plt.scatter([peak_time], [peak_value], color='red', s=150, zorder=5,
+                    edgecolors='black', linewidths=1.5, marker='*',
+                    label=f'Selected Peak (Dist: {peak_value:.1f})')
 
-        ax1.plot(time_sec, left_dist, 'b-', label='Left Corner to Eye-Line', linewidth=2)
-        ax1.plot(time_sec, right_dist, 'r-', label='Right Corner to Eye-Line', linewidth=2)
-        ax1.plot(time_sec, total_dist, 'g--', label='Total Distance (selection)', linewidth=1.5, alpha=0.7)
-
-        ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
-        dist_at_peak = total_dist[peak_idx] if peak_idx < len(total_dist) else 0
-        ax1.scatter([peak_time], [dist_at_peak], color='red', s=150, zorder=5,
-                    edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
-        ax1.annotate(f'Min: {dist_at_peak:.1f}px', xy=(peak_time, dist_at_peak),
-                     xytext=(10, 10), textcoords='offset points', fontsize=10, fontweight='bold')
-
-    ax1.set_xlabel(x_label, fontsize=11)
-    ax1.set_ylabel('Distance to Eye-Line (pixels)', fontsize=11)
-
-    title = f'{action_name} Peak Selection: Minimum Corner-to-Eye Distance'
+    title = "Smile Peak Selection: Min Eye-Line Distance"
     if palsy_detection:
         palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
         title += f' | Detected: {palsy_text}'
-    ax1.set_title(title, fontsize=13, fontweight='bold')
-    ax1.legend(loc='best')
-    ax1.grid(True, alpha=0.3)
 
-    # 中图: 嘴宽曲线
-    ax2 = axes[1]
-
-    if valid_mask is not None:
-        add_valid_region_shading(ax2, valid_mask, time_sec)
-
-    mouth_width = sequences["Mouth Width"]
-    ax2.plot(time_sec, mouth_width, 'g-', label='Mouth Width', linewidth=2)
-    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
-
-    ax2.set_xlabel(x_label, fontsize=11)
-    ax2.set_ylabel('Mouth Width (pixels)', fontsize=11)
-    ax2.set_title('Mouth Width Over Time', fontsize=12)
-    ax2.legend(loc='best')
-    ax2.grid(True, alpha=0.3)
-
-    # 下图: 口角角度 (用于患侧判断参考)
-    ax3 = axes[2]
-
-    if valid_mask is not None:
-        add_valid_region_shading(ax3, valid_mask, time_sec)
-
-    ax3.plot(time_sec, sequences["AOE (Right)"], 'r-', label='AOE (Right)', linewidth=2)
-    ax3.plot(time_sec, sequences["BOF (Left)"], 'b-', label='BOF (Left)', linewidth=2)
-    ax3.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7, label=f'Peak Frame {peak_idx}')
-    ax3.axhline(y=0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
-
-    ax3.set_xlabel(x_label, fontsize=11)
-    ax3.set_ylabel('Oral Angle (degrees)', fontsize=11)
-    ax3.set_title('Oral Commissure Angles (for reference)', fontsize=12)
-    ax3.legend(loc='best')
-    ax3.grid(True, alpha=0.3)
-
+    plt.title(title, fontsize=14, fontweight='bold')
+    plt.xlabel(x_label, fontsize=11)
+    plt.ylabel('Distance to Eye-Line (px, lower is better)', fontsize=11)
+    plt.legend()
+    plt.grid(True, alpha=0.4)
     plt.tight_layout()
-    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.savefig(str(output_path), dpi=150)
     plt.close()
 
 
@@ -650,7 +643,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         return None
 
     # 找峰值帧（嘴角到眼线距离最小）
-    peak_idx = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
+    peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
@@ -719,6 +712,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "voluntary_score": result.voluntary_movement_score,
         "severity_score": severity_score,
         "severity_desc": severity_desc,
+        "peak_debug": peak_debug,
     }
 
     if "excursion" in smile_metrics:
@@ -730,13 +724,10 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     # 绘制关键帧选择曲线（添加患侧信息）
     plot_smile_peak_selection(
-        sequences,
+        peak_debug,
         video_info.get("fps", 30.0),
-        peak_idx,
         action_dir / "peak_selection_curve.png",
-        ACTION_NAME,
-        valid_mask=None,  # smile 没有 valid 逻辑，传 None
-        palsy_detection=palsy_detection
+        palsy_detection
     )
 
     # 保存原始帧

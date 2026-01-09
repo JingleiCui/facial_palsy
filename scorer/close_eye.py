@@ -721,8 +721,8 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 绘制眼睛变化曲线
-    plot_eye_curve(eye_seq, fps, peak_idx, action_dir / "eye_curve.png", action_name,
-                   valid_mask=None,  # close_eye 没有 valid 逻辑
+    plot_eye_curve(eye_seq, fps, peak_idx, action_dir / "peak_selection_curve.png", action_name,
+                   valid_mask=None,
                    palsy_detection=palsy_detection)
 
     # 保存JSON

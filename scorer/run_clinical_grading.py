@@ -69,15 +69,12 @@ TARGET_EXAM_ID = None
 # 调试筛选：只分析特定患者/特定检查（其余跳过）
 # =============================================================================
 # 1) 只跑指定患者（常用）
-TARGET_PATIENT_IDS = []
+TARGET_PATIENT_IDS = ["XW000395", "XW000393"]
 
 # 2) 只跑指定检查ID（优先级更高）
 TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
-# "NeutralFace",
-"CloseEyeSoftly",
-"CloseEyeHardly",
 ]
 
 # ENABLED_ACTIONS = [
@@ -91,7 +88,7 @@ ENABLED_ACTIONS = [
 #     "SpontaneousEyeBlink",
 #     "LipPucker",
 #     "BlowCheek",
-#     "ShrugNose"
+#     "ShrugNose",
 # ]
 
 # 是否复用已有的 NeutralFace 结果（用于调试其他动作时跳过基线重算）

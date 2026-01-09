@@ -26,7 +26,7 @@ from clinical_base import (
     compute_oral_angle, compute_icd, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
     add_valid_region_shading, get_palsy_side_text,
-    compute_eye_closure_by_area,
+    compute_eye_closure_by_area, draw_palsy_side_label,
 )
 
 from thresholds import THR
@@ -325,9 +325,13 @@ def plot_ear_curve(ear_seq: Dict[str, List[float]],
 
 def visualize_blink_indicators(frame: np.ndarray, landmarks, w: int, h: int,
                                result: ActionResult,
-                               dynamics: Dict[str, Any]) -> np.ndarray:
+                               dynamics: Dict[str, Any],
+                               palsy_detection: Dict[str, Any] = None) -> np.ndarray:
     """可视化眨眼指标"""
     img = frame.copy()
+
+    # 添加患侧标签
+    img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
 
     # 绘制眼部轮廓
     draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_L, (255, 0, 0), 2)
@@ -675,12 +679,13 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
     # 保存可视化
-    vis_indicators = visualize_blink_indicators(peak_frame, peak_landmarks, w, h, result, dynamics)
+    vis_indicators = visualize_blink_indicators(peak_frame, peak_landmarks, w, h, result,
+                                                dynamics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis_indicators)
 
     # 绘制EAR和面积曲线
     plot_ear_curve(ear_seq, area_seq, fps, peak_idx,
-                   action_dir / "ear_curve.png", action_name,
+                   action_dir / "peak_selection_curve.png", action_name,
                    palsy_detection=palsy_detection)
 
     # 保存JSON

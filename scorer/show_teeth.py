@@ -31,6 +31,7 @@ from clinical_base import (
     ActionResult, OralAngleMeasure, draw_polygon,
     compute_scale_to_baseline, draw_palsy_side_label,
     compute_lip_midline_offset_from_face_midline,
+    compute_mouth_corner_to_eye_line_distance, compute_mouth_metrics,
 )
 
 from sunnybrook_scorer import (
@@ -43,36 +44,73 @@ ACTION_NAME = "ShowTeeth"
 ACTION_NAME_CN = "露齿"
 
 
-def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int) -> int:
-    """找露齿峰值帧
-
-    露齿的“峰值”不一定来自“上唇提升”，也可能来自“下颌下压/下唇下拉”。
-    因此这里用 **内唇缘一圈(Inner Lip)围成的开口面积** 作为露齿强度的近似指标：
-    - 开口面积越大，通常牙齿暴露越明显
-    - 为减轻前后距离变化的影响，对面积做 ICD² 归一化
-
-    注意：这仍是“牙齿暴露”的几何代理指标。若后续接入牙齿/口腔分割，可进一步更准。
+def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
+                    baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
     """
-    best_score = -1.0
-    best_idx = 0
+    找露齿峰值帧 - 使用嘴角到眼部水平线距离
+
+    改进:
+    - 露齿时嘴角上提/外展，到眼部水平线的距离减小
+    - 取距离之和最小的帧作为峰值帧
+    - 返回peak_debug用于可视化曲线
+
+    Returns:
+        (peak_idx, peak_debug): 峰值帧索引和调试信息
+    """
+    n_frames = len(landmarks_seq)
+    if n_frames == 0:
+        return 0, {"error": "empty_sequence"}
+
+    # 收集时序数据
+    left_dist_seq = []
+    right_dist_seq = []
+    total_dist_seq = []
+    mouth_width_seq = []
+
+    min_total_dist = float('inf')
+    min_idx = 0
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
+            left_dist_seq.append(np.nan)
+            right_dist_seq.append(np.nan)
+            total_dist_seq.append(np.nan)
+            mouth_width_seq.append(np.nan)
             continue
 
-        # 1) 内唇缘面积
-        inner_pts = np.array(pts2d(lm, LM.INNER_LIP, w, h), dtype=np.float32)
-        area = float(abs(polygon_area(inner_pts))) if len(inner_pts) >= 3 else 0.0
+        # 计算左右嘴角到眼部水平线的距离
+        left_result = compute_mouth_corner_to_eye_line_distance(lm, w, h, left=True)
+        right_result = compute_mouth_corner_to_eye_line_distance(lm, w, h, left=False)
 
-        # 2) ICD²归一化，降低面部远近变化带来的面积缩放
-        icd = float(compute_icd(lm, w, h))
-        score = area / (icd * icd + 1e-9)
+        left_dist = left_result["distance"]
+        right_dist = right_result["distance"]
+        total_dist = left_dist + right_dist
 
-        if score > best_score:
-            best_score = score
-            best_idx = i
+        # 也收集嘴宽信息
+        mouth = compute_mouth_metrics(lm, w, h)
+        mouth_width = mouth["width"]
 
-    return best_idx
+        left_dist_seq.append(left_dist)
+        right_dist_seq.append(right_dist)
+        total_dist_seq.append(total_dist)
+        mouth_width_seq.append(mouth_width)
+
+        if total_dist < min_total_dist:
+            min_total_dist = total_dist
+            min_idx = i
+
+    # 构建peak_debug字典
+    peak_debug = {
+        "left_dist": left_dist_seq,
+        "right_dist": right_dist_seq,
+        "total_dist": total_dist_seq,
+        "mouth_width": mouth_width_seq,
+        "peak_idx": min_idx,
+        "peak_value": float(min_total_dist) if np.isfinite(min_total_dist) else None,
+        "selection_criterion": "min_total_eye_line_distance",
+    }
+
+    return min_idx, peak_debug
 
 
 def extract_show_teeth_sequences(landmarks_seq: List, w: int, h: int) -> Dict[str, List[float]]:
@@ -112,62 +150,69 @@ def extract_show_teeth_sequences(landmarks_seq: List, w: int, h: int) -> Dict[st
 
 
 def plot_show_teeth_peak_selection(
-        sequences: Dict[str, List[float]],
+        peak_debug: Dict[str, Any],
         fps: float,
-        peak_idx: int,
-        output_path: Path
+        output_path,
+        palsy_detection: Dict[str, Any] = None
 ) -> None:
     """
-    绘制露齿关键帧选择的可解释性曲线
-
-    露齿选择标准: 内唇缘开口面积(ICD归一化)最大的帧
+    绘制ShowTeeth关键帧选择的可解释性曲线。
     """
-    import matplotlib
-    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from clinical_base import get_palsy_side_text
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    left_dist = peak_debug.get("left_dist", [])
+    right_dist = peak_debug.get("right_dist", [])
+    total_dist = peak_debug.get("total_dist", [])
+    mouth_width = peak_debug.get("mouth_width", [])
+    peak_idx = peak_debug.get("peak_idx", 0)
 
-    n_frames = len(sequences["Inner Mouth Area (norm)"])
+    if not total_dist:
+        return
+
+    n_frames = len(total_dist)
     frames = np.arange(n_frames)
     time_sec = frames / fps if fps > 0 else frames
     x_label = 'Time (seconds)' if fps > 0 else 'Frame'
     peak_time = peak_idx / fps if fps > 0 else peak_idx
 
-    # 上图: 内唇面积曲线 (关键帧选择依据)
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    # 上图：眼线距离
     ax1 = axes[0]
-    area_seq = sequences["Inner Mouth Area (norm)"]
-    ax1.plot(time_sec, area_seq, 'purple', label='Inner Mouth Area (ICD² normalized)', linewidth=2)
+    ax1.plot(time_sec, left_dist, 'b-', label='Left Eye-Line Distance', linewidth=2, alpha=0.6)
+    ax1.plot(time_sec, right_dist, 'r-', label='Right Eye-Line Distance', linewidth=2, alpha=0.6)
+    ax1.plot(time_sec, total_dist, 'g-', label='Total Distance (Selection)', linewidth=2.5)
 
-    # 标注峰值帧
-    ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
-    area_at_peak = area_seq[peak_idx] if peak_idx < len(area_seq) else 0
-    ax1.scatter([peak_time], [area_at_peak], color='red', s=150, zorder=5,
-                edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
-    ax1.annotate(f'Max: {area_at_peak:.3f}', xy=(peak_time, area_at_peak),
-                 xytext=(10, -20), textcoords='offset points', fontsize=10, fontweight='bold')
+    ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
+    if 0 <= peak_idx < n_frames and np.isfinite(total_dist[peak_idx]):
+        ax1.scatter([peak_time], [total_dist[peak_idx]], color='red', s=150, zorder=5,
+                    edgecolors='black', linewidths=1.5, marker='*',
+                    label=f'Peak Frame {peak_idx}')
 
-    ax1.set_xlabel(x_label, fontsize=11)
-    ax1.set_ylabel('Normalized Area', fontsize=11)
-    ax1.set_title('ShowTeeth Peak Selection: Maximum Inner Lip Area (ICD² normalized)', fontsize=13, fontweight='bold')
-    ax1.legend(loc='best')
-    ax1.grid(True, alpha=0.3)
+    title = "ShowTeeth Peak Selection: Min Eye-Line Distance"
+    if palsy_detection:
+        palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
+        title += f' | Detected: {palsy_text}'
 
-    # 下图: 口角角度 (用于患侧判断)
+    ax1.set_title(title, fontsize=13, fontweight='bold')
+    ax1.set_ylabel('Eye-Line Distance (px)', fontsize=11)
+    ax1.legend()
+    ax1.grid(True, alpha=0.4)
+
+    # 下图：嘴宽
     ax2 = axes[1]
-    ax2.plot(time_sec, sequences["AOE (Right)"], 'r-', label='AOE (Right)', linewidth=2)
-    ax2.plot(time_sec, sequences["BOF (Left)"], 'b-', label='BOF (Left)', linewidth=2)
-    ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7, label=f'Peak Frame {peak_idx}')
-    ax2.axhline(y=0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
-
+    if mouth_width:
+        ax2.plot(time_sec, mouth_width, 'purple', label='Mouth Width', linewidth=2)
+        ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
+    ax2.set_title('Mouth Width Over Time', fontsize=11)
     ax2.set_xlabel(x_label, fontsize=11)
-    ax2.set_ylabel('Oral Angle (degrees)', fontsize=11)
-    ax2.set_title('Oral Commissure Angles (for Palsy Detection)', fontsize=12)
-    ax2.legend(loc='best')
-    ax2.grid(True, alpha=0.3)
+    ax2.set_ylabel('Width (px)', fontsize=11)
+    ax2.legend()
+    ax2.grid(True, alpha=0.4)
 
     plt.tight_layout()
-    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.savefig(str(output_path), dpi=150)
     plt.close()
 
 
@@ -585,8 +630,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     if not landmarks_seq or not frames_seq:
         return None
 
-    # 找峰值帧 (嘴宽最大)
-    peak_idx = find_peak_frame(landmarks_seq, frames_seq, w, h)
+    # 找峰值帧
+    peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
@@ -635,6 +680,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "synkinesis": synkinesis,
         "severity_score": severity_score,
         "severity_desc": severity_desc,
+        "peak_debug": peak_debug,
     }
 
     # 创建输出目录
@@ -650,10 +696,10 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     # 绘制关键帧选择曲线
     plot_show_teeth_peak_selection(
-        sequences,
+        peak_debug,
         video_info.get("fps", 30.0),
-        peak_idx,
-        action_dir / "peak_selection_curve.png"
+        action_dir / "peak_selection_curve.png",
+        palsy_detection
     )
 
     # 保存JSON

@@ -31,6 +31,7 @@ from clinical_base import (
     compute_brow_centroid, compute_scale_to_baseline,
     ActionResult, draw_polygon, draw_landmarks,
     add_valid_region_shading, get_palsy_side_text,
+    draw_palsy_side_label,
 )
 
 from thresholds import THR
@@ -626,11 +627,15 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
 
 
 def visualize_raise_eyebrow(frame: np.ndarray, landmarks, w: int, h: int,
-                                result: ActionResult,
-                                metrics: Dict[str, Any],
-                                baseline_metrics: Optional[Dict[str, Any]] = None) -> np.ndarray:
+                            result: ActionResult,
+                            metrics: Dict[str, Any],
+                            baseline_metrics: Optional[Dict[str, Any]] = None,
+                            palsy_detection: Dict[str, Any] = None) -> np.ndarray:
     """可视化眉眼距"""
     img = frame.copy()
+
+    # 添加患侧标签
+    img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
 
     # 绘制眉毛轮廓
     draw_polygon(img, landmarks, w, h, LM.BROW_L, (255, 100, 100), 2, False)
@@ -862,7 +867,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     if baseline_landmarks is not None:
         baseline_metrics = compute_raise_eyebrow_metrics(baseline_landmarks, w, h, None)
 
-    vis = visualize_raise_eyebrow(peak_frame, peak_landmarks, w, h, result, metrics, baseline_metrics)
+    vis = visualize_raise_eyebrow(peak_frame, peak_landmarks, w, h, result, metrics,
+                                  baseline_metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
     # 保存JSON

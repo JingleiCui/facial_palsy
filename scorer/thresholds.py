@@ -6,11 +6,6 @@
 
 集中管理所有动作处理模块的阈值配置，方便统一调整和管理。
 
-使用方式:
-    from thresholds import THR
-
-    if seal_norm <= THR.BLOW_CHEEK_SEAL:
-        # 判断闭唇
 """
 
 from dataclasses import dataclass
@@ -56,7 +51,7 @@ class Thresholds:
     EYE_SYNC_PEAK_DIFF_MAX: int = 5  # 峰值帧差 < 5帧 认为同步
 
     # =========================================================================
-    # 鼓腮 BlowCheek 相对鼻尖深度阈值
+    # 鼓腮 BlowCheek 阈值
     # =========================================================================
 
     # bulge = (base_rel_z - current_rel_z) / ICD，rel_z = cheek_z - nose_z
@@ -65,133 +60,183 @@ class Thresholds:
     BLOW_CHEEK_ASYM_THRESHOLD: float = 0.15  # 左右不对称比 > 15% 判定患侧
     BLOW_CHEEK_BASELINE_FRAMES: int = 10  # 用视频前10帧建立内部baseline
 
+    # 唇封闭距离归一化阈值 (seal_total / ICD)
+    MOUTH_SEAL: float = 0.032
+
+    # 嘴部高度归一化阈值 (mouth_height / ICD)
+    MOUTH_HEIGHT: float = 0.032
+
+    # 嘴唇内圈面积增幅阈值
+    MOUTH_INNER_AREA_INC: float = 3.5
+    MOUTH_INNER_AREA_BASE_EPS: float = 1e-4
+
     # =========================================================================
-    # 撅嘴 LipPucker 相对鼻尖深度阈值
+    # 撅嘴 LipPucker 阈值
     # =========================================================================
 
-    # protrusion = (base_rel_z - current_rel_z) / ICD，rel_z = lip_z - nose_z
-    LIP_PUCKER_PROTRUSION_MIN: float = 0.005  # protrusion > 0.5% 认为有撅嘴动作
-    LIP_PUCKER_PROTRUSION_GOOD: float = 0.015  # protrusion > 1.5% 认为撅嘴明显
-    LIP_PUCKER_WIDTH_RATIO_MAX: float = 0.90  # 嘴宽比 < 90% 认为有收缩
-    LIP_PUCKER_BASELINE_FRAMES: int = 10  # 用视频前10帧建立内部baseline
+    LIP_PUCKER_PROTRUSION_MIN: float = 0.005
+    LIP_PUCKER_PROTRUSION_GOOD: float = 0.015
+    LIP_PUCKER_WIDTH_RATIO_MAX: float = 0.90
+    LIP_PUCKER_BASELINE_FRAMES: int = 10
+    LIP_PUCKER_WIDTH_RATIO: float = 0.85
+    LIP_PUCKER_Z_DELTA: float = 0.01
 
-    # 对称性判断阈值 (ratio 偏离 1.0 的程度)
+    # LipPucker 面瘫检测阈值
+    LIP_PUCKER_OFFSET_THRESHOLD: float = 0.020  # 偏移 > 2% 判定有面瘫
+    LIP_PUCKER_CORNER_ASYM_TRACE: float = 0.10
+    LIP_PUCKER_CORNER_ASYM_MILD: float = 0.20
+    LIP_PUCKER_CORNER_ASYM_MODERATE: float = 0.35
+    LIP_PUCKER_CORNER_ASYM_SEVERE: float = 0.50
+
+    # =========================================================================
+    # 对称性判断通用阈值
+    # =========================================================================
+
     SYMMETRY_NORMAL: float = 0.10  # 偏差 < 10% 认为对称
     SYMMETRY_MILD: float = 0.20  # 偏差 < 20% 认为轻度不对称
     SYMMETRY_MODERATE: float = 0.35  # 偏差 < 35% 认为中度不对称
 
     # 运动幅度 (excursion) 对称性阈值
-    EXCURSION_SYMMETRIC: float = 0.85  # 比值 > 0.85 认为运动对称
-    EXCURSION_MILD_ASYM: float = 0.60  # 比值 > 0.60 认为轻度不对称
-    EXCURSION_MODERATE_ASYM: float = 0.30  # 比值 > 0.30 认为中度不对称
+    EXCURSION_SYMMETRIC: float = 0.85
+    EXCURSION_MILD_ASYM: float = 0.60
+    EXCURSION_MODERATE_ASYM: float = 0.30
 
     # 口角角度不对称阈值 (度)
-    ORAL_ANGLE_SYMMETRIC: float = 3.0  # < 3° 认为对称
-    ORAL_ANGLE_MILD: float = 6.0  # < 6° 认为轻度不对称
-    ORAL_ANGLE_MODERATE: float = 10.0  # < 10° 认为中度不对称
-    ORAL_ANGLE_SEVERE: float = 15.0  # < 15° 认为重度不对称
+    ORAL_ANGLE_SYMMETRIC: float = 3.0
+    ORAL_ANGLE_MILD: float = 6.0
+    ORAL_ANGLE_MODERATE: float = 10.0
+    ORAL_ANGLE_SEVERE: float = 15.0
 
     # =========================================================================
-    # BlowCheek 鼓腮动作阈值
+    # 面瘫侧别检测通用阈值
     # =========================================================================
 
-    # 唇封闭距离归一化阈值 (seal_total / ICD)
-    # 值越小表示嘴唇闭合越紧
-    MOUTH_SEAL: float = 0.032
+    # 嘴唇中线偏移阈值 (归一化到ICD)
+    PALSY_LIP_OFFSET_THRESHOLD: float = 0.025  # 偏移 > 2.5% 判定有面瘫
 
-    # 嘴部高度归一化阈值 (mouth_height / ICD)
-    # 值越小表示嘴巴张开越小
-    MOUTH_HEIGHT: float = 0.032
-
-    # 嘴唇内圈面积增幅阈值
-    # 计算方式: (current_area / baseline_area) - 1.0
-    # 值越大表示嘴张开越多
-    MOUTH_INNER_AREA_INC: float = 3.5
-
-    # 嘴唇内圈面积基线最小值 (防止除零)
-    MOUTH_INNER_AREA_BASE_EPS: float = 1e-4  # 原1e-5, 增大防止噪声
+    # 严重度分级阈值 (基于嘴唇偏移)
+    SEVERITY_NORMAL: float = 0.03  # < 3% 正常
+    SEVERITY_MILD: float = 0.06  # < 6% 轻度
+    SEVERITY_MODERATE: float = 0.10  # < 10% 中度
+    SEVERITY_SEVERE: float = 0.15  # < 15% 重度
 
     # =========================================================================
-    # LipPucker 撅嘴动作阈值
+    # NeutralFace 静息面阈值
     # =========================================================================
 
-    # 嘴宽收缩比例阈值 (越小表示撅嘴越明显)
-    LIP_PUCKER_WIDTH_RATIO: float = 0.85  # 当前嘴宽/基线嘴宽 < 此值认为撅嘴
-
-    # 嘴唇 z 轴前移阈值 (归一化到 ICD)
-    LIP_PUCKER_Z_DELTA: float = 0.01  # delta_z/ICD > 此值认为前移
+    NEUTRAL_MIN_EAR: float = 0.20  # EAR > 此值认为眼睛睁开
+    NEUTRAL_MAX_MOUTH_RATIO: float = 0.15  # 嘴高/嘴宽 < 此值认为嘴闭合
+    NEUTRAL_PALP_DEVIATION: float = 0.12  # 眼睑裂比偏离 > 12% 认为不对称
+    NEUTRAL_NLF_DEVIATION: float = 0.12  # 鼻唇沟比偏离 > 12% 认为不对称
+    NEUTRAL_AREA_DEVIATION: float = 0.10  # 眼睛面积比偏离 > 10% 认为不对称
 
     # =========================================================================
     # CloseEye 闭眼动作阈值
     # =========================================================================
 
-    # 闭眼判断 EAR 阈值
-    CLOSE_EYE_EAR_CLOSED: float = 0.2  # EAR < 此值认为眼睛闭合
+    CLOSE_EYE_EAR_CLOSED: float = 0.2
+    CLOSE_EYE_SYMMETRY: float = 0.10
 
-    # 闭眼程度对称性阈值
-    CLOSE_EYE_SYMMETRY: float = 0.10  # |L_EAR - R_EAR| / max(L,R) > 此值认为不对称
-
-    # =========================================================================
-    # RaiseEyebrow 抬眉动作阈值
-    # =========================================================================
-
-    # 眉眼距变化阈值 (像素)
-    RAISE_EYEBROW_CHANGE_MIN: float = 5.0  # 变化 > 此值认为有运动
-
-    # 眉眼距变化对称性阈值
-    RAISE_EYEBROW_SYMMETRY: float = 0.30  # 左右变化比 < 此值认为不对称
-
-    # 曲线平滑窗口
-    RAISE_EYEBROW_SMOOTH_WIN: int = 5
-
-    # =========================================================================
-    # ShrugNose 皱鼻动作阈值
-    # =========================================================================
-
-    # 鼻翼-内眦距离变化阈值
-    SHRUG_NOSE_CHANGE_MIN: float = 3.0  # 变化 > 此值认为有运动
-
-    # 皱鼻对称性阈值
-    SHRUG_NOSE_SYMMETRY: float = 0.25
-
-    # =========================================================================
-    # Smile 微笑动作阈值
-    # =========================================================================
-
-    # 嘴宽变化阈值
-    SMILE_WIDTH_CHANGE_MIN: float = 10.0  # 变化 > 此值认为有微笑
-
-    # 微笑对称性阈值
-    SMILE_SYMMETRY: float = 0.20
-
-    # =========================================================================
-    # ShowTeeth 露齿动作阈值
-    # =========================================================================
-
-    # 与 Smile 类似
-    SHOW_TEETH_WIDTH_CHANGE_MIN: float = 10.0
-    SHOW_TEETH_SYMMETRY: float = 0.20
+    # 联动检测阈值 (嘴部变化)
+    CLOSE_EYE_SYNKINESIS_SEVERE: float = 0.15
+    CLOSE_EYE_SYNKINESIS_MODERATE: float = 0.08
+    CLOSE_EYE_SYNKINESIS_MILD: float = 0.04
 
     # =========================================================================
     # EyeBlink 眨眼动作阈值
     # =========================================================================
 
-    # 眨眼闭合程度阈值
-    EYE_BLINK_CLOSURE_RATIO: float = 0.50  # EAR下降比例 > 此值认为有效眨眼
-
-    # 眨眼对称性阈值
-    EYE_BLINK_SYMMETRY: float = 0.15
+    BLINK_WORSE_RATIO: float = 0.60  # 某侧闭合不良比例 > 60%
+    BLINK_PERSISTENT_RATIO: float = 0.60  # 持续检测到同侧异常的比例
+    BLINK_MIN_CLOSURE: float = 0.20  # 最小有效闭合度
+    BLINK_ASYMMETRY_MIN: float = 0.01  # 不对称比 < 1% 认为对称
+    BLINK_MAX_PEAK_CLOSURE: float = 0.10  # 峰值帧闭合度阈值
+    BLINK_SYMMETRY_RATIO_MIN: float = 0.01  # 对称性比阈值
 
     # =========================================================================
-    # Synkinesis 联动运动阈值
+    # RaiseEyebrow 抬眉动作阈值
     # =========================================================================
 
-    # 嘴部联动阈值 (嘴宽变化比例)
-    SYNKINESIS_MOUTH_MILD: float = 0.05  # > 5% 轻度联动
-    SYNKINESIS_MOUTH_MODERATE: float = 0.10  # > 10% 中度联动
-    SYNKINESIS_MOUTH_SEVERE: float = 0.20  # > 20% 重度联动
+    RAISE_EYEBROW_CHANGE_MIN: float = 5.0  # 最小变化量(像素)
+    RAISE_EYEBROW_SYMMETRY: float = 0.30
+    RAISE_EYEBROW_SMOOTH_WIN: int = 5
 
-    # 眼部联动阈值 (EAR变化比例)
+    # 面瘫检测阈值
+    RAISE_EYEBROW_ASYM_NORMAL: float = 0.10  # 不对称 < 10% 正常
+
+    # 严重度分级
+    RAISE_EYEBROW_CHANGE_SEVERE: float = 0.20
+    RAISE_EYEBROW_CHANGE_MODERATE: float = 0.12
+    RAISE_EYEBROW_CHANGE_MILD: float = 0.06
+
+    # 联动检测
+    RAISE_EYEBROW_SYNKINESIS_SEVERE: float = 0.15
+    RAISE_EYEBROW_SYNKINESIS_MODERATE: float = 0.08
+    RAISE_EYEBROW_SYNKINESIS_MILD: float = 0.04
+
+    # =========================================================================
+    # Smile 微笑动作阈值
+    # =========================================================================
+
+    SMILE_WIDTH_CHANGE_MIN: float = 10.0
+    SMILE_SYMMETRY: float = 0.20
+
+    # 面瘫检测阈值
+    SMILE_ASYM_SYMMETRIC: float = 0.15  # 不对称 < 15% 对称
+
+    # 严重度分级 (基于嘴角上提不对称)
+    SMILE_ASYM_TRACE: float = 0.02  # < 2% 完美
+    SMILE_ASYM_NORMAL: float = 0.03  # < 3% 正常
+    SMILE_ASYM_MILD: float = 0.08  # < 8% 轻度
+    SMILE_ASYM_MODERATE: float = 0.15  # < 15% 中度
+    SMILE_ASYM_SEVERE: float = 0.25  # < 25% 重度
+
+    # 口角角度不对称分级
+    SMILE_ORAL_ASYM_TRACE: float = 0.08
+    SMILE_ORAL_ASYM_MILD: float = 0.18
+    SMILE_ORAL_ASYM_MODERATE: float = 0.30
+    SMILE_ORAL_ASYM_SEVERE: float = 0.45
+
+    # =========================================================================
+    # ShowTeeth 露齿动作阈值
+    # =========================================================================
+
+    SHOW_TEETH_WIDTH_CHANGE_MIN: float = 10.0
+    SHOW_TEETH_SYMMETRY: float = 0.20
+    SHOW_TEETH_OFFSET_THRESHOLD: float = 0.025  # 偏移阈值
+
+    # 联动检测
+    SHOW_TEETH_SYNKINESIS_SEVERE: float = 0.15
+    SHOW_TEETH_SYNKINESIS_MODERATE: float = 0.08
+
+    # =========================================================================
+    # ShrugNose 皱鼻动作阈值
+    # =========================================================================
+
+    SHRUG_NOSE_CHANGE_MIN: float = 3.0
+    SHRUG_NOSE_SYMMETRY: float = 0.25
+
+    # 面瘫检测阈值
+    SHRUG_NOSE_ASYM_NORMAL: float = 0.08  # 不对称 < 8% 正常
+
+    # 严重度分级
+    SHRUG_NOSE_CHANGE_SEVERE: float = 0.18
+    SHRUG_NOSE_CHANGE_MODERATE: float = 0.10
+    SHRUG_NOSE_CHANGE_MILD: float = 0.05
+
+    # 联动检测
+    SHRUG_NOSE_SYNKINESIS_SEVERE: float = 0.15
+    SHRUG_NOSE_SYNKINESIS_MODERATE: float = 0.08
+    SHRUG_NOSE_SYNKINESIS_MILD: float = 0.04
+
+    # =========================================================================
+    # Synkinesis 联动运动通用阈值
+    # =========================================================================
+
+    SYNKINESIS_MOUTH_MILD: float = 0.05
+    SYNKINESIS_MOUTH_MODERATE: float = 0.10
+    SYNKINESIS_MOUTH_SEVERE: float = 0.20
+
     SYNKINESIS_EYE_MILD: float = 0.08
     SYNKINESIS_EYE_MODERATE: float = 0.15
     SYNKINESIS_EYE_SEVERE: float = 0.25
@@ -200,17 +245,34 @@ class Thresholds:
     # Sunnybrook 评分相关阈值
     # =========================================================================
 
-    # Resting Symmetry 阈值
-    RESTING_EYE_RATIO: float = 0.20  # 睑裂高度比偏离 > 此值认为异常
-    RESTING_CHEEK_NLF_RATIO: float = 0.15  # NLF比偏离 > 此值认为轻度异常
-    RESTING_CHEEK_NLF_SEVERE: float = 0.30  # NLF比偏离 > 此值认为重度异常
-    RESTING_MOUTH_ANGLE_DIFF: float = 5.0  # 口角角度差 > 此值认为异常
+    RESTING_EYE_RATIO: float = 0.20
+    RESTING_CHEEK_NLF_RATIO: float = 0.15
+    RESTING_CHEEK_NLF_SEVERE: float = 0.30
+    RESTING_MOUTH_ANGLE_DIFF: float = 5.0
 
-    # Voluntary Movement 评分阈值
-    VOLUNTARY_COMPLETE: float = 0.85  # 运动比 > 85% 认为完整
-    VOLUNTARY_ALMOST: float = 0.70  # 运动比 > 70% 认为几乎完整
-    VOLUNTARY_INITIATE: float = 0.40  # 运动比 > 40% 认为有启动
-    VOLUNTARY_TRACE: float = 0.15  # 运动比 > 15% 认为轻微启动
+    # Sunnybrook 眼睑裂比阈值
+    SUNNYBROOK_PALP_RATIO_NORMAL: float = 0.85  # 比值 < 0.85 认为异常
+
+    # Sunnybrook NLF比阈值
+    SUNNYBROOK_NLF_RATIO_MILD: float = 0.85  # 0.75-0.85 轻度
+    SUNNYBROOK_NLF_RATIO_SEVERE: float = 0.75  # < 0.75 重度
+
+    VOLUNTARY_COMPLETE: float = 0.85
+    VOLUNTARY_ALMOST: float = 0.70
+    VOLUNTARY_INITIATE: float = 0.40
+    VOLUNTARY_TRACE: float = 0.15
+
+    # =========================================================================
+    # clinical_base.py 中使用的阈值
+    # =========================================================================
+
+    EAR_DIFF_SYMMETRIC: float = 0.15  # EAR差异 < 15% 对称
+    EAR_DIFF_TRACE: float = 0.05  # EAR差异 < 5% 完美对称
+    AREA_RATIO_SYMMETRIC: float = 0.15  # 面积比偏离 < 15% 对称
+    CLOSURE_MIN_VALID: float = 0.10  # 最小有效闭合度
+    CLOSURE_ASYM_SYMMETRIC: float = 0.15  # 闭合不对称 < 15% 对称
+    CHANGE_DIFF_SYMMETRIC: float = 0.15  # 变化差异 < 15% 对称
+    REDUCTION_ASYM_SYMMETRIC: float = 0.10  # 缩减不对称 < 10% 对称
 
 
 # 全局单例
@@ -273,18 +335,7 @@ def get_eye_symmetry_level(asymmetry_ratio: float) -> int:
 
 
 def get_eye_sync_level(pearson_corr: float, peak_diff: int) -> int:
-    """
-    获取眼睛同步性等级
-
-    Args:
-        pearson_corr: Pearson相关系数
-        peak_diff: 峰值帧差异
-
-    Returns:
-        0: 同步良好
-        1: 同步一般
-        2: 同步较差
-    """
+    """获取眼睛同步性等级"""
     if pearson_corr >= THR.EYE_SYNC_PEARSON_GOOD and peak_diff <= THR.EYE_SYNC_PEAK_DIFF_MAX:
         return 0
     elif pearson_corr >= THR.EYE_SYNC_PEARSON_FAIR:
@@ -293,23 +344,37 @@ def get_eye_sync_level(pearson_corr: float, peak_diff: int) -> int:
         return 2
 
 
-def get_eye_symmetry_text(level: int) -> str:
-    """获取眼睛对称性文字描述"""
-    texts = {
-        0: "对称",
-        1: "轻度不对称",
-        2: "中度不对称",
-        3: "重度不对称",
-    }
-    return texts.get(level, "未知")
+def get_severity_level(offset_norm: float) -> int:
+    """
+    根据偏移量获取严重度等级
+
+    Returns:
+        1: 正常
+        2: 轻度
+        3: 中度
+        4: 重度
+        5: 完全面瘫
+    """
+    if offset_norm < THR.SEVERITY_NORMAL:
+        return 1
+    elif offset_norm < THR.SEVERITY_MILD:
+        return 2
+    elif offset_norm < THR.SEVERITY_MODERATE:
+        return 3
+    elif offset_norm < THR.SEVERITY_SEVERE:
+        return 4
+    else:
+        return 5
 
 
-def get_eye_sync_text(level: int) -> str:
-    """获取眼睛同步性文字描述"""
+def get_severity_text(level: int) -> str:
+    """获取严重度文字描述"""
     texts = {
-        0: "同步良好",
-        1: "同步一般",
-        2: "同步较差",
+        1: "正常",
+        2: "轻度异常",
+        3: "中度异常",
+        4: "重度异常",
+        5: "完全面瘫",
     }
     return texts.get(level, "未知")
 
@@ -322,15 +387,7 @@ def is_symmetric(ratio: float, threshold: float = None) -> bool:
 
 
 def get_asymmetry_level(ratio: float) -> int:
-    """
-    获取不对称程度等级
-
-    Returns:
-        0: 对称
-        1: 轻度不对称
-        2: 中度不对称
-        3: 重度不对称
-    """
+    """获取不对称程度等级"""
     deviation = abs(ratio - 1.0)
     if deviation <= THR.SYMMETRY_NORMAL:
         return 0
@@ -343,18 +400,7 @@ def get_asymmetry_level(ratio: float) -> int:
 
 
 def get_oral_angle_asymmetry_level(angle_diff: float) -> int:
-    """
-    获取口角角度不对称程度等级
-
-    Args:
-        angle_diff: 口角角度差值（度）
-
-    Returns:
-        0: 对称
-        1: 轻度不对称
-        2: 中度不对称
-        3: 重度不对称
-    """
+    """获取口角角度不对称程度等级"""
     if angle_diff < THR.ORAL_ANGLE_SYMMETRIC:
         return 0
     elif angle_diff < THR.ORAL_ANGLE_MILD:
@@ -366,19 +412,7 @@ def get_oral_angle_asymmetry_level(angle_diff: float) -> int:
 
 
 def get_synkinesis_score(change_ratio: float, region: str = "mouth") -> int:
-    """
-    获取联动运动评分
-
-    Args:
-        change_ratio: 变化比例
-        region: "mouth" 或 "eye"
-
-    Returns:
-        0: 无联动
-        1: 轻度联动
-        2: 中度联动
-        3: 重度联动
-    """
+    """获取联动运动评分"""
     if region == "mouth":
         mild = THR.SYNKINESIS_MOUTH_MILD
         moderate = THR.SYNKINESIS_MOUTH_MODERATE
@@ -398,13 +432,40 @@ def get_synkinesis_score(change_ratio: float, region: str = "mouth") -> int:
         return 3
 
 
+def get_voluntary_score(ratio: float) -> int:
+    """
+    根据运动比例获取Voluntary Movement评分
+
+    Args:
+        ratio: 患侧/健侧运动比例 (0-1)
+
+    Returns:
+        5: 完整运动
+        4: 几乎完整
+        3: 有启动
+        2: 轻微启动
+        1: 无运动
+    """
+    if ratio >= THR.VOLUNTARY_COMPLETE:
+        return 5
+    elif ratio >= THR.VOLUNTARY_ALMOST:
+        return 4
+    elif ratio >= THR.VOLUNTARY_INITIATE:
+        return 3
+    elif ratio >= THR.VOLUNTARY_TRACE:
+        return 2
+    else:
+        return 1
+
+
 if __name__ == "__main__":
     # 打印所有阈值用于检查
-    print("=" * 60)
-    print("阈值配置一览")
-    print("=" * 60)
+    print("=" * 70)
+    print("阈值配置一览 ")
+    print("=" * 70)
 
-    for field_name in dir(THR):
+    for field_name in sorted(dir(THR)):
         if not field_name.startswith("_"):
             value = getattr(THR, field_name)
-            print(f"{field_name}: {value}")
+            if not callable(value):
+                print(f"{field_name}: {value}")
