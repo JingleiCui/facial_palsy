@@ -31,7 +31,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from clinical_base import (
     LM, LandmarkExtractor, ActionResult,
     db_fetch_examinations, db_fetch_videos_for_exam, db_fetch_labels,
-    compute_ear, extract_common_indicators,
+    compute_ear, extract_common_indicators, draw_polygon,
+    make_json_serializable,
 )
 
 from sunnybrook_scorer import (
@@ -39,25 +40,6 @@ from sunnybrook_scorer import (
     Synkinesis, SynkinesisItem, SunnybrookScore,
     compute_resting_symmetry, compute_voluntary_score_from_ratio,
     compute_sunnybrook_composite, SUNNYBROOK_EXPRESSION_MAPPING
-)
-
-from session_diagnosis import (
-    SessionDiagnosis,
-    compute_session_diagnosis,
-    sunnybrook_to_hb,
-    voluntary_to_severity,
-    compute_action_severity,
-    standardize_action_output,
-    HB_DESCRIPTIONS,
-    SEVERITY_DESCRIPTIONS,
-)
-
-from diagnosis_visualization import (
-    draw_diagnosis_badge,
-    draw_diagnosis_panel,
-    draw_palsy_indicator_on_face,
-    add_diagnosis_overlay,
-    DiagnosisColors,
 )
 
 from thresholds import THR
@@ -87,24 +69,27 @@ TARGET_EXAM_ID = None
 # 调试筛选：只分析特定患者/特定检查（其余跳过）
 # =============================================================================
 # 1) 只跑指定患者（常用）
-TARGET_PATIENT_IDS = []
+TARGET_PATIENT_IDS = ["XW000124", "XW000132"]
 
 # 2) 只跑指定检查ID（优先级更高）
 TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
-    "NeutralFace",
-    "Smile",
-    "ShowTeeth",
-    "RaiseEyebrow",
-    "CloseEyeSoftly",
-    "CloseEyeHardly",
-    "VoluntaryEyeBlink",
-    "SpontaneousEyeBlink",
-    "LipPucker",
-    "BlowCheek",
-    "ShrugNose"
 ]
+
+# ENABLED_ACTIONS = [
+#     "NeutralFace",
+#     "Smile",
+#     "ShowTeeth",
+#     "RaiseEyebrow",
+#     "CloseEyeSoftly",
+#     "CloseEyeHardly",
+#     "VoluntaryEyeBlink",
+#     "SpontaneousEyeBlink",
+#     "LipPucker",
+#     "BlowCheek",
+#     "ShrugNose"
+# ]
 
 # 是否复用已有的 NeutralFace 结果（用于调试其他动作时跳过基线重算）
 # True: 从已有的 indicators.json 加载基线
@@ -152,7 +137,7 @@ def find_peak_frame_generic(landmarks_seq, frames_seq, w, h, action_name, baseli
     if action_name == "NeutralFace":
         return neutral_face.find_peak_frame(landmarks_seq, frames_seq, w, h)
     elif action_name == "Smile":
-        return smile.find_peak_frame_smile(landmarks_seq, frames_seq, w, h)
+        return smile.find_peak_frame(landmarks_seq, frames_seq, w, h)
     elif action_name == "ShowTeeth":
         return show_teeth.find_peak_frame(landmarks_seq, frames_seq, w, h)
     elif action_name in ["VoluntaryEyeBlink", "SpontaneousEyeBlink"]:
@@ -368,7 +353,6 @@ def process_generic_action(landmarks_seq, frames_seq, w, h, video_info, output_d
 
 def visualize_generic_action(frame, landmarks, w, h, result):
     """通用动作可视化"""
-    from clinical_base import draw_polygon, pt2d
 
     img = frame.copy()
 
@@ -1288,7 +1272,7 @@ def process_examination(examination: Dict[str, Any], db_path: str,
         summary["sunnybrook"] = sunnybrook.to_dict()
 
     with open(exam_output_dir / "summary.json", 'w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+        json.dump(make_json_serializable(summary), f, indent=2, ensure_ascii=False)
 
     return summary
 
@@ -1314,6 +1298,8 @@ def _process_exam_worker(args):
 # =============================================================================
 
 def main():
+    print("[DEBUG] running file:", __file__)
+    print("[DEBUG] ENABLED_ACTIONS:", ENABLED_ACTIONS)
     print("=" * 70)
     print("面部临床分级系统 - 完整Sunnybrook评分")
     print("=" * 70)
@@ -1394,10 +1380,20 @@ def main():
 
     else:
         # 只有1个检查时，多进程收益不大，避免额外开销
+        all_results = []
         with LandmarkExtractor(MEDIAPIPE_MODEL_PATH) as extractor:
             for i, exam in enumerate(examinations):
                 print(f"\n[{i + 1}/{len(examinations)}]", end="")
-                result = process_examination(exam, DATABASE_PATH, output_dir, extractor)
+
+                result = process_examination(
+                    exam,
+                    DATABASE_PATH,
+                    output_dir,
+                    extractor,
+                    enabled_actions=ENABLED_ACTIONS,
+                    reuse_baseline=REUSE_BASELINE,
+                    skip_existing=SKIP_EXISTING_ACTIONS,
+                )
                 all_results.append(result)
 
     print(f"\n\n{'=' * 70}")

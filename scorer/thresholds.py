@@ -34,7 +34,46 @@ class Thresholds:
     # =========================================================================
 
     # EAR (Eye Aspect Ratio) 闭眼阈值
-    EYE_CLOSURE_EAR: float = 0.15  # EAR < 此值认为眼睛闭合
+    EYE_CLOSURE_EAR: float = 0.22  # EAR < 此值认为眼睛闭合
+
+    # =========================================================================
+    # 眼睛闭合度相关阈值（基于面积比）
+    # =========================================================================
+
+    # 闭合度阈值（1 - current_area/baseline_area）
+    EYE_CLOSURE_RATIO_CLOSED: float = 0.90  # 闭合度 > 认为眼睛闭合
+    EYE_CLOSURE_RATIO_PARTIAL: float = 0.50  # 闭合度 > 认为部分闭合
+    EYE_CLOSURE_RATIO_MINIMAL: float = 0.20  # 闭合度 > 认为有闭眼动作
+
+    # 眼睛对称性阈值（|left - right| / max(left, right)）
+    EYE_SYMMETRY_NORMAL: float = 0.15  # 不对称比 < 15% 认为对称
+    EYE_SYMMETRY_MILD: float = 0.25  # 不对称比 < 25% 认为轻度不对称
+    EYE_SYMMETRY_MODERATE: float = 0.40  # 不对称比 < 40% 认为中度不对称
+
+    # 眼睛同步性阈值
+    EYE_SYNC_PEARSON_GOOD: float = 0.85  # Pearson相关 > 0.85 认为同步良好
+    EYE_SYNC_PEARSON_FAIR: float = 0.60  # Pearson相关 > 0.60 认为同步一般
+    EYE_SYNC_PEAK_DIFF_MAX: int = 5  # 峰值帧差 < 5帧 认为同步
+
+    # =========================================================================
+    # 鼓腮 BlowCheek 相对鼻尖深度阈值
+    # =========================================================================
+
+    # bulge = (base_rel_z - current_rel_z) / ICD，rel_z = cheek_z - nose_z
+    BLOW_CHEEK_BULGE_MIN: float = 0.005  # bulge > 0.5% 认为有鼓腮动作
+    BLOW_CHEEK_BULGE_GOOD: float = 0.02  # bulge > 2% 认为鼓腮明显
+    BLOW_CHEEK_ASYM_THRESHOLD: float = 0.15  # 左右不对称比 > 15% 判定患侧
+    BLOW_CHEEK_BASELINE_FRAMES: int = 10  # 用视频前10帧建立内部baseline
+
+    # =========================================================================
+    # 撅嘴 LipPucker 相对鼻尖深度阈值
+    # =========================================================================
+
+    # protrusion = (base_rel_z - current_rel_z) / ICD，rel_z = lip_z - nose_z
+    LIP_PUCKER_PROTRUSION_MIN: float = 0.005  # protrusion > 0.5% 认为有撅嘴动作
+    LIP_PUCKER_PROTRUSION_GOOD: float = 0.015  # protrusion > 1.5% 认为撅嘴明显
+    LIP_PUCKER_WIDTH_RATIO_MAX: float = 0.90  # 嘴宽比 < 90% 认为有收缩
+    LIP_PUCKER_BASELINE_FRAMES: int = 10  # 用视频前10帧建立内部baseline
 
     # 对称性判断阈值 (ratio 偏离 1.0 的程度)
     SYMMETRY_NORMAL: float = 0.10  # 偏差 < 10% 认为对称
@@ -58,22 +97,19 @@ class Thresholds:
 
     # 唇封闭距离归一化阈值 (seal_total / ICD)
     # 值越小表示嘴唇闭合越紧
-    MOUTH_SEAL: float = 0.58
+    MOUTH_SEAL: float = 0.032
 
     # 嘴部高度归一化阈值 (mouth_height / ICD)
     # 值越小表示嘴巴张开越小
-    MOUTH_HEIGHT: float = 0.05
+    MOUTH_HEIGHT: float = 0.032
 
     # 嘴唇内圈面积增幅阈值
     # 计算方式: (current_area / baseline_area) - 1.0
     # 值越大表示嘴张开越多
-    MOUTH_INNER_AREA_INC: float = 8.0
+    MOUTH_INNER_AREA_INC: float = 3.5
 
     # 嘴唇内圈面积基线最小值 (防止除零)
     MOUTH_INNER_AREA_BASE_EPS: float = 1e-4  # 原1e-5, 增大防止噪声
-
-    # 深度曲线平滑窗口
-    BLOW_CHEEK_SMOOTH_WIN: int = 7
 
     # =========================================================================
     # LipPucker 撅嘴动作阈值
@@ -84,9 +120,6 @@ class Thresholds:
 
     # 嘴唇 z 轴前移阈值 (归一化到 ICD)
     LIP_PUCKER_Z_DELTA: float = 0.01  # delta_z/ICD > 此值认为前移
-
-    # 深度曲线平滑窗口
-    LIP_PUCKER_SMOOTH_WIN: int = 5
 
     # =========================================================================
     # CloseEye 闭眼动作阈值
@@ -191,6 +224,94 @@ THR = Thresholds()
 def is_eye_closed(ear: float) -> bool:
     """判断眼睛是否闭合"""
     return ear < THR.EYE_CLOSURE_EAR
+
+
+def get_eye_closure_level(closure_ratio: float) -> int:
+    """
+    获取眼睛闭合程度等级
+
+    Args:
+        closure_ratio: 闭合度 (0-1)
+
+    Returns:
+        0: 睁开
+        1: 轻微闭合
+        2: 部分闭合
+        3: 完全闭合
+    """
+    if closure_ratio < THR.EYE_CLOSURE_RATIO_MINIMAL:
+        return 0
+    elif closure_ratio < THR.EYE_CLOSURE_RATIO_PARTIAL:
+        return 1
+    elif closure_ratio < THR.EYE_CLOSURE_RATIO_CLOSED:
+        return 2
+    else:
+        return 3
+
+
+def get_eye_symmetry_level(asymmetry_ratio: float) -> int:
+    """
+    获取眼睛对称性等级
+
+    Args:
+        asymmetry_ratio: 不对称比 (|L-R| / max(L,R))
+
+    Returns:
+        0: 对称
+        1: 轻度不对称
+        2: 中度不对称
+        3: 重度不对称
+    """
+    if asymmetry_ratio < THR.EYE_SYMMETRY_NORMAL:
+        return 0
+    elif asymmetry_ratio < THR.EYE_SYMMETRY_MILD:
+        return 1
+    elif asymmetry_ratio < THR.EYE_SYMMETRY_MODERATE:
+        return 2
+    else:
+        return 3
+
+
+def get_eye_sync_level(pearson_corr: float, peak_diff: int) -> int:
+    """
+    获取眼睛同步性等级
+
+    Args:
+        pearson_corr: Pearson相关系数
+        peak_diff: 峰值帧差异
+
+    Returns:
+        0: 同步良好
+        1: 同步一般
+        2: 同步较差
+    """
+    if pearson_corr >= THR.EYE_SYNC_PEARSON_GOOD and peak_diff <= THR.EYE_SYNC_PEAK_DIFF_MAX:
+        return 0
+    elif pearson_corr >= THR.EYE_SYNC_PEARSON_FAIR:
+        return 1
+    else:
+        return 2
+
+
+def get_eye_symmetry_text(level: int) -> str:
+    """获取眼睛对称性文字描述"""
+    texts = {
+        0: "对称",
+        1: "轻度不对称",
+        2: "中度不对称",
+        3: "重度不对称",
+    }
+    return texts.get(level, "未知")
+
+
+def get_eye_sync_text(level: int) -> str:
+    """获取眼睛同步性文字描述"""
+    texts = {
+        0: "同步良好",
+        1: "同步一般",
+        2: "同步较差",
+    }
+    return texts.get(level, "未知")
 
 
 def is_symmetric(ratio: float, threshold: float = None) -> bool:

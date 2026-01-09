@@ -36,6 +36,8 @@ from clinical_base import (
     compute_icd, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
     draw_palsy_side_label, compute_eye_closure_by_area,
+    compute_eye_closure_sequence, compute_eye_synchrony,
+    compute_eye_symmetry_at_peak,
 )
 
 from thresholds import THR
@@ -442,7 +444,7 @@ def plot_eye_curve(eye_seq: Dict, fps: float, peak_idx: int,
     ax1.plot(time_sec, eye_seq["ear"]["right"], 'r-', label='Right Eye EAR', linewidth=2)
     ax1.plot(time_sec, eye_seq["ear"]["average"], 'g--', label='Average EAR', linewidth=1.5, alpha=0.7)
     ax1.axvline(x=time_sec[peak_idx], color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
-    ax1.axhline(y=0.15, color='orange', linestyle=':', alpha=0.7, label='Closure Threshold')
+    ax1.axhline(y=THR.EYE_CLOSURE_EAR, color='orange', linestyle=':', alpha=0.7, label='Closure Threshold')
     ax1.set_xlabel('Time (seconds)' if fps > 0 else 'Frame', fontsize=11)
     ax1.set_ylabel('Eye Aspect Ratio (EAR)', fontsize=11)
 
@@ -581,10 +583,24 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     if not landmarks_seq or not frames_seq:
         return None
 
+    # 计算整个视频的闭合度序列
+    closure_data = compute_eye_closure_sequence(landmarks_seq, w, h, baseline_landmarks)
+
     # 找峰值帧 (眼睛面积最小/闭合度最大)
     peak_idx = find_peak_frame_close_eye(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
+
+    # 计算同步度（整个视频）
+    synchrony = compute_eye_synchrony(
+        closure_data["left_closure"],
+        closure_data["right_closure"]
+    )
+
+    # 计算峰值帧对称度
+    left_closure_at_peak = closure_data["left_closure"][peak_idx]
+    right_closure_at_peak = closure_data["right_closure"][peak_idx]
+    symmetry_at_peak = compute_eye_symmetry_at_peak(left_closure_at_peak, right_closure_at_peak)
 
     if peak_landmarks is None:
         return None
@@ -619,8 +635,13 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
-    # 获取面瘫侧别检测结果
-    palsy_detection = metrics.get("palsy_detection", {})
+    # 面瘫侧别检测
+    palsy_detection = {
+        "palsy_side": symmetry_at_peak["palsy_side"],
+        "confidence": 1.0 - symmetry_at_peak["symmetry_score"],
+        "interpretation": symmetry_at_peak["interpretation"],
+        "method": "area_closure_symmetry",
+    }
 
     # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
     severity_score, severity_desc = compute_severity_score(metrics)
@@ -641,11 +662,43 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
             "area_left": [float(x) if not np.isnan(x) else None for x in eye_seq["area"]["left"]],
             "area_right": [float(x) if not np.isnan(x) else None for x in eye_seq["area"]["right"]],
         },
+        # 闭合度序列（用于曲线绘制）
+        "closure_sequence": {
+            "left": [float(v) if np.isfinite(v) else None for v in closure_data["left_closure"]],
+            "right": [float(v) if np.isfinite(v) else None for v in closure_data["right_closure"]],
+        },
+
+        # 基线信息
+        "baseline": {
+            "left_area": float(closure_data["baseline_left_area"]),
+            "right_area": float(closure_data["baseline_right_area"]),
+        },
+
+        # 峰值帧信息
+        "peak_frame": {
+            "idx": int(peak_idx),
+            "left_closure": float(left_closure_at_peak),
+            "right_closure": float(right_closure_at_peak),
+            "left_area": float(closure_data["left_area"][peak_idx]),
+            "right_area": float(closure_data["right_area"][peak_idx]),
+        },
+
+        # 对称度分析
+        "symmetry_analysis": symmetry_at_peak,
+
+        # 同步度分析
+        "synchrony_analysis": synchrony,
+
+        # 面瘫检测
         "palsy_detection": palsy_detection,
-        "voluntary_interpretation": interpretation,
-        "synkinesis": synkinesis,
-        "severity_score": severity_score,
-        "severity_desc": severity_desc,
+
+        # 诊断汇总
+        "diagnosis_summary": {
+            "palsy_side": palsy_detection["palsy_side"],
+            "symmetry_score": symmetry_at_peak["symmetry_score"],
+            "synchrony_score": synchrony["synchrony_score"],
+            "pearson_correlation": synchrony["pearson_correlation"],
+        }
     }
 
     if "left_closure_percent" in metrics:

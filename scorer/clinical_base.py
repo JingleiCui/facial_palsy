@@ -117,8 +117,8 @@ class LM:
     CHEEK_L = [425, 426, 427, 411, 280]
     CHEEK_R = [205, 206, 207, 187, 50]
 
-    BLOW_CHEEK_L = [280, 376, 433, 367, 364, 273, 410, 423, 266, ]
-    BLOW_CHEEK_R = [50, 147, 213, 138, 135, 43, 92, 203, 36, ]
+    BLOW_CHEEK_L = [280, 376, 433, 367, 364, 287, 410, 423, 266, ]
+    BLOW_CHEEK_R = [50, 147, 213, 138, 135, 57, 92, 203, 36, ]
 
     # =============================================================================
 
@@ -2718,3 +2718,360 @@ def compute_ala_canthus_change(landmarks, w: int, h: int,
             result["palsy_side_suggestion"] = 2
 
     return result
+
+
+# =============================================================================
+# 眼睛闭合度序列计算
+# =============================================================================
+
+def compute_eye_closure_sequence(landmarks_seq: List, w: int, h: int,
+                                 baseline_landmarks=None) -> Dict[str, Any]:
+    """
+    计算整个视频序列的眼睛闭合度
+
+    闭合度定义: closure_ratio = 1 - (current_area / baseline_area)
+    - 0 = 完全睁开（面积等于基线）
+    - 1 = 完全闭合（面积为0）
+
+    Args:
+        landmarks_seq: 关键点序列
+        w, h: 图像尺寸
+        baseline_landmarks: 基线关键点（静息帧）
+
+    Returns:
+        {
+            "left_closure": [闭合度序列],
+            "right_closure": [闭合度序列],
+            "left_area": [面积序列],
+            "right_area": [面积序列],
+            "baseline_left_area": 基线左眼面积,
+            "baseline_right_area": 基线右眼面积,
+            "baseline_source": "neutral" | "video_init",
+        }
+    """
+    n = len(landmarks_seq)
+
+    left_area_seq = []
+    right_area_seq = []
+    left_closure_seq = []
+    right_closure_seq = []
+
+    # 获取基线面积
+    baseline_source = "neutral"
+    if baseline_landmarks is not None:
+        baseline_left_area, _ = compute_eye_area(baseline_landmarks, w, h, True)
+        baseline_right_area, _ = compute_eye_area(baseline_landmarks, w, h, False)
+    else:
+        # 用视频前10帧的最大面积作为baseline（假设开始时眼睛睁开）
+        baseline_source = "video_init"
+        init_left = []
+        init_right = []
+        for lm in landmarks_seq[:min(10, n)]:
+            if lm is not None:
+                la, _ = compute_eye_area(lm, w, h, True)
+                ra, _ = compute_eye_area(lm, w, h, False)
+                if la > 0:
+                    init_left.append(la)
+                if ra > 0:
+                    init_right.append(ra)
+
+        # 使用90百分位数而非最大值，更鲁棒
+        baseline_left_area = float(np.percentile(init_left, 90)) if init_left else 1.0
+        baseline_right_area = float(np.percentile(init_right, 90)) if init_right else 1.0
+
+    # 确保baseline有效
+    baseline_left_area = max(baseline_left_area, 1e-6)
+    baseline_right_area = max(baseline_right_area, 1e-6)
+
+    for lm in landmarks_seq:
+        if lm is None:
+            left_area_seq.append(np.nan)
+            right_area_seq.append(np.nan)
+            left_closure_seq.append(np.nan)
+            right_closure_seq.append(np.nan)
+        else:
+            # 计算尺度因子（补偿距离变化）
+            if baseline_landmarks is not None:
+                scale = compute_scale_to_baseline(lm, baseline_landmarks, w, h)
+            else:
+                scale = 1.0
+
+            l_area, _ = compute_eye_area(lm, w, h, True)
+            r_area, _ = compute_eye_area(lm, w, h, False)
+
+            # 尺度校正
+            scaled_l = l_area * (scale ** 2)
+            scaled_r = r_area * (scale ** 2)
+
+            left_area_seq.append(float(scaled_l))
+            right_area_seq.append(float(scaled_r))
+
+            # 闭合度 = 1 - (当前面积/基线面积)
+            l_closure = 1.0 - (scaled_l / baseline_left_area)
+            r_closure = 1.0 - (scaled_r / baseline_right_area)
+
+            # 限制在 0-1 范围
+            left_closure_seq.append(float(max(0, min(1, l_closure))))
+            right_closure_seq.append(float(max(0, min(1, r_closure))))
+
+    return {
+        "left_closure": left_closure_seq,
+        "right_closure": right_closure_seq,
+        "left_area": left_area_seq,
+        "right_area": right_area_seq,
+        "baseline_left_area": float(baseline_left_area),
+        "baseline_right_area": float(baseline_right_area),
+        "baseline_source": baseline_source,
+    }
+
+
+# =============================================================================
+# 眼睛同步度计算
+# =============================================================================
+
+def compute_eye_synchrony(left_closure_seq: List[float],
+                          right_closure_seq: List[float]) -> Dict[str, Any]:
+    """
+    计算左右眼的同步度
+
+    衡量两只眼睛运动的时间同步性和幅度一致性
+
+    指标：
+    1. Pearson相关系数：时间同步性（-1~1，越接近1越同步）
+    2. 峰值时间差：两眼达到最大闭合的帧差
+    3. 闭合度差异：幅度一致性
+
+    Args:
+        left_closure_seq: 左眼闭合度序列
+        right_closure_seq: 右眼闭合度序列
+
+    Returns:
+        {
+            "pearson_correlation": 相关系数,
+            "peak_frame_diff": 峰值帧差异,
+            "left_peak_frame": 左眼峰值帧,
+            "right_peak_frame": 右眼峰值帧,
+            "mean_closure_diff": 平均闭合度差异,
+            "max_closure_diff": 最大闭合度差异,
+            "synchrony_score": 综合同步度得分 (0-1),
+            "valid_frames": 有效帧数,
+        }
+    """
+    left_arr = np.array(left_closure_seq, dtype=np.float64)
+    right_arr = np.array(right_closure_seq, dtype=np.float64)
+
+    # 过滤无效值
+    valid_mask = np.isfinite(left_arr) & np.isfinite(right_arr)
+    valid_count = int(valid_mask.sum())
+
+    if valid_count < 5:
+        return {
+            "pearson_correlation": 0.0,
+            "peak_frame_diff": 0,
+            "left_peak_frame": 0,
+            "right_peak_frame": 0,
+            "mean_closure_diff": 0.0,
+            "max_closure_diff": 0.0,
+            "synchrony_score": 0.5,
+            "valid_frames": valid_count,
+            "status": "insufficient_data",
+        }
+
+    left_valid = left_arr[valid_mask]
+    right_valid = right_arr[valid_mask]
+
+    # 1. Pearson 相关系数
+    if np.std(left_valid) > 1e-6 and np.std(right_valid) > 1e-6:
+        pearson_corr = float(np.corrcoef(left_valid, right_valid)[0, 1])
+        if np.isnan(pearson_corr):
+            pearson_corr = 1.0
+    else:
+        pearson_corr = 1.0  # 无变化时认为同步
+
+    # 2. 峰值帧差异
+    # 使用整个序列（包含nan的位置也要考虑）
+    left_peak_idx = int(np.nanargmax(left_arr)) if np.any(np.isfinite(left_arr)) else 0
+    right_peak_idx = int(np.nanargmax(right_arr)) if np.any(np.isfinite(right_arr)) else 0
+    peak_frame_diff = abs(left_peak_idx - right_peak_idx)
+
+    # 3. 闭合度差异
+    closure_diff = np.abs(left_valid - right_valid)
+    mean_closure_diff = float(np.mean(closure_diff))
+    max_closure_diff = float(np.max(closure_diff))
+
+    # 4. 综合同步度得分
+    # 权重：相关性(50%) + 峰值同步(30%) + 幅度一致(20%)
+    corr_score = (pearson_corr + 1) / 2  # 映射到 0-1
+    peak_score = max(0, 1 - peak_frame_diff / 10)  # 10帧以上差异得0分
+    diff_score = max(0, 1 - mean_closure_diff * 5)  # 20%平均差异得0分
+
+    synchrony_score = 0.5 * corr_score + 0.3 * peak_score + 0.2 * diff_score
+
+    return {
+        "pearson_correlation": float(pearson_corr),
+        "peak_frame_diff": int(peak_frame_diff),
+        "left_peak_frame": int(left_peak_idx),
+        "right_peak_frame": int(right_peak_idx),
+        "mean_closure_diff": float(mean_closure_diff),
+        "max_closure_diff": float(max_closure_diff),
+        "synchrony_score": float(synchrony_score),
+        "valid_frames": valid_count,
+        "status": "ok",
+    }
+
+
+# =============================================================================
+# 峰值帧眼睛对称度计算
+# =============================================================================
+
+def compute_eye_symmetry_at_peak(left_closure: float, right_closure: float,
+                                 threshold: float = 0.15) -> Dict[str, Any]:
+    """
+    计算峰值帧的左右眼对称度
+
+    Args:
+        left_closure: 左眼闭合度 (0-1)
+        right_closure: 右眼闭合度 (0-1)
+        threshold: 不对称判定阈值（默认15%）
+
+    Returns:
+        {
+            "left_closure": 左眼闭合度,
+            "right_closure": 右眼闭合度,
+            "closure_diff": 闭合度差值（绝对值）,
+            "asymmetry_ratio": 不对称比例,
+            "symmetry_score": 对称度得分 (0-1, 1=完全对称),
+            "palsy_side": 患侧判断 (0=对称, 1=左, 2=右),
+            "interpretation": 文字解释,
+        }
+    """
+    # 处理无效值
+    if not np.isfinite(left_closure) or not np.isfinite(right_closure):
+        return {
+            "left_closure": float(left_closure) if np.isfinite(left_closure) else 0.0,
+            "right_closure": float(right_closure) if np.isfinite(right_closure) else 0.0,
+            "closure_diff": 0.0,
+            "asymmetry_ratio": 0.0,
+            "symmetry_score": 1.0,
+            "palsy_side": 0,
+            "interpretation": "数据无效",
+        }
+
+    closure_diff = abs(left_closure - right_closure)
+    max_closure = max(left_closure, right_closure)
+
+    # 闭合幅度太小，无法判断
+    if max_closure < 0.15:
+        return {
+            "left_closure": float(left_closure),
+            "right_closure": float(right_closure),
+            "closure_diff": float(closure_diff),
+            "asymmetry_ratio": 0.0,
+            "symmetry_score": 1.0,
+            "palsy_side": 0,
+            "interpretation": f"闭眼幅度过小 (L={left_closure:.1%}, R={right_closure:.1%})，无法判断",
+        }
+
+    asymmetry_ratio = closure_diff / max_closure
+    symmetry_score = max(0, 1 - asymmetry_ratio)
+
+    # 判断患侧
+    if asymmetry_ratio < threshold:
+        palsy_side = 0
+        interpretation = f"双眼闭合对称 (L={left_closure:.1%}, R={right_closure:.1%}, 差异{asymmetry_ratio:.1%})"
+    elif left_closure < right_closure:
+        # 左眼闭合程度低 = 左眼闭不上 = 左侧面瘫
+        palsy_side = 1
+        interpretation = f"左眼闭合较差 (L={left_closure:.1%} < R={right_closure:.1%}) → 左侧面瘫"
+    else:
+        palsy_side = 2
+        interpretation = f"右眼闭合较差 (R={right_closure:.1%} < L={left_closure:.1%}) → 右侧面瘫"
+
+    return {
+        "left_closure": float(left_closure),
+        "right_closure": float(right_closure),
+        "closure_diff": float(closure_diff),
+        "asymmetry_ratio": float(asymmetry_ratio),
+        "symmetry_score": float(symmetry_score),
+        "palsy_side": int(palsy_side),
+        "interpretation": interpretation,
+    }
+
+
+# =============================================================================
+# 综合眼睛分析
+# =============================================================================
+
+def analyze_eye_closure_full(landmarks_seq: List, w: int, h: int,
+                             baseline_landmarks=None,
+                             peak_idx: int = None) -> Dict[str, Any]:
+    """
+    完整的眼睛闭合分析（整合闭合度序列、同步度、对称度）
+
+    Args:
+        landmarks_seq: 关键点序列
+        w, h: 图像尺寸
+        baseline_landmarks: 基线关键点
+        peak_idx: 峰值帧索引（如果不提供，自动找最大闭合帧）
+
+    Returns:
+        完整的分析结果，包含所有指标
+    """
+    # 1. 计算闭合度序列
+    closure_data = compute_eye_closure_sequence(landmarks_seq, w, h, baseline_landmarks)
+
+    # 2. 自动找峰值帧（如果没提供）
+    if peak_idx is None:
+        left_arr = np.array(closure_data["left_closure"])
+        right_arr = np.array(closure_data["right_closure"])
+        avg_arr = (left_arr + right_arr) / 2
+        peak_idx = int(np.nanargmax(avg_arr)) if np.any(np.isfinite(avg_arr)) else 0
+
+    # 3. 计算同步度
+    synchrony = compute_eye_synchrony(
+        closure_data["left_closure"],
+        closure_data["right_closure"]
+    )
+
+    # 4. 计算峰值帧对称度
+    if 0 <= peak_idx < len(closure_data["left_closure"]):
+        left_at_peak = closure_data["left_closure"][peak_idx]
+        right_at_peak = closure_data["right_closure"][peak_idx]
+    else:
+        left_at_peak = 0.0
+        right_at_peak = 0.0
+
+    symmetry = compute_eye_symmetry_at_peak(left_at_peak, right_at_peak)
+
+    # 5. 综合诊断
+    diagnosis = {
+        "palsy_side": symmetry["palsy_side"],
+        "confidence": 1.0 - symmetry["symmetry_score"],
+        "symmetry_score": symmetry["symmetry_score"],
+        "synchrony_score": synchrony["synchrony_score"],
+        "method": "area_closure_analysis",
+    }
+
+    return {
+        "closure_sequence": {
+            "left": [float(v) if np.isfinite(v) else None for v in closure_data["left_closure"]],
+            "right": [float(v) if np.isfinite(v) else None for v in closure_data["right_closure"]],
+        },
+        "area_sequence": {
+            "left": [float(v) if np.isfinite(v) else None for v in closure_data["left_area"]],
+            "right": [float(v) if np.isfinite(v) else None for v in closure_data["right_area"]],
+        },
+        "baseline": {
+            "left_area": closure_data["baseline_left_area"],
+            "right_area": closure_data["baseline_right_area"],
+            "source": closure_data["baseline_source"],
+        },
+        "peak_frame": {
+            "idx": int(peak_idx),
+            "left_closure": float(left_at_peak),
+            "right_closure": float(right_at_peak),
+        },
+        "symmetry_analysis": symmetry,
+        "synchrony_analysis": synchrony,
+        "diagnosis": diagnosis,
+    }

@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 
 from clinical_base import (
     LM, pt2d, pt3d, pts2d, dist, compute_ear, compute_eye_area,
-    compute_mouth_metrics, compute_oral_angle, compute_lip_seal_distance,
+    compute_mouth_metrics, compute_oral_angle,
     compute_icd, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
     kabsch_rigid_transform, apply_rigid_transform,
@@ -108,99 +108,285 @@ def _save_lip_z_curve_png(png_path, z_delta_norm, peak_idx: int):
     plt.close()
 
 
+# =============================================================================
+# 曲线绘制函数
+# =============================================================================
+
+def _save_lip_protrusion_curve_png(png_path,
+                                   peak_debug: Dict[str, Any],
+                                   palsy_detection: Dict[str, Any] = None) -> None:
+    """
+    绘制撅嘴 protrusion 曲线
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    from clinical_base import add_valid_region_shading, get_palsy_side_text
+
+    protrusion = peak_debug.get("protrusion", [])
+    width_ratio = peak_debug.get("width_ratio", [])
+    score = peak_debug.get("score", [])
+    valid_mask = peak_debug.get("valid", None)
+    peak_idx = peak_debug.get("peak_idx", 0)
+
+    if not protrusion:
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+
+    n = len(protrusion)
+    xs = np.arange(n)
+
+    protrusion_arr = np.array([v if v is not None else np.nan for v in protrusion])
+    width_ratio_arr = np.array([v if v is not None else np.nan for v in width_ratio])
+    score_arr = np.array([v if v is not None else np.nan for v in score])
+
+    # ===== 上图：Protrusion 曲线 =====
+    ax1 = axes[0]
+
+    if valid_mask is not None:
+        add_valid_region_shading(ax1, valid_mask, xs)
+
+    ax1.plot(xs, protrusion_arr, 'b-', label="Lip protrusion", linewidth=2)
+    ax1.plot(xs, score_arr, 'g--', label="Combined score", linewidth=1.5, alpha=0.7)
+
+    if 0 <= peak_idx < n:
+        ax1.axvline(peak_idx, linestyle="--", color='black', linewidth=2)
+        if np.isfinite(score_arr[peak_idx]):
+            ax1.scatter([peak_idx], [score_arr[peak_idx]], color='red', s=150,
+                        zorder=5, marker='*', edgecolors='black', linewidths=2)
+
+    title = "LipPucker: Lip protrusion relative to nose (higher = more protrusion)"
+    if palsy_detection:
+        palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
+        title += f' | Detected: {palsy_text}'
+
+    ax1.set_title(title, fontsize=12, fontweight='bold')
+    ax1.set_xlabel("Frame")
+    ax1.set_ylabel("Protrusion / Score")
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+
+    # ===== 下图：Width ratio 曲线 =====
+    ax2 = axes[1]
+
+    ax2.plot(xs, width_ratio_arr, 'orange', linewidth=2, label='Mouth width ratio')
+    ax2.axhline(y=1.0, color='gray', linestyle='--', linewidth=1, label='Baseline width')
+
+    if 0 <= peak_idx < n:
+        ax2.axvline(peak_idx, linestyle='--', color='black', linewidth=2)
+
+    ax2.set_title('Mouth Width Ratio (< 1.0 = narrower = puckering)', fontsize=11)
+    ax2.set_xlabel('Frame')
+    ax2.set_ylabel('Width Ratio')
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(0.5, 1.2)
+
+    plt.tight_layout()
+    plt.savefig(str(png_path), dpi=150)
+    plt.close()
+
+
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
                     baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
     """
-    撅嘴峰值帧：
-    - 主：嘴宽相对 baseline 明显变小
-    - 辅：唇部区域更靠近镜头（baseline_z - current_z 更大）
-    - 门控：不张嘴 + 唇密封（避免误选说话/张口帧）
+    撅嘴峰值帧选择 - 使用嘴唇相对鼻尖的深度变化
+
+    原理：
+    - rel_z = mean_z(lip_region) - z(nose_tip)
+    - 撅嘴时嘴唇前突，rel_z 变小（更靠近相机）
+    - protrusion = (base_rel_z - current_rel_z) / ICD
+    - 同时考虑嘴宽收缩（撅嘴时嘴变窄）
+
+    内部baseline：用视频前 BASELINE_FRAMES 帧的中位数
+
+    Args:
+        landmarks_seq: 关键点序列
+        frames_seq: 帧图像序列（未使用，保留接口兼容）
+        w, h: 图像尺寸
+        baseline_landmarks: 静息帧关键点（本方法不需要，但保留接口兼容）
+
+    Returns:
+        (peak_idx, peak_debug): 峰值帧索引和调试信息
     """
     n = len(landmarks_seq)
     if n == 0:
-        return 0, {}
+        return 0, {"error": "empty_sequence"}
 
-    # baseline mouth width / ICD / baseline lip z
-    if baseline_landmarks is not None:
-        base_mouth = compute_mouth_metrics(baseline_landmarks, w, h)
-        base_width = float(base_mouth["width"])
-        base_icd = float(compute_icd(baseline_landmarks, w, h))
-        base_z = _mean_lip_z_aligned(baseline_landmarks, w, h, baseline_landmarks=None)
-    else:
-        # 没 baseline 就用第一帧当 baseline（退化）
-        first = next((lm for lm in landmarks_seq if lm is not None), None)
-        base_mouth = compute_mouth_metrics(first, w, h) if first is not None else {"width": 1.0}
-        base_width = float(base_mouth["width"])
-        base_icd = float(compute_icd(first, w, h)) if first is not None else 1.0
-        base_z = _mean_lip_z_aligned(first, w, h, baseline_landmarks=None) if first is not None else 0.0
+    # 配置参数
+    BASELINE_FRAMES = getattr(THR, 'LIP_PUCKER_BASELINE_FRAMES', 10)
+    MOUTH_H_THR = THR.MOUTH_HEIGHT
 
-    base_width = max(base_width, 1e-6)
-    base_icd = max(base_icd, 1e-6)
+    # ========== 辅助函数 ==========
+    def _safe_pt3d(landmarks, idx: int):
+        """安全获取3D点"""
+        try:
+            if landmarks is None or idx < 0 or idx >= len(landmarks):
+                return None
+            return np.asarray(pt3d(landmarks[idx], w, h), dtype=np.float64)
+        except Exception:
+            return None
 
-    # 门控阈值（你可以按数据再调）
-    mouth_h_thr = THR.MOUTH_HEIGHT
-    seal_thr = THR.MOUTH_SEAL
+    def _get_nose_z(landmarks) -> float:
+        """获取鼻尖Z坐标"""
+        p = _safe_pt3d(landmarks, LM.NOSE_TIP)
+        return float(p[2]) if p is not None else np.nan
 
-    best_score = -1e18
-    best_idx = 0
+    def _get_lip_mean_z(landmarks) -> float:
+        """获取嘴唇区域平均Z坐标"""
+        lip_indices = list(LM.OUTER_LIP) + list(LM.INNER_LIP)
+        zs = []
+        for idx in lip_indices:
+            p = _safe_pt3d(landmarks, idx)
+            if p is not None:
+                zs.append(float(p[2]))
+        return float(np.mean(zs)) if zs else np.nan
 
-    width_ratio_list = []
-    z_delta_norm_list = []
-    score_list = []
-    valid_list = []
+    # ========== 第一遍扫描：收集所有帧的指标 ==========
+    icd_arr = np.full(n, np.nan, dtype=np.float64)
+    nose_z_arr = np.full(n, np.nan, dtype=np.float64)
+    lip_z_arr = np.full(n, np.nan, dtype=np.float64)
+    lip_rel_z_arr = np.full(n, np.nan, dtype=np.float64)
+    mouth_width_arr = np.full(n, np.nan, dtype=np.float64)
+    mouth_height_arr = np.full(n, np.nan, dtype=np.float64)
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
-            width_ratio_list.append(float("nan"))
-            z_delta_norm_list.append(float("nan"))
-            score_list.append(float("nan"))
-            valid_list.append(False)
             continue
 
-        mouth = compute_mouth_metrics(lm, w, h)
-        width = float(mouth["width"])
-        height = float(mouth["height"])
+        try:
+            icd = float(max(compute_icd(lm, w, h), 1e-6))
+        except Exception:
+            continue
 
-        width_ratio = width / base_width
-        mouth_h_ratio = height / base_icd
+        icd_arr[i] = icd
 
-        # 唇密封（越小越闭合）
-        seal = compute_lip_seal_distance(lm, w, h)
-        seal_ratio = float(seal["middle_distance"]) / base_icd
+        # 鼻尖和嘴唇Z坐标
+        nose_z = _get_nose_z(lm)
+        lip_z = _get_lip_mean_z(lm)
 
-        # 唇部深度：对齐后取唇部平均z（越小越靠前）
-        cur_z = _mean_lip_z_aligned(lm, w, h, baseline_landmarks=baseline_landmarks)
-        # delta_z：baseline_z - current_z （越大表示越“靠前”）
-        z_delta = float(base_z - cur_z)
-        z_delta_norm = z_delta / base_icd
+        nose_z_arr[i] = nose_z
+        lip_z_arr[i] = lip_z
 
-        # 门控：不张口 + 唇闭合（避免嘴张开误选）
-        valid = (mouth_h_ratio <= mouth_h_thr) and (seal_ratio <= seal_thr)
+        # 相对鼻尖的深度
+        if np.isfinite(nose_z) and np.isfinite(lip_z):
+            lip_rel_z_arr[i] = lip_z - nose_z
 
-        # 评分：嘴唇前突为主
-        score = z_delta_norm
+        # 嘴部指标
+        try:
+            mouth = compute_mouth_metrics(lm, w, h)
+            mouth_width_arr[i] = float(mouth["width"])
+            mouth_height_arr[i] = float(mouth["height"])
+        except Exception:
+            pass
 
-        # 如果没通过门控，强惩罚
-        if not valid:
-            score -= 10.0
+    # ========== 建立视频内部baseline ==========
+    valid_init_mask = (np.isfinite(lip_rel_z_arr[:BASELINE_FRAMES]) &
+                       np.isfinite(icd_arr[:BASELINE_FRAMES]) &
+                       np.isfinite(mouth_width_arr[:BASELINE_FRAMES]))
+    valid_init_idx = np.where(valid_init_mask)[0]
 
-        width_ratio_list.append(width_ratio)
-        z_delta_norm_list.append(z_delta_norm)
-        score_list.append(score)
-        valid_list.append(valid)
+    if len(valid_init_idx) < 3:
+        all_valid = (np.isfinite(lip_rel_z_arr) &
+                     np.isfinite(icd_arr) &
+                     np.isfinite(mouth_width_arr))
+        valid_init_idx = np.where(all_valid)[0]
 
-        if score > best_score:
-            best_score = score
-            best_idx = i
+    if len(valid_init_idx) == 0:
+        return 0, {"error": "no_valid_frames", "method": "nose_relative_protrusion"}
 
-    debug = {
-        "width_ratio": width_ratio_list,
-        "lip_z_delta_norm": z_delta_norm_list,
-        "score": score_list,
-        "valid": valid_list,
-        "best_score": float(best_score)
+    base_lip_rel_z = float(np.median(lip_rel_z_arr[valid_init_idx]))
+    base_icd = float(np.median(icd_arr[valid_init_idx]))
+    base_mouth_width = float(np.median(mouth_width_arr[valid_init_idx]))
+
+    # ========== 计算 protrusion 曲线 ==========
+    protrusion_arr = np.full(n, np.nan, dtype=np.float64)
+    width_ratio_arr = np.full(n, np.nan, dtype=np.float64)
+    score_arr = np.full(n, np.nan, dtype=np.float64)
+
+    for i in range(n):
+        # protrusion = (base_rel - current_rel) / ICD
+        # 撅嘴时嘴唇前突，current_rel 变小，protrusion 变大
+        if np.isfinite(lip_rel_z_arr[i]):
+            protrusion_arr[i] = (base_lip_rel_z - lip_rel_z_arr[i]) / base_icd
+
+        # 嘴宽比（撅嘴时嘴变窄）
+        if np.isfinite(mouth_width_arr[i]) and base_mouth_width > 0:
+            width_ratio_arr[i] = mouth_width_arr[i] / base_mouth_width
+
+        # 综合评分：前突为主，嘴宽收缩为辅
+        if np.isfinite(protrusion_arr[i]):
+            score_arr[i] = protrusion_arr[i]
+            # 加分：嘴变窄（width_ratio < 1）
+            if np.isfinite(width_ratio_arr[i]) and width_ratio_arr[i] < 1.0:
+                width_bonus = (1.0 - width_ratio_arr[i]) * 0.5
+                score_arr[i] += width_bonus
+
+    # ========== 门控：闭唇 ==========
+    mouth_h_norm = mouth_height_arr / icd_arr
+
+    valid = (np.isfinite(score_arr) & (mouth_h_norm <= MOUTH_H_THR))
+
+    # 退化策略
+    if valid.sum() < 3:
+        valid = np.isfinite(score_arr) & (mouth_h_norm <= MOUTH_H_THR * 1.5)
+
+    if valid.sum() < 1:
+        valid = np.isfinite(score_arr)
+
+    # 选峰值帧
+    fallback = None
+    if valid.sum() < 1:
+        fallback = "no_valid_fallback"
+        peak_idx = int(np.nanargmax(score_arr)) if np.any(np.isfinite(score_arr)) else 0
+    else:
+        cand = np.where(valid)[0]
+        peak_idx = int(cand[int(np.nanargmax(score_arr[cand]))])
+
+    # ========== 调试信息 ==========
+    peak_debug = {
+        # 原始Z坐标
+        "nose_z": [float(v) if np.isfinite(v) else None for v in nose_z_arr],
+        "lip_z": [float(v) if np.isfinite(v) else None for v in lip_z_arr],
+
+        # 相对鼻尖的深度
+        "lip_rel_z": [float(v) if np.isfinite(v) else None for v in lip_rel_z_arr],
+
+        # protrusion 曲线
+        "protrusion": [float(v) if np.isfinite(v) else None for v in protrusion_arr],
+
+        # 嘴宽比
+        "width_ratio": [float(v) if np.isfinite(v) else None for v in width_ratio_arr],
+
+        # 综合评分
+        "score": [float(v) if np.isfinite(v) else None for v in score_arr],
+
+        # 门控曲线
+        "mouth_height_norm": [float(v) if np.isfinite(v) else None for v in mouth_h_norm],
+
+        # baseline信息
+        "baseline": {
+            "frames_used": int(len(valid_init_idx)),
+            "lip_rel_z": float(base_lip_rel_z),
+            "icd": float(base_icd),
+            "mouth_width": float(base_mouth_width),
+        },
+
+        # 阈值
+        "thresholds": {
+            "mouth_h_thr": float(MOUTH_H_THR),
+        },
+
+        # 选帧结果
+        "valid": [bool(v) for v in valid],
+        "peak_idx": int(peak_idx),
+        "fallback": fallback,
+        "method": "nose_relative_protrusion",
     }
-    return best_idx, debug
+
+    return peak_idx, peak_debug
 
 
 def compute_lip_pucker_metrics(landmarks, w: int, h: int,

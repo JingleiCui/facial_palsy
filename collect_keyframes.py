@@ -468,7 +468,7 @@ def collect_one_exam(exam_dir: Path) -> Tuple[int, int, List[Dict[str, Any]], Op
         dst_action_dir = DST_ROOT / action_name
         dst_action_dir.mkdir(parents=True, exist_ok=True)
 
-        # 复制图片
+        # 复制关键帧图片（peak_raw / peak_indicators）
         for base in targets:
             src_file = None
             for ext in exts:
@@ -488,6 +488,18 @@ def collect_one_exam(exam_dir: Path) -> Tuple[int, int, List[Dict[str, Any]], Op
                 copied += 1
             except Exception as e:
                 print(f"[ERROR] copy failed: {src_file} -> {dst_path} | {e}")
+                skipped += 1
+
+        # 复制曲线图
+        curve_files = sorted(action_dir.glob("*curve*.png"))
+        for curve_file in curve_files:
+            dst_name = f"{exam_id}_{action_name}_{curve_file.name}"
+            dst_path = dst_action_dir / dst_name
+            try:
+                shutil.copy2(curve_file, dst_path)
+                copied += 1
+            except Exception as e:
+                print(f"[ERROR] copy curve failed: {curve_file} -> {dst_path} | {e}")
                 skipped += 1
 
         # 加载面瘫预测并记录
@@ -1416,7 +1428,8 @@ def copy_classified_images(records: List[Dict[str, Any]], output_dir: Path):
         # 目标目录
         dst_cat_dir = output_dir / action / result
 
-        # 复制图片
+        # 复制关键帧图片（peak_raw / peak_indicators）
+        copied_files = 0
         for img_base in ["peak_raw", "peak_indicators"]:
             src_path = None
             for ext in ["jpg", "jpeg", "png", "webp"]:
@@ -1435,9 +1448,31 @@ def copy_classified_images(records: List[Dict[str, Any]], output_dir: Path):
                 except Exception as e:
                     print(f"[WARN] Copy failed: {src_path} -> {dst_path}: {e}")
 
+        # 复制证据曲线图, 规则：复制 src_action_dir 下所有 *_curve.png
+        curve_candidates = []
+        curve_candidates.extend(sorted(src_action_dir.glob("*_curve.png")))
+
+        # 去重（按文件名）
+        seen = set()
+        for curve_path in curve_candidates:
+            if not curve_path.is_file():
+                continue
+            if curve_path.name in seen:
+                continue
+            seen.add(curve_path.name)
+
+            dst_name = f"{exam_id}_{curve_path.name}"  # 放在动作目录下，文件名带 exam_id
+            dst_path = dst_cat_dir / dst_name
+            try:
+                shutil.copy2(curve_path, dst_path)  # 不压缩，原样复制
+                copied_files += 1
+            except Exception as e:
+                print(f"[WARN] Copy curve failed: {curve_path} -> {dst_path}: {e}")
+
     # 打印统计
-    total_copied = sum(sum(v.values()) for v in copy_stats.values())
-    print(f"\n[OK] Classified images copied: {total_copied * 2} files to {output_dir}")
+    total_pairs = sum(sum(v.values()) for v in copy_stats.values())
+    print(f"\n[OK] Classified exam-action copied: {total_pairs} pairs (peak_raw+peak_indicators) to {output_dir}")
+    print("[OK] Curve images (*_curve.png) are also copied when present.")
 
     print(f"\n分类图片统计:")
     print(f"{'Action':<20} {'OK':>5} {'WRONG':>6} {'FN':>4} {'FP':>4} {'both_sym':>8}")
