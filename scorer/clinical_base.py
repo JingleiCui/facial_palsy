@@ -23,7 +23,7 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
-
+from thresholds import THR
 
 # =============================================================================
 # Landmark 索引定义 (MediaPipe 478点)
@@ -928,6 +928,120 @@ def compute_oral_angle(landmarks, w: int, h: int) -> OralAngleMeasure:
         angle_asymmetry=abs(BOF_angle - AOE_angle),
         A_dist_to_EF=A_dist, B_dist_to_EF=B_dist
     )
+
+
+def compute_face_midline(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    计算面中线（双眼内眦中点的中垂线）
+
+    Returns:
+        {
+            "center": (cx, cy),           # 内眦中点
+            "direction": (nx, ny),         # 中垂线单位方向向量
+            "top_point": (tx, ty),         # 面中线顶端点
+            "bottom_point": (bx, by),      # 面中线底端点
+            "icd": float,                  # 内眦距（归一化基准）
+        }
+    """
+    # 获取内眦点
+    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)  # 362
+    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)  # 133
+
+    lx, ly = left_canthus
+    rx, ry = right_canthus
+
+    # 中点
+    cx, cy = (lx + rx) / 2, (ly + ry) / 2
+
+    # 内眦距
+    icd = math.sqrt((rx - lx) ** 2 + (ry - ly) ** 2)
+
+    # 连线方向
+    dx, dy = rx - lx, ry - ly
+
+    # 中垂线方向（法向量，归一化）
+    length = math.sqrt(dx ** 2 + dy ** 2)
+    if length < 1e-6:
+        return None
+    nx, ny = -dy / length, dx / length  # 旋转90度
+
+    # 计算上下端点（延伸到图像边界）
+    # 向上延伸到眉毛上方，向下延伸到下巴
+    extend_up = cy + 50  # 向上延伸
+    extend_down = h - cy  # 向下延伸
+
+    top_point = (cx + nx * extend_up, cy + ny * extend_up)
+    bottom_point = (cx - nx * extend_down, cy - ny * extend_down)
+
+    return {
+        "center": (cx, cy),
+        "direction": (nx, ny),
+        "top_point": top_point,
+        "bottom_point": bottom_point,
+        "icd": icd,
+    }
+
+
+def draw_face_midline(img: np.ndarray, midline: Dict[str, Any],
+                      color=(0, 255, 255), thickness=2, dashed=True) -> np.ndarray:
+    """
+    在图像上绘制面中线
+
+    Args:
+        img: 输入图像
+        midline: compute_face_midline的返回值
+        color: 颜色 (BGR)
+        thickness: 线宽
+        dashed: 是否使用虚线
+    """
+    result = img.copy()
+
+    if midline is None:
+        return result
+
+    top = midline["top_point"]
+    bottom = midline["bottom_point"]
+    center = midline["center"]
+
+    tx, ty = int(top[0]), int(top[1])
+    bx, by = int(bottom[0]), int(bottom[1])
+    cx, cy = int(center[0]), int(center[1])
+
+    if dashed:
+        # 绘制虚线
+        dash_length = 10
+        gap_length = 5
+
+        # 计算总长度和方向
+        total_length = math.sqrt((bx - tx) ** 2 + (by - ty) ** 2)
+        dx = (bx - tx) / total_length
+        dy = (by - ty) / total_length
+
+        current_length = 0
+        while current_length < total_length:
+            start_x = tx + dx * current_length
+            start_y = ty + dy * current_length
+            end_length = min(current_length + dash_length, total_length)
+            end_x = tx + dx * end_length
+            end_y = ty + dy * end_length
+
+            cv2.line(result,
+                     (int(start_x), int(start_y)),
+                     (int(end_x), int(end_y)),
+                     color, thickness)
+
+            current_length += dash_length + gap_length
+    else:
+        cv2.line(result, (tx, ty), (bx, by), color, thickness)
+
+    # 标注中心点
+    cv2.circle(result, (cx, cy), 4, color, -1)
+
+    # 标注"Face Midline"
+    cv2.putText(result, "Face Mid", (cx + 5, ty + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+    return result
 
 
 # =============================================================================
@@ -3075,3 +3189,69 @@ def analyze_eye_closure_full(landmarks_seq: List, w: int, h: int,
         "synchrony_analysis": synchrony,
         "diagnosis": diagnosis,
     }
+
+
+# === Add these new functions to the end of clinical_base.py ===
+
+def detect_synkinesis_from_mouth(baseline_result: Optional[ActionResult],
+                                 current_landmarks, w: int, h: int) -> Dict[str, int]:
+    """检测嘴部动作时的眼部联动"""
+    synkinesis = {"eye_synkinesis": 0, "brow_synkinesis": 0}
+    if baseline_result is None: return synkinesis
+
+    l_ear, r_ear = compute_ear(current_landmarks, w, h, True), compute_ear(current_landmarks, w, h, False)
+    bl_ear, br_ear = baseline_result.left_ear, baseline_result.right_ear
+
+    if bl_ear > 1e-9 and br_ear > 1e-9:
+        l_change = (bl_ear - l_ear) / bl_ear
+        r_change = (br_ear - r_ear) / br_ear
+        avg_change = (l_change + r_change) / 2
+
+        if avg_change > THR.MOUTH_SYNKINESIS_EYE_SEVERE:
+            synkinesis["eye_synkinesis"] = 3
+        elif avg_change > THR.MOUTH_SYNKINESIS_EYE_MODERATE:
+            synkinesis["eye_synkinesis"] = 2
+        elif avg_change > THR.MOUTH_SYNKINESIS_EYE_MILD:
+            synkinesis["eye_synkinesis"] = 1
+    return synkinesis
+
+
+def detect_synkinesis_from_brow(baseline_result: Optional[ActionResult],
+                                current_landmarks, w: int, h: int) -> Dict[str, int]:
+    """检测抬眉时的嘴部联动"""
+    synkinesis = {"mouth_synkinesis": 0}
+    if baseline_result is None: return synkinesis
+
+    mouth = compute_mouth_metrics(current_landmarks, w, h)
+    if baseline_result.mouth_width > 1e-9:
+        mouth_change = abs(mouth["width"] - baseline_result.mouth_width) / baseline_result.mouth_width
+        if mouth_change > THR.RAISE_EYEBROW_SYNKINESIS_MOUTH_SEVERE:
+            synkinesis["mouth_synkinesis"] = 3
+        elif mouth_change > THR.RAISE_EYEBROW_SYNKINESIS_MOUTH_MODERATE:
+            synkinesis["mouth_synkinesis"] = 2
+        elif mouth_change > THR.RAISE_EYEBROW_SYNKINESIS_MOUTH_MILD:
+            synkinesis["mouth_synkinesis"] = 1
+    return synkinesis
+
+
+def compute_voluntary_score_from_excursion(excursion_metrics: Dict[str, Any]) -> Tuple[int, str]:
+    """根据运动幅度计算Voluntary Score"""
+    left_exc = excursion_metrics.get("left_reduction") or excursion_metrics.get("left_total", 0)
+    right_exc = excursion_metrics.get("right_reduction") or excursion_metrics.get("right_total", 0)
+
+    max_exc = max(left_exc, right_exc)
+    if max_exc < 3: return 1, "运动幅度过小"
+
+    symmetry_ratio = min(left_exc, right_exc) / max_exc if max_exc > 1e-6 else 1.0
+
+    if symmetry_ratio >= THR.SMILE_VOL_SYMM_COMPLETE:
+        return 5, "运动完整"
+    elif symmetry_ratio >= THR.SMILE_VOL_SYMM_ALMOST:
+        return 4, "几乎完整"
+    elif symmetry_ratio >= THR.SMILE_VOL_SYMM_INITIATE:
+        return 3, "启动但不对称"
+    elif symmetry_ratio >= THR.SMILE_VOL_SYMM_SLIGHT:
+        return 2, "轻微启动"
+    else:
+        return 1, "无法启动"
+

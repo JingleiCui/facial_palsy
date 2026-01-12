@@ -170,6 +170,90 @@ def plot_lip_pucker_peak_selection(
     plt.close()
 
 
+def compute_lip_midline_angle(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    计算嘴唇中线与面中线的角度
+
+    原理:
+    - 面中线: 鼻尖到下巴中点的连线方向 (垂直向下)
+    - 嘴唇中线: 上唇中点到下唇中点的连线方向
+    - 正常情况两线接近平行，面瘫时形成角度
+
+    Args:
+        landmarks: 面部关键点
+        w, h: 图像尺寸
+
+    Returns:
+        {
+            "angle": 夹角(度),
+            "direction": 偏向 ("left", "right", "center"),
+            "cross_product": 叉积值 (用于判断方向),
+            "face_vec": 面中线向量,
+            "lip_vec": 嘴唇中线向量,
+        }
+    """
+    result = {
+        "angle": 0.0,
+        "direction": "center",
+        "cross_product": 0.0,
+        "face_vec": (0, 1),
+        "lip_vec": (0, 1),
+    }
+
+    try:
+        # 面中线: 鼻尖 -> 下巴中点 (归一化方向)
+        nose_tip = pt2d(landmarks[LM.NOSE_TIP], w, h)
+
+        # 获取下巴点 (LM.CHIN = 152)
+        chin = pt2d(landmarks[LM.CHIN], w, h)
+
+        face_vec = (chin[0] - nose_tip[0], chin[1] - nose_tip[1])
+        result["face_vec"] = face_vec
+
+        # 嘴唇中线: 上唇中点 -> 下唇中点
+        lip_top = pt2d(landmarks[LM.LIP_TOP_CENTER], w, h)
+        lip_bot = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)
+        lip_vec = (lip_bot[0] - lip_top[0], lip_bot[1] - lip_top[1])
+        result["lip_vec"] = lip_vec
+
+        # 计算向量模
+        def magnitude(v):
+            return math.sqrt(v[0] ** 2 + v[1] ** 2)
+
+        mag_face = magnitude(face_vec)
+        mag_lip = magnitude(lip_vec)
+
+        if mag_face < 1e-6 or mag_lip < 1e-6:
+            return result
+
+        # 计算夹角 (点积)
+        dot = face_vec[0] * lip_vec[0] + face_vec[1] * lip_vec[1]
+        cos_angle = dot / (mag_face * mag_lip)
+        cos_angle = max(-1.0, min(1.0, cos_angle))  # 数值稳定
+        angle = math.degrees(math.acos(cos_angle))
+        result["angle"] = angle
+
+        # 判断偏向 (叉积)
+        # cross = face_x * lip_y - face_y * lip_x
+        # cross > 0: lip_vec 在 face_vec 逆时针方向 (嘴唇偏左)
+        # cross < 0: lip_vec 在 face_vec 顺时针方向 (嘴唇偏右)
+        cross = face_vec[0] * lip_vec[1] - face_vec[1] * lip_vec[0]
+        result["cross_product"] = cross
+
+        # 设置方向阈值 (避免噪声)
+        if abs(cross) < 1e-3:
+            result["direction"] = "center"
+        elif cross > 0:
+            result["direction"] = "left"  # 嘴唇偏向左侧
+        else:
+            result["direction"] = "right"  # 嘴唇偏向右侧
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
                     baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
     """
@@ -501,17 +585,21 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
         else:
             metrics["corner_contraction_asymmetry"] = 0
 
+        lip_angle = compute_lip_midline_angle(landmarks, w, h)
+        metrics["lip_midline_angle"] = lip_angle
+
     return metrics
 
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从撅嘴动作检测面瘫侧别 - 基于嘴角收缩程度比较
+    从撅嘴动作检测面瘫侧别
 
-    核心逻辑:
-    - 撅嘴时口轮匝肌收缩，嘴唇向中间聚拢
-    - 比较左右嘴角的收缩量
-    - 收缩量小的一侧 = 面瘫侧（肌肉无力）
+    判断逻辑:
+    1. 嘴角收缩量比较: 收缩量小的一侧是患侧
+    2. 嘴唇中线角度: 嘴唇偏向X侧 → X对侧是患侧
+    3. 嘴唇中心偏移: 嘴唇偏向X侧 → X对侧是患侧
+    4. 综合加权投票
     """
     result = {
         "palsy_side": 0,
@@ -521,67 +609,87 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "evidence": {}
     }
 
-    # ========== 方法: 嘴角收缩量比较 ==========
+    votes = {0: 0.0, 1: 0.0, 2: 0.0}
+    evidence = {}
+    reasons = {1: [], 2: []}
+
+    # ========== 方法1: 嘴角收缩量比较 ==========
     left_contraction = metrics.get("left_corner_contraction", 0)
     right_contraction = metrics.get("right_corner_contraction", 0)
-
-    result["evidence"]["left_contraction"] = left_contraction
-    result["evidence"]["right_contraction"] = right_contraction
-
     max_contraction = max(abs(left_contraction), abs(right_contraction))
 
-    if max_contraction < 2:  # 运动幅度过小（像素）
-        # 回退到lip_midline_offset
-        if "lip_midline_offset" in metrics:
-            offset_data = metrics["lip_midline_offset"]
-            current_offset = offset_data.get("current_offset", 0)
-            icd = metrics.get("icd", 1)
-            if icd < 1e-6:
-                icd = 1
-            offset_norm = abs(current_offset) / icd
-            result["evidence"]["offset_norm"] = offset_norm
+    evidence["left_contraction"] = left_contraction
+    evidence["right_contraction"] = right_contraction
 
-            if offset_norm > 0.020:
-                result["method"] = "lip_midline_offset"
-                result["confidence"] = min(1.0, offset_norm * 15)
+    if max_contraction >= THR.LIP_PUCKER_PALSY_MIN_CONTRACTION:
+        asymmetry = abs(left_contraction - right_contraction) / max_contraction
+        evidence["contraction_asymmetry"] = asymmetry
 
-                if current_offset > 0:
-                    result["palsy_side"] = 2
-                    result["interpretation"] = f"嘴唇偏向左侧 ({current_offset:+.1f}px) → 右侧面瘫"
-                else:
-                    result["palsy_side"] = 1
-                    result["interpretation"] = f"嘴唇偏向右侧 ({current_offset:+.1f}px) → 左侧面瘫"
-                return result
+        if asymmetry >= THR.LIP_PUCKER_PALSY_ASYMMETRY_THRESHOLD:
+            if left_contraction < right_contraction:
+                votes[1] += THR.LIP_PUCKER_CONTRACTION_WEIGHT
+                reasons[1].append(f"L收缩弱{left_contraction:.1f}px")
+                evidence["contraction_vote"] = 1
+            else:
+                votes[2] += THR.LIP_PUCKER_CONTRACTION_WEIGHT
+                reasons[2].append(f"R收缩弱{right_contraction:.1f}px")
+                evidence["contraction_vote"] = 2
+            evidence["contraction_triggered"] = True
 
-        result["method"] = "none"
-        result["interpretation"] = "运动幅度过小，无法判断"
-        return result
+    # ========== 方法2: 嘴唇中线角度 ==========
+    lip_angle = metrics.get("lip_midline_angle", {})
+    angle = lip_angle.get("angle", 0)
+    direction = lip_angle.get("direction", "center")
 
-    # 计算不对称度
-    asymmetry = abs(left_contraction - right_contraction) / max_contraction
-    result["evidence"]["contraction_asymmetry"] = asymmetry
-    result["method"] = "corner_contraction"
-    result["confidence"] = min(1.0, asymmetry * 2)
+    evidence["midline_angle"] = angle
+    evidence["angle_direction"] = direction
 
-    if asymmetry < 0.15:
-        result["palsy_side"] = 0
-        result["interpretation"] = (
-            f"双侧嘴角收缩对称 (L={left_contraction:.1f}px, R={right_contraction:.1f}px, "
-            f"不对称{asymmetry:.1%})"
-        )
-    elif left_contraction < right_contraction:
-        # 左侧收缩量小 = 左侧肌肉弱 = 左侧面瘫
+    if angle >= THR.LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD:
+        if direction == "left":
+            votes[2] += THR.LIP_PUCKER_ANGLE_WEIGHT
+            reasons[2].append(f"偏左{angle:.1f}°")
+            evidence["angle_vote"] = 2
+        elif direction == "right":
+            votes[1] += THR.LIP_PUCKER_ANGLE_WEIGHT
+            reasons[1].append(f"偏右{angle:.1f}°")
+            evidence["angle_vote"] = 1
+        evidence["angle_triggered"] = True
+
+    # ========== 方法3: 嘴唇中心偏移 ==========
+    lip_offset = metrics.get("lip_midline_offset", {})
+    offset_norm = abs(lip_offset.get("offset_norm", 0) or 0)
+    current_offset = lip_offset.get("current_offset", 0) or 0
+
+    evidence["offset_norm"] = offset_norm
+    evidence["current_offset"] = current_offset
+
+    if offset_norm >= THR.LIP_PUCKER_PALSY_OFFSET_THRESHOLD:
+        if current_offset > 0:
+            votes[2] += THR.LIP_PUCKER_OFFSET_WEIGHT
+            reasons[2].append(f"偏左{current_offset:+.1f}px")
+            evidence["offset_vote"] = 2
+        elif current_offset < 0:
+            votes[1] += THR.LIP_PUCKER_OFFSET_WEIGHT
+            reasons[1].append(f"偏右{abs(current_offset):.1f}px")
+            evidence["offset_vote"] = 1
+        evidence["offset_triggered"] = True
+
+    # ========== 汇总 ==========
+    evidence["votes"] = {"left": votes[1], "right": votes[2]}
+    result["evidence"] = evidence
+
+    min_conf = 0.12
+    if votes[1] >= min_conf and votes[1] >= votes[2]:
         result["palsy_side"] = 1
-        result["interpretation"] = (
-            f"左侧嘴角收缩弱 (L={left_contraction:.1f}px < R={right_contraction:.1f}px, "
-            f"不对称{asymmetry:.1%}) → 左侧面瘫"
-        )
-    else:
+        result["confidence"] = min(1.0, votes[1])
+        result["interpretation"] = "左侧面瘫: " + ", ".join(reasons[1])
+    elif votes[2] >= min_conf:
         result["palsy_side"] = 2
-        result["interpretation"] = (
-            f"右侧嘴角收缩弱 (R={right_contraction:.1f}px < L={left_contraction:.1f}px, "
-            f"不对称{asymmetry:.1%}) → 右侧面瘫"
-        )
+        result["confidence"] = min(1.0, votes[2])
+        result["interpretation"] = "右侧面瘫: " + ", ".join(reasons[2])
+    else:
+        asym = evidence.get("contraction_asymmetry", 0)
+        result["interpretation"] = f"对称 (收缩差{asym:.1%}, 角度{angle:.1f}°)"
 
     return result
 
@@ -982,7 +1090,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     vis = visualize_lip_pucker(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
-    # !! 新增：调用绘图函数
+    # 调用绘图函数
     if peak_debug:
         plot_lip_pucker_peak_selection(
             peak_debug,

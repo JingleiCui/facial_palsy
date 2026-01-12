@@ -34,7 +34,7 @@ from clinical_base import (
     draw_palsy_side_label, compute_lip_midline_symmetry,
     compute_lip_midline_offset_from_face_midline,
 )
-from diagnosis_visualization import add_diagnosis_overlay, draw_diagnosis_badge
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt

@@ -134,72 +134,166 @@ def extract_eye_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, Dict[
     }
 
 
-def detect_palsy_side_from_closure(peak_closure_data: Dict[str, Any]) -> Dict[str, Any]:
+def detect_palsy_side(
+        symmetry_at_peak: Dict[str, Any],
+        synchrony: Dict[str, Any],
+        left_closure: float,
+        right_closure: float
+) -> Dict[str, Any]:
     """
-    从闭眼动作检测面瘫侧别 - 基于眼睛面积
+    综合对称度和同步度检测面瘫侧别
 
-    原理: 使用compute_eye_closure_by_area的结果来判断面瘫侧
+    判断逻辑:
+    1. 对称度差 (asymmetry > 8%) → 闭合差的一侧是患侧
+    2. 同步度差 (peak_diff > 3帧) → 峰值帧晚的一侧是患侧
+    3. 完整性差 (一侧<85%但另一侧>=85%) → 闭合不完全的一侧是患侧
+    4. Pearson相关 (<0.70) → 加权同步度判断
+    5. 综合加权投票
 
     Args:
-        peak_closure_data: 峰值帧的眼睛闭合数据（来自compute_eye_closure_by_area）
+        symmetry_at_peak: 峰值帧对称度分析结果
+        synchrony: 同步度分析结果
+        left_closure: 左眼峰值闭合度
+        right_closure: 右眼峰值闭合度
+
+    Returns:
+        palsy_detection dict
     """
     result = {
         "palsy_side": 0,
         "confidence": 0.0,
+        "method": "comprehensive",
         "interpretation": "",
-        "method": "area_closure",
-        "evidence": {}
+        "evidence": {},
     }
 
-    if peak_closure_data is None:
-        result["interpretation"] = "无闭眼数据"
-        return result
+    # 提取指标
+    asymmetry_ratio = symmetry_at_peak.get("asymmetry_ratio", 0)
+    symmetry_palsy = symmetry_at_peak.get("palsy_side", 0)
 
-    left_closure = peak_closure_data.get("left_closure_ratio", 0)
-    right_closure = peak_closure_data.get("right_closure_ratio", 0)
+    peak_diff = synchrony.get("peak_frame_diff", 0)
+    left_peak = synchrony.get("left_peak_frame", 0)
+    right_peak = synchrony.get("right_peak_frame", 0)
+    pearson = synchrony.get("pearson_correlation", 1.0)
 
-    result["evidence"] = {
-        "left_area": peak_closure_data.get("left_area", 0),
-        "right_area": peak_closure_data.get("right_area", 0),
-        "left_closure_pct": left_closure * 100,
-        "right_closure_pct": right_closure * 100,
+    # 收集证据
+    evidence = {
+        "asymmetry_ratio": asymmetry_ratio,
+        "symmetry_palsy_vote": symmetry_palsy,
+        "peak_frame_diff": peak_diff,
+        "left_peak_frame": left_peak,
+        "right_peak_frame": right_peak,
+        "pearson_correlation": pearson,
+        "left_closure": left_closure,
+        "right_closure": right_closure,
     }
 
-    if "baseline_left_area" in peak_closure_data:
-        result["evidence"]["baseline_left_area"] = peak_closure_data["baseline_left_area"]
-        result["evidence"]["baseline_right_area"] = peak_closure_data["baseline_right_area"]
+    # ========== 1. 对称度分析 ==========
+    sym_vote = 0
+    sym_weight = 0.0
+
+    if asymmetry_ratio >= THR.EYE_PALSY_ASYMMETRY_THRESHOLD:
+        sym_vote = symmetry_palsy
+        # 不对称越大，权重越高
+        sym_weight = THR.EYE_PALSY_SYMMETRY_WEIGHT * min(1.0, asymmetry_ratio * 5)
+        evidence["symmetry_triggered"] = True
+    else:
+        evidence["symmetry_triggered"] = False
+
+    # ========== 2. 同步度分析 ==========
+    sync_vote = 0
+    sync_weight = 0.0
+
+    if peak_diff > THR.EYE_PALSY_SYNC_PEAK_DIFF:
+        # 峰值帧晚的一侧 = 反应慢 = 患侧
+        sync_vote = 1 if left_peak > right_peak else 2
+        sync_weight = THR.EYE_PALSY_SYNC_WEIGHT * min(1.0, peak_diff / 10)
+        evidence["sync_triggered"] = True
+        evidence["sync_palsy_vote"] = sync_vote
+    else:
+        evidence["sync_triggered"] = False
+        evidence["sync_palsy_vote"] = 0
+
+    # Pearson相关性低也是不同步的证据
+    if pearson < THR.EYE_PALSY_PEARSON_THRESHOLD:
+        # 如果Pearson低但peak_diff不大，额外加权
+        if not evidence.get("sync_triggered"):
+            sync_weight += THR.EYE_PALSY_SYNC_WEIGHT * 0.5
+        evidence["low_pearson_triggered"] = True
+    else:
+        evidence["low_pearson_triggered"] = False
+
+    # ========== 3. 完整性分析 ==========
+    complete_vote = 0
+    complete_weight = 0.0
 
     max_closure = max(left_closure, right_closure)
+    min_closure = min(left_closure, right_closure)
 
-    if max_closure < THR.EYE_CLOSURE_RATIO_PARTIAL:  # 闭合不足
-        result["interpretation"] = f"闭眼幅度过小 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%)"
-        result["evidence"]["status"] = "insufficient_closure"
-        return result
+    if max_closure >= THR.EYE_PALSY_COMPLETE_CLOSURE:
+        # 有一侧能完全闭合
+        if min_closure < THR.EYE_PALSY_COMPLETE_CLOSURE:
+            # 另一侧闭不完全 → 患侧
+            complete_vote = 1 if left_closure < right_closure else 2
+            complete_weight = THR.EYE_PALSY_COMPLETE_WEIGHT
+            evidence["completeness_triggered"] = True
+            evidence["incomplete_side"] = "left" if complete_vote == 1 else "right"
 
-    # 计算不对称比例
-    asymmetry = abs(left_closure - right_closure) / max_closure
-    result["confidence"] = min(1.0, asymmetry * 5)
-    result["evidence"]["asymmetry_ratio"] = asymmetry
-    result["evidence"]["left_closure_pct"] = left_closure * 100
-    result["evidence"]["right_closure_pct"] = right_closure * 100
+    if "completeness_triggered" not in evidence:
+        evidence["completeness_triggered"] = False
 
-    if asymmetry < THR.EYE_SYMMETRY_NORMAL:  # 以内认为对称
-        result["palsy_side"] = 0
-        result["interpretation"] = (
-            f"双眼闭合对称 (L={left_closure * 100:.1f}%, R={right_closure * 100:.1f}%, "
-            f"差异{asymmetry * 100:.4f}%)"
-        )
-    elif left_closure < right_closure:
-        # 左眼闭合程度低 -> 左侧面瘫
+    # ========== 4. 综合投票 ==========
+    votes = {0: 0.0, 1: 0.0, 2: 0.0}
+
+    if sym_vote != 0:
+        votes[sym_vote] += sym_weight
+    if sync_vote != 0:
+        votes[sync_vote] += sync_weight
+    if complete_vote != 0:
+        votes[complete_vote] += complete_weight
+
+    evidence["vote_scores"] = {
+        "symmetric": votes[0],
+        "left_palsy": votes[1],
+        "right_palsy": votes[2],
+    }
+
+    result["evidence"] = evidence
+
+    # ========== 5. 最终判定 ==========
+    # 选择得票最高的（需要超过阈值）
+    min_confidence = 0.15  # 最低置信度阈值
+
+    if votes[1] >= min_confidence and votes[1] >= votes[2]:
         result["palsy_side"] = 1
+        result["confidence"] = min(1.0, votes[1])
+    elif votes[2] >= min_confidence and votes[2] > votes[1]:
+        result["palsy_side"] = 2
+        result["confidence"] = min(1.0, votes[2])
+    else:
+        result["palsy_side"] = 0
+        result["confidence"] = 0.0
+
+    # ========== 6. 生成解释 ==========
+    if result["palsy_side"] == 0:
         result["interpretation"] = (
-            f"左眼闭合差 (L={left_closure * 100:.1f}% < R={right_closure * 100:.1f}%) → 左侧面瘫"
+            f"双眼闭合对称 (差异{asymmetry_ratio:.1%}, "
+            f"峰值差{peak_diff}帧, Pearson={pearson:.2f})"
         )
     else:
-        result["palsy_side"] = 2
-        result["interpretation"] = (
-            f"右眼闭合差 (R={right_closure * 100:.1f}% < L={left_closure * 100:.1f}%) → 右侧面瘫"
-        )
+        side_name = "左" if result["palsy_side"] == 1 else "右"
+        reasons = []
+
+        if evidence.get("symmetry_triggered") and sym_vote == result["palsy_side"]:
+            reasons.append(f"闭合度差异{asymmetry_ratio:.1%}")
+        if evidence.get("sync_triggered") and sync_vote == result["palsy_side"]:
+            reasons.append(f"峰值延迟{peak_diff}帧")
+        if evidence.get("low_pearson_triggered"):
+            reasons.append(f"相关性低{pearson:.2f}")
+        if evidence.get("completeness_triggered") and complete_vote == result["palsy_side"]:
+            reasons.append("闭合不完全")
+
+        result["interpretation"] = f"{side_name}侧面瘫: " + ", ".join(reasons) if reasons else f"{side_name}侧面瘫"
 
     return result
 
@@ -268,10 +362,6 @@ def compute_close_eye_metrics(landmarks, w: int, h: int,
         metrics["right_closure_ratio"] = area_closure["right_closure_ratio"]
         metrics["left_closure_percent"] = area_closure["left_closure_ratio"] * 100
         metrics["right_closure_percent"] = area_closure["right_closure_ratio"] * 100
-
-    # 面瘫侧检测（使用面积方法）
-    palsy_detection = detect_palsy_side_from_closure(area_closure)
-    metrics["palsy_detection"] = palsy_detection
 
     return metrics
 
@@ -635,13 +725,13 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
-    # 面瘫侧别检测
-    palsy_detection = {
-        "palsy_side": symmetry_at_peak["palsy_side"],
-        "confidence": 1.0 - symmetry_at_peak["symmetry_score"],
-        "interpretation": symmetry_at_peak["interpretation"],
-        "method": "area_closure_symmetry",
-    }
+    # 面瘫侧别检测 - 综合对称度和同步度
+    palsy_detection = detect_palsy_side(
+        symmetry_at_peak=symmetry_at_peak,
+        synchrony=synchrony,
+        left_closure=left_closure_at_peak,
+        right_closure=right_closure_at_peak
+    )
 
     # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
     severity_score, severity_desc = compute_severity_score(metrics)

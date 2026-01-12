@@ -29,7 +29,7 @@ class Thresholds:
     # =========================================================================
 
     # EAR (Eye Aspect Ratio) 闭眼阈值
-    EYE_CLOSURE_EAR: float = 0.22  # EAR < 此值认为眼睛闭合
+    EYE_CLOSURE_EAR: float = 0.2  # EAR < 此值认为眼睛闭合
 
     # =========================================================================
     # 眼睛闭合度相关阈值（基于面积比）
@@ -49,6 +49,23 @@ class Thresholds:
     EYE_SYNC_PEARSON_GOOD: float = 0.85  # Pearson相关 > 0.85 认为同步良好
     EYE_SYNC_PEARSON_FAIR: float = 0.60  # Pearson相关 > 0.60 认为同步一般
     EYE_SYNC_PEAK_DIFF_MAX: int = 5  # 峰值帧差 < 5帧 认为同步
+
+    # 对称度阈值 - 降低以提高敏感度
+    EYE_PALSY_ASYMMETRY_THRESHOLD: float = 0.08  # 8%差异即判定不对称 (原15%)
+
+    # 同步度阈值 - 峰值帧差异
+    EYE_PALSY_SYNC_PEAK_DIFF: int = 3  # 峰值帧差>3帧判定不同步
+
+    # 完整闭合阈值
+    EYE_PALSY_COMPLETE_CLOSURE: float = 0.85  # 闭合度>85%认为完全闭合
+
+    # 综合判断权重
+    EYE_PALSY_SYMMETRY_WEIGHT: float = 0.50  # 对称度权重
+    EYE_PALSY_SYNC_WEIGHT: float = 0.30  # 同步度权重
+    EYE_PALSY_COMPLETE_WEIGHT: float = 0.20  # 完整性权重
+
+    # Pearson相关系数阈值
+    EYE_PALSY_PEARSON_THRESHOLD: float = 0.70  # <0.70认为不同步
 
     # =========================================================================
     # 鼓腮 BlowCheek 阈值
@@ -87,6 +104,23 @@ class Thresholds:
     LIP_PUCKER_CORNER_ASYM_MILD: float = 0.20
     LIP_PUCKER_CORNER_ASYM_MODERATE: float = 0.35
     LIP_PUCKER_CORNER_ASYM_SEVERE: float = 0.50
+
+    # 嘴角收缩不对称阈值 - 降低以提高敏感度
+    LIP_PUCKER_PALSY_ASYMMETRY_THRESHOLD: float = 0.10  # 10%差异判定不对称 (原15%)
+
+    # 最小收缩量阈值 - 降低以捕获更多运动
+    LIP_PUCKER_PALSY_MIN_CONTRACTION: float = 1.0  # 1px即可分析 (原2px)
+
+    # 嘴唇中线角度阈值
+    LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD: float = 4.0  # 角度>4度判定偏斜
+
+    # 嘴唇中心偏移阈值 (归一化到ICD)
+    LIP_PUCKER_PALSY_OFFSET_THRESHOLD: float = 0.012  # 偏移>1.2% ICD (原2%)
+
+    # 综合判断权重
+    LIP_PUCKER_CONTRACTION_WEIGHT: float = 0.40  # 收缩量权重
+    LIP_PUCKER_ANGLE_WEIGHT: float = 0.35  # 角度权重
+    LIP_PUCKER_OFFSET_WEIGHT: float = 0.25  # 偏移量权重
 
     # =========================================================================
     # 对称性判断通用阈值
@@ -367,6 +401,32 @@ def get_severity_level(offset_norm: float) -> int:
         return 5
 
 
+def get_eye_palsy_from_asymmetry(asymmetry_ratio: float, left_closure: float, right_closure: float) -> int:
+    """
+    基于对称度判断眼睛面瘫侧
+
+    Returns:
+        0: 对称, 1: 左侧面瘫, 2: 右侧面瘫
+    """
+    if asymmetry_ratio < THR.EYE_PALSY_ASYMMETRY_THRESHOLD:
+        return 0
+    # 闭合度低的一侧是患侧
+    return 1 if left_closure < right_closure else 2
+
+
+def get_eye_palsy_from_sync(peak_diff: int, left_peak: int, right_peak: int) -> int:
+    """
+    基于同步度判断眼睛面瘫侧
+
+    Returns:
+        0: 同步, 1: 左侧面瘫(左眼慢), 2: 右侧面瘫(右眼慢)
+    """
+    if peak_diff <= THR.EYE_PALSY_SYNC_PEAK_DIFF:
+        return 0
+    # 峰值帧晚的一侧(反应慢)是患侧
+    return 1 if left_peak > right_peak else 2
+
+
 def get_severity_text(level: int) -> str:
     """获取严重度文字描述"""
     texts = {
@@ -457,6 +517,26 @@ def get_voluntary_score(ratio: float) -> int:
     else:
         return 1
 
+
+def get_lip_pucker_palsy_from_angle(angle: float, direction: str) -> int:
+    """
+    基于嘴唇中线角度判断撅嘴面瘫侧
+
+    Args:
+        angle: 中线角度(度)
+        direction: 偏向 ("left", "right", "center")
+
+    Returns:
+        0: 对称, 1: 左侧面瘫, 2: 右侧面瘫
+    """
+    if angle < THR.LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD:
+        return 0
+    # 嘴唇偏向X侧 → X侧对面是患侧(被健侧拉过去)
+    if direction == "left":
+        return 2  # 偏左 → 右侧面瘫
+    elif direction == "right":
+        return 1  # 偏右 → 左侧面瘫
+    return 0
 
 if __name__ == "__main__":
     # 打印所有阈值用于检查

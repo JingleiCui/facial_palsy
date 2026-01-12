@@ -1149,8 +1149,6 @@ def save_severity_stats(records: List[Dict[str, Any]], output_path: Path, labels
         ])
 
         for action in ACTIONS:
-            if action == "NeutralFace":
-                continue
 
             data = by_action.get(action, [])
             if not data:
@@ -1203,8 +1201,6 @@ def save_severity_stats(records: List[Dict[str, Any]], output_path: Path, labels
         grand_total = {"paired": 0, "exact": 0, "within1": 0}
 
         for action in ACTIONS:
-            if action == "NeutralFace":
-                continue
 
             data = by_action.get(action, [])
             if not data:
@@ -1315,8 +1311,6 @@ def save_severity_stats(records: List[Dict[str, Any]], output_path: Path, labels
     print("=" * 80)
 
     for action in ACTIONS:
-        if action == "NeutralFace":
-            continue
 
         data = by_action.get(action, [])
         paired = [(d["pred"], d["gt"]) for d in data if d["pred"] is not None and d["gt"] is not None]
@@ -1399,8 +1393,7 @@ def copy_classified_images(records: List[Dict[str, Any]], output_dir: Path):
 
     # 创建目录结构
     for action in ACTIONS:
-        if action == "NeutralFace":
-            continue
+
         for cat in categories:
             cat_dir = output_dir / action / cat
             cat_dir.mkdir(parents=True, exist_ok=True)
@@ -1411,8 +1404,6 @@ def copy_classified_images(records: List[Dict[str, Any]], output_dir: Path):
     # 复制图片
     for r in records:
         action = r["action"]
-        if action == "NeutralFace":
-            continue
 
         result = r["result"]
         if result not in categories:
@@ -1478,8 +1469,6 @@ def copy_classified_images(records: List[Dict[str, Any]], output_dir: Path):
     print(f"{'Action':<20} {'OK':>5} {'WRONG':>6} {'FN':>4} {'FP':>4} {'both_sym':>8}")
     print("-" * 52)
     for action in ACTIONS:
-        if action == "NeutralFace":
-            continue
         stats = copy_stats.get(action, {})
         if sum(stats.values()) > 0:
             print(f"{action:<20} {stats.get('OK', 0):>5} {stats.get('WRONG', 0):>6} "
