@@ -497,27 +497,38 @@ def visualize_show_teeth(frame: np.ndarray, landmarks, w: int, h: int,
     if palsy_detection:
         img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
 
-    # ========== 绘制嘴唇中线 ==========
+    # ========== 绘制嘴唇中线和偏移 ==========
     lip_offset_data = metrics.get("lip_midline_offset", {})
     if lip_offset_data:
-        face_midline_x = lip_offset_data.get("face_midline_x", 0)
         lip_midline_x = lip_offset_data.get("lip_midline_x", 0)
         lip_midline_y = lip_offset_data.get("lip_midline_y", 0)
+        lip_center_proj = lip_offset_data.get("lip_center_proj")
+        current_signed_dist = lip_offset_data.get("current_signed_dist",
+                                                  lip_offset_data.get("current_offset", 0))
 
-        # 绘制嘴唇中线点（黄色圆点）
-        cv2.circle(img, (int(lip_midline_x), int(lip_midline_y)), 8, (0, 255, 255), -1)
+        # 绘制嘴唇中线点（绿色圆点）
+        cv2.circle(img, (int(lip_midline_x), int(lip_midline_y)), 8, (0, 255, 0), -1)
 
-        # 绘制偏移连线（面中线到嘴唇中线）
-        cv2.line(img, (int(face_midline_x), int(lip_midline_y)),
-                 (int(lip_midline_x), int(lip_midline_y)), (0, 165, 255), 3)  # 橙色
+        # 绘制偏移连线（垂线到面中线）
+        if lip_center_proj is not None:
+            proj_x, proj_y = lip_center_proj
+            dist = abs(current_signed_dist)
+            offset_color = (0, 0, 255) if dist > 10 else (0, 165, 255)
 
-        # 标注偏移方向
-        offset = lip_midline_x - face_midline_x
-        direction = "L" if offset > 0 else "R" if offset < 0 else ""
-        if abs(offset) > 5:
-            cv2.putText(img, f"{direction} {abs(offset):.1f}px",
-                        (int(lip_midline_x) + 10, int(lip_midline_y) - 10),
-                        FONT, 0.8, (0, 165, 255), 2)
+            # 画垂线：从嘴唇中心到面中线投影点
+            cv2.line(img, (int(lip_midline_x), int(lip_midline_y)),
+                     (int(proj_x), int(proj_y)), offset_color, 3)
+
+            # 画投影点
+            cv2.circle(img, (int(proj_x), int(proj_y)), 5, offset_color, -1)
+
+            # 标注偏移方向和距离
+            direction = "L" if current_signed_dist > 0 else "R" if current_signed_dist < 0 else ""
+            if dist > 3:
+                mid_x = (int(lip_midline_x) + int(proj_x)) // 2
+                mid_y = (int(lip_midline_y) + int(proj_y)) // 2
+                cv2.putText(img, f"{direction} {dist:.1f}px",
+                            (mid_x + 5, mid_y - 10), FONT, 0.8, offset_color, 2)
 
     # 绘制嘴部轮廓
     draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 3)

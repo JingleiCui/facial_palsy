@@ -69,13 +69,12 @@ TARGET_EXAM_ID = None
 # 调试筛选：只分析特定患者/特定检查（其余跳过）
 # =============================================================================
 # 1) 只跑指定患者（常用）
-TARGET_PATIENT_IDS = []
+TARGET_PATIENT_IDS = ["XW000136"]
 
 # 2) 只跑指定检查ID（优先级更高）
 TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
-"NeutralFace",
 ]
 
 # ENABLED_ACTIONS = [

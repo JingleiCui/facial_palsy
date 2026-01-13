@@ -902,6 +902,38 @@ def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, asym_color, 1)
     y += 22
 
+    # ========== 绘制嘴唇中线偏移 ==========
+    if "lip_midline_offset" in metrics:
+        offset_data = metrics["lip_midline_offset"]
+        lip_x = offset_data.get("lip_midline_x")
+        lip_y = offset_data.get("lip_midline_y")
+        lip_center_proj = offset_data.get("lip_center_proj")
+        current_signed_dist = offset_data.get("current_signed_dist",
+                                              offset_data.get("current_offset", 0))
+
+        if lip_x is not None and lip_y is not None:
+            # 绘制嘴唇中心点（绿色）
+            cv2.circle(img, (int(lip_x), int(lip_y)), 6, (0, 255, 0), -1)
+
+            if lip_center_proj is not None:
+                proj_x, proj_y = lip_center_proj
+                dist = abs(current_signed_dist)
+                offset_color = (0, 0, 255) if dist > 8 else (0, 165, 255)
+
+                # 画垂线
+                cv2.line(img, (int(lip_x), int(lip_y)),
+                         (int(proj_x), int(proj_y)), offset_color, 2)
+                cv2.circle(img, (int(proj_x), int(proj_y)), 4, offset_color, -1)
+
+                # 标注
+                if dist > 3:
+                    direction = "L" if current_signed_dist > 0 else "R"
+                    mid_x = (int(lip_x) + int(proj_x)) // 2
+                    mid_y = (int(lip_y) + int(proj_y)) // 2
+                    cv2.putText(img, f"{direction}{dist:.0f}",
+                                (mid_x + 3, mid_y - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, offset_color, 1)
+
     return img
 
 

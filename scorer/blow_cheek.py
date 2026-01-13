@@ -1056,6 +1056,39 @@ def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: i
                 FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
     y += LINE_HEIGHT + 10
 
+    # ========== 绘制嘴唇中线偏移 ==========
+    if "lip_midline_offset" in metrics:
+        offset_data = metrics["lip_midline_offset"]
+        lip_x = offset_data.get("lip_midline_x")
+        lip_y = offset_data.get("lip_midline_y")
+        lip_center_proj = offset_data.get("lip_center_proj")
+        current_signed_dist = offset_data.get("current_signed_dist",
+                                              offset_data.get("current_offset", 0))
+
+        if lip_x is not None and lip_y is not None:
+            # 绘制嘴唇中心点（绿色）
+            cv2.circle(img, (int(lip_x), int(lip_y)), 8, (0, 255, 0), -1)
+            cv2.putText(img, "Lip", (int(lip_x) + 10, int(lip_y) - 5),
+                        FONT, 0.5, (0, 255, 0), 2)
+
+            if lip_center_proj is not None:
+                proj_x, proj_y = lip_center_proj
+                dist = abs(current_signed_dist)
+                offset_color = (0, 0, 255) if dist > 10 else (0, 165, 255)
+
+                # 画垂线
+                cv2.line(img, (int(lip_x), int(lip_y)),
+                         (int(proj_x), int(proj_y)), offset_color, 3)
+                cv2.circle(img, (int(proj_x), int(proj_y)), 5, offset_color, -1)
+
+                # 标注
+                if dist > 3:
+                    direction = "L" if current_signed_dist > 0 else "R"
+                    mid_x = (int(lip_x) + int(proj_x)) // 2
+                    mid_y = (int(lip_y) + int(proj_y)) // 2
+                    cv2.putText(img, f"{direction} {dist:.1f}px",
+                                (mid_x + 5, mid_y - 10), FONT, 0.6, offset_color, 2)
+
     return img
 
 
