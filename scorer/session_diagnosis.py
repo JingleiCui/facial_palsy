@@ -46,7 +46,7 @@ ACTION_WEIGHTS = {
     "CloseEyeSoftly": 1.2,
     "VoluntaryEyeBlink": 1,
     "SpontaneousEyeBlink": 1,
-    "ShowTeeth": 1.1,
+    "ShowTeeth": 1.4,
     "Smile": 0.9,
     "RaiseEyebrow": 1,
     "ShrugNose": 1.0,

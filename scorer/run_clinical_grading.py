@@ -76,9 +76,6 @@ TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
 "NeutralFace",
-"BlowCheek",
-"ShowTeeth",
-"LipPucker",
 ]
 
 # ENABLED_ACTIONS = [

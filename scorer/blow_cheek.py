@@ -33,7 +33,7 @@ from clinical_base import (
     add_valid_region_shading, get_palsy_side_text,
     draw_palsy_side_label, compute_lip_midline_symmetry,
     compute_lip_midline_offset_from_face_midline,
-    compute_face_midline, draw_face_midline,
+    compute_face_midline, draw_face_midline, compute_lip_shape_symmetry,
 )
 
 import matplotlib
@@ -623,72 +623,238 @@ def compute_blow_cheek_metrics(landmarks, w: int, h: int, baseline_landmarks=Non
         lip_offset_data = compute_lip_midline_offset_from_face_midline(landmarks, w, h, None)
         metrics["lip_midline_offset"] = lip_offset_data
 
+    # ========= 使用向量化函数计算嘴唇偏移 ==========
+    lip_offset_data = compute_lip_midline_offset_from_face_midline(
+        landmarks, w, h, baseline_landmarks
+    )
+    metrics["lip_midline_offset"] = lip_offset_data
+
+    # ========== 计算嘴唇形状对称性 ==========
+    lip_shape_data = compute_lip_shape_symmetry(landmarks, w, h)
+    metrics["lip_shape_symmetry"] = lip_shape_data
+
     return metrics
 
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从鼓腮动作检测面瘫侧别 - 基于嘴唇中线偏移
+    从鼓腮动作检测面瘫侧别
 
-    核心逻辑:
-    - 拟合嘴唇中线，计算相对于面中线的偏移
-    - 面中线是双眼内眦连线的中垂线
-    - 嘴唇被健侧肌肉拉扯，偏向健侧
-    - 嘴唇偏向哪侧 → 对侧是面瘫侧
+    核心改进：
+    1. 使用向量化面中线（处理头部倾斜）
+    2. 多指标综合判断
+    3. 详细记录每个指标的value vs threshold
 
-    指标优先级:
-    1. 嘴唇中线偏移（最直观）
-    2. 口角角度（作为验证）
+    指标体系：
+    1. 嘴唇中心偏移（主要）: 嘴唇中心到面中线的垂直距离
+    2. 嘴唇形状对称性（辅助）: 左右嘴唇展开度对比
+    3. 脸颊膨胀对称性（辅助）: 左右脸颊鼓起程度对比
+
     """
     result = {
         "palsy_side": 0,
         "confidence": 0.0,
         "interpretation": "",
-        "method": "",
-        "evidence": {}
+        "method": "multi_indicator",
+        "evidence": {},
+        "votes": [],
+        "final_decision": {},
     }
 
-    # ========== 方法1（优先）: 嘴唇中线偏移 ==========
+    votes = []  # 收集各指标的投票
+
+    # ========== 指标1: 嘴唇中心偏移（主要指标）==========
     if "lip_midline_offset" in metrics:
         offset_data = metrics["lip_midline_offset"]
 
-        current_offset = offset_data.get("current_offset", 0)
-        face_midline_x = offset_data.get("face_midline_x", 0)
-        lip_midline_x = offset_data.get("lip_midline_x", 0)
+        # 获取关键数据
+        current_signed_dist = offset_data.get("current_signed_dist",
+                                              offset_data.get("current_offset", 0))
+        offset_norm = offset_data.get("offset_norm", 0)
+        icd = offset_data.get("icd", metrics.get("icd", 1))
 
-        result["evidence"]["face_midline_x"] = face_midline_x
-        result["evidence"]["lip_midline_x"] = lip_midline_x
-        result["evidence"]["current_offset"] = current_offset
+        # 如果没有offset_norm，手动计算
+        if offset_norm == 0 and icd > 1e-6:
+            offset_norm = abs(current_signed_dist) / icd
 
-        # 计算归一化偏移
-        icd = metrics.get("icd", 1)
-        if icd < 1e-6:
-            icd = 1
-        offset_norm = abs(current_offset) / icd
-        result["evidence"]["offset_norm"] = offset_norm
+        # 阈值
+        threshold = THR.MOUTH_CENTER_PALSY_OFFSET  # 0.020
+        is_abnormal = offset_norm > threshold
 
-        # 判断阈值：偏移超过ICD的
-        if offset_norm > THR.MOUTH_CENTER_PALSY_OFFSET:
-            result["method"] = "lip_midline_offset"
-            result["confidence"] = min(1.0, offset_norm * 5)
+        # 判断方向
+        if not is_abnormal:
+            contribution = "None"
+            vote_side = 0
+            vote_conf = 0.0
+        elif current_signed_dist > 0:
+            # 偏向患者左侧 = 右侧面瘫
+            contribution = "Right"
+            vote_side = 2
+            vote_conf = min(1.0, offset_norm / threshold - 1.0 + 0.5)
+        else:
+            contribution = "Left"
+            vote_side = 1
+            vote_conf = min(1.0, offset_norm / threshold - 1.0 + 0.5)
 
-            if current_offset > 0:
-                # 嘴唇中线偏向左侧（图像右侧）= 被左侧拉 = 右侧面瘫
-                result["palsy_side"] = 2
-                result["interpretation"] = (
-                    f"嘴唇中线偏向左侧 ({current_offset:+.1f}px, {offset_norm:.4%}) → 右侧面瘫"
-                )
+        # 记录证据
+        result["evidence"]["lip_offset"] = {
+            "raw_value_px": float(current_signed_dist),
+            "normalized_value": float(offset_norm),
+            "threshold": float(threshold),
+            "is_abnormal": is_abnormal,
+            "contribution": contribution,
+            "weight": 0.50,  # 主要指标，权重50%
+            "description": f"嘴唇中心偏移: {current_signed_dist:+.1f}px ({offset_norm:.2%} ICD), 阈值: {threshold:.2%}"
+        }
+
+        if vote_side != 0:
+            votes.append({
+                "indicator": "lip_offset",
+                "side": vote_side,
+                "confidence": vote_conf,
+                "weight": 0.50,
+            })
+
+    # ========== 指标2: 脸颊膨胀对称性 ==========
+    if "bulge" in metrics:
+        bulge = metrics["bulge"]
+        left_bulge = bulge.get("left", 0)
+        right_bulge = bulge.get("right", 0)
+
+        # 计算不对称度
+        max_bulge = max(abs(left_bulge), abs(right_bulge))
+        if max_bulge > 0.001:  # 有明显鼓腮动作
+            bulge_diff = left_bulge - right_bulge
+            bulge_asym = abs(bulge_diff) / max_bulge
+
+            threshold = THR.BLOW_CHEEK_ASYM_THRESHOLD  # 0.10
+            is_abnormal = bulge_asym > threshold
+
+            if not is_abnormal:
+                contribution = "None"
+                vote_side = 0
+                vote_conf = 0.0
+            elif left_bulge < right_bulge:
+                # 左侧鼓起更小 = 左侧面瘫
+                contribution = "Left"
+                vote_side = 1
+                vote_conf = min(1.0, bulge_asym / threshold - 1.0 + 0.3)
             else:
-                # 嘴唇中线偏向右侧（图像左侧）= 被右侧拉 = 左侧面瘫
-                result["palsy_side"] = 1
-                result["interpretation"] = (
-                    f"嘴唇中线偏向右侧 ({current_offset:+.1f}px, {offset_norm:.4%}) → 左侧面瘫"
-                )
-            return result
+                contribution = "Right"
+                vote_side = 2
+                vote_conf = min(1.0, bulge_asym / threshold - 1.0 + 0.3)
 
-    # 未检测到明显不对称
-    result["method"] = "none"
-    result["interpretation"] = (f"各指标均未检测到明显不对称, {offset_norm:.4%}")
+            result["evidence"]["cheek_bulge"] = {
+                "left_bulge": float(left_bulge),
+                "right_bulge": float(right_bulge),
+                "asymmetry_ratio": float(bulge_asym),
+                "threshold": float(threshold),
+                "is_abnormal": is_abnormal,
+                "contribution": contribution,
+                "weight": 0.30,
+                "description": f"脸颊膨胀: L={left_bulge:.3f}, R={right_bulge:.3f}, 不对称={bulge_asym:.2%}, 阈值={threshold:.2%}"
+            }
+
+            if vote_side != 0:
+                votes.append({
+                    "indicator": "cheek_bulge",
+                    "side": vote_side,
+                    "confidence": vote_conf,
+                    "weight": 0.30,
+                })
+
+    # ========== 指标3: 嘴唇形状对称性 ==========
+    if "lip_shape_symmetry" in metrics:
+        shape_data = metrics["lip_shape_symmetry"]
+        shape_asym = shape_data.get("shape_asymmetry", 0)
+        palsy_suggestion = shape_data.get("palsy_suggestion", 0)
+
+        threshold = 0.10  # 10%
+        is_abnormal = shape_asym > threshold
+
+        if not is_abnormal:
+            contribution = "None"
+        elif palsy_suggestion == 1:
+            contribution = "Left"
+        elif palsy_suggestion == 2:
+            contribution = "Right"
+        else:
+            contribution = "None"
+
+        result["evidence"]["lip_shape"] = {
+            "left_avg_dist": float(shape_data.get("left_avg_dist", 0)),
+            "right_avg_dist": float(shape_data.get("right_avg_dist", 0)),
+            "asymmetry_ratio": float(shape_asym),
+            "threshold": float(threshold),
+            "is_abnormal": is_abnormal,
+            "contribution": contribution,
+            "weight": 0.20,
+            "description": f"嘴唇形状不对称: {shape_asym:.2%}, 阈值: {threshold:.2%}"
+        }
+
+        if is_abnormal and palsy_suggestion != 0:
+            votes.append({
+                "indicator": "lip_shape",
+                "side": palsy_suggestion,
+                "confidence": min(1.0, shape_asym / threshold - 1.0 + 0.3),
+                "weight": 0.20,
+            })
+
+    # ========== 汇总投票 ==========
+    result["votes"] = votes
+
+    if not votes:
+        result["palsy_side"] = 0
+        result["confidence"] = 0.0
+        result["interpretation"] = "各指标均未检测到明显不对称"
+        result["final_decision"] = {
+            "left_score": 0.0,
+            "right_score": 0.0,
+            "decision_reason": "No significant asymmetry detected",
+        }
+        return result
+
+    # 加权计算左右得分
+    left_score = 0.0
+    right_score = 0.0
+    total_weight = 0.0
+
+    for vote in votes:
+        weight = vote["weight"] * vote["confidence"]
+        total_weight += weight
+        if vote["side"] == 1:
+            left_score += weight
+        elif vote["side"] == 2:
+            right_score += weight
+
+    # 归一化
+    if total_weight > 0:
+        left_score /= total_weight
+        right_score /= total_weight
+
+    result["final_decision"] = {
+        "left_score": float(left_score),
+        "right_score": float(right_score),
+        "total_weight": float(total_weight),
+    }
+
+    # 决策
+    if left_score > right_score * 1.2:
+        result["palsy_side"] = 1
+        result["confidence"] = left_score
+        result["interpretation"] = f"左侧面瘫 (L={left_score:.2f} vs R={right_score:.2f})"
+        result["final_decision"]["decision_reason"] = "Left score significantly higher"
+    elif right_score > left_score * 1.2:
+        result["palsy_side"] = 2
+        result["confidence"] = right_score
+        result["interpretation"] = f"右侧面瘫 (R={right_score:.2f} vs L={left_score:.2f})"
+        result["final_decision"]["decision_reason"] = "Right score significantly higher"
+    else:
+        result["palsy_side"] = 0
+        result["confidence"] = max(left_score, right_score)
+        result["interpretation"] = f"无法确定 (L={left_score:.2f} vs R={right_score:.2f})"
+        result["final_decision"]["decision_reason"] = "Scores too close to determine"
+
     return result
 
 
@@ -889,115 +1055,6 @@ def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: i
     cv2.putText(img, f"AOE/BOF: {oral.get('AOE', 0):.2f} / {oral.get('BOF', 0):.2f}", (30, y),
                 FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
     y += LINE_HEIGHT + 10
-
-    # ========== 绘制嘴唇对称性证据 ==========
-    if "lip_symmetry" in metrics:
-        lip_sym = metrics["lip_symmetry"]
-        cv2.putText(img, "=== Lip Symmetry Evidence ===", (30, y),
-                    FONT, FONT_SCALE_NORMAL, (0, 255, 255), THICKNESS_NORMAL)
-        y += LINE_HEIGHT
-
-        left_dist = lip_sym["left_to_midline"]
-        right_dist = lip_sym["right_to_midline"]
-        lip_offset = lip_sym["lip_offset"]
-        asymmetry_ratio = lip_sym["asymmetry_ratio"]
-
-        # 左侧距离（距离大的用绿色表示健侧拉力强）
-        left_color = (0, 255, 0) if left_dist >= right_dist else (0, 0, 255)
-        cv2.putText(img, f"L to midline: {left_dist:.1f}px", (30, y),
-                    FONT, FONT_SCALE_NORMAL, left_color, THICKNESS_NORMAL)
-        y += LINE_HEIGHT
-
-        # 右侧距离
-        right_color = (0, 255, 0) if right_dist >= left_dist else (0, 0, 255)
-        cv2.putText(img, f"R to midline: {right_dist:.1f}px", (30, y),
-                    FONT, FONT_SCALE_NORMAL, right_color, THICKNESS_NORMAL)
-        y += LINE_HEIGHT
-
-        # 偏移方向
-        direction = "Left" if lip_offset > 0 else "Right"
-        cv2.putText(img, f"Lip Offset: {lip_offset:+.1f}px ({direction})", (30, y),
-                    FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
-        y += LINE_HEIGHT
-
-        # 不对称比例
-        cv2.putText(img, f"Asymmetry: {asymmetry_ratio * 100:.1f}%", (30, y),
-                    FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
-        y += LINE_HEIGHT
-
-        # ========== 绘制嘴唇中线 ==========
-        if "lip_midline_offset" in metrics:
-            offset_data = metrics["lip_midline_offset"]
-            face_midline_x = offset_data.get("face_midline_x", None)
-            lip_midline_x = offset_data.get("lip_midline_x", None)
-            lip_midline_y = offset_data.get("lip_midline_y", None)
-
-            # ========== 绘制嘴唇中线 ==========
-            if lip_midline_x is not None and lip_midline_y is not None:
-                lip_midline_x_int = int(lip_midline_x)
-                lip_midline_y_int = int(lip_midline_y)
-
-                # 获取嘴唇中线的四个点
-                lip_top_center = pt2d(landmarks[LM.LIP_TOP_CENTER], w, h)
-                lip_top = pt2d(landmarks[LM.LIP_TOP], w, h)
-                lip_bot = pt2d(landmarks[LM.LIP_BOT], w, h)
-                lip_bot_center = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)
-
-                # 绘制嘴唇中线（绿色实线）
-                lip_midline_pts = np.array([
-                    [int(lip_top_center[0]), int(lip_top_center[1])],
-                    [int(lip_top[0]), int(lip_top[1])],
-                    [int(lip_bot[0]), int(lip_bot[1])],
-                    [int(lip_bot_center[0]), int(lip_bot_center[1])]
-                ], dtype=np.int32)
-                cv2.polylines(img, [lip_midline_pts], False, (0, 255, 0), 3)
-
-                # 绘制嘴唇中线中心点
-                cv2.circle(img, (lip_midline_x_int, lip_midline_y_int), 8, (0, 255, 0), -1)
-                cv2.putText(img, "Lip Mid", (lip_midline_x_int + 10, lip_midline_y_int),
-                            FONT, 0.5, (0, 255, 0), 2)
-
-                # ========== 绘制偏移指示线 ==========
-                if face_midline_x is not None:
-                    face_midline_x_int = int(face_midline_x)
-                    offset = lip_midline_x - face_midline_x
-                    offset_color = (0, 0, 255) if abs(offset) > 10 else (0, 255, 255)
-                    cv2.line(img, (lip_midline_x_int, lip_midline_y_int),
-                             (face_midline_x_int, lip_midline_y_int), offset_color, 3)
-
-                    # 标注偏移值
-                    mid_x = (lip_midline_x_int + face_midline_x_int) // 2
-                    direction = "L" if offset > 0 else "R"
-                    cv2.putText(img, f"{abs(offset):.0f}px({direction})",
-                                (mid_x - 40, lip_midline_y_int - 15),
-                                FONT, 0.6, offset_color, 2)
-
-        elif "midline_x" in metrics:
-            # 回退到旧的简化版
-            midline_x = int(metrics["midline_x"])
-            for yy in range(0, h, 10):
-                cv2.line(img, (midline_x, yy), (midline_x, min(yy + 5, h)), (0, 255, 255), 1)
-            cv2.putText(img, "Mid", (midline_x + 5, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-
-        # ========== 绘制嘴角到中线的连线（保留原功能作为补充） ==========
-        if "left_corner" in metrics and "lip_midline_offset" not in metrics:
-            if "midline_x" in metrics:
-                left_corner = metrics["left_corner"]
-                right_corner = metrics["right_corner"]
-                midline_x = int(metrics["midline_x"])
-
-                cv2.line(img, (int(left_corner[0]), int(left_corner[1])),
-                         (midline_x, int(left_corner[1])), (255, 0, 0), 2)
-                cv2.line(img, (int(right_corner[0]), int(right_corner[1])),
-                         (midline_x, int(right_corner[1])), (0, 165, 255), 2)
-
-    # 面瘫侧别
-    if palsy_detection:
-        palsy_side = palsy_detection.get("palsy_side", 0)
-        palsy_text = {0: "Symmetric", 1: "Left Palsy", 2: "Right Palsy"}.get(palsy_side, "Unknown")
-        palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
-        cv2.putText(img, f"Palsy: {palsy_text}", (30, y), FONT, FONT_SCALE_NORMAL, palsy_color, THICKNESS_NORMAL)
 
     return img
 

@@ -18,10 +18,9 @@ import json
 import csv
 from pathlib import Path
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Dict, List, Any, Optional, Tuple
 import shutil
-from collections import Counter
 
 # =============================================================================
 # 配置
@@ -1486,6 +1485,478 @@ def print_threshold_reference():
     print()
 
 
+def load_indicators_json(exam_dir: Path, action: str) -> Optional[Dict[str, Any]]:
+    """
+    加载指定动作的indicators.json
+
+    Args:
+        exam_dir: 检查目录 (如 /path/to/P001/E001)
+        action: 动作名称 (如 "BlowCheek")
+
+    Returns:
+        indicators字典或None
+    """
+    indicators_path = exam_dir / action / "indicators.json"
+    if indicators_path.exists():
+        try:
+            with open(indicators_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[WARN] 加载 {indicators_path} 失败: {e}")
+    return None
+
+
+def extract_palsy_evidence(indicators: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    从indicators中提取面瘫检测的证据信息
+
+    Args:
+        indicators: indicators.json的内容
+
+    Returns:
+        {
+            "palsy_side": int,
+            "confidence": float,
+            "method": str,
+            "evidence": {
+                "indicator_name": {
+                    "raw_value": ...,
+                    "threshold": ...,
+                    "is_abnormal": ...,
+                    "contribution": ...,
+                },
+                ...
+            },
+            "votes": [...],
+            "interpretation": str,
+        }
+    """
+    result = {
+        "palsy_side": 0,
+        "confidence": 0.0,
+        "method": "unknown",
+        "evidence": {},
+        "votes": [],
+        "interpretation": "",
+    }
+
+    # 尝试从不同位置提取palsy_detection
+    palsy_detection = None
+
+    if "palsy_detection" in indicators:
+        palsy_detection = indicators["palsy_detection"]
+    elif "action_specific" in indicators:
+        action_specific = indicators["action_specific"]
+        if "palsy_detection" in action_specific:
+            palsy_detection = action_specific["palsy_detection"]
+
+    if palsy_detection is None:
+        return result
+
+    result["palsy_side"] = palsy_detection.get("palsy_side", 0)
+    result["confidence"] = palsy_detection.get("confidence", 0.0)
+    result["method"] = palsy_detection.get("method", "unknown")
+    result["interpretation"] = palsy_detection.get("interpretation", "")
+
+    # 提取evidence
+    if "evidence" in palsy_detection:
+        result["evidence"] = palsy_detection["evidence"]
+
+    # 提取votes
+    if "votes" in palsy_detection:
+        result["votes"] = palsy_detection["votes"]
+
+    return result
+
+
+def generate_error_report(error_cases: List[Dict[str, Any]],
+                          output_path: Path,
+                          action: str) -> None:
+    """
+    生成错误案例详细报告
+
+    Args:
+        error_cases: 错误案例列表
+        output_path: 输出路径
+        action: 动作名称
+    """
+    report_lines = []
+    report_lines.append(f"# {action} 错误案例分析报告")
+    report_lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report_lines.append(f"错误案例数: {len(error_cases)}")
+    report_lines.append("")
+    report_lines.append("=" * 80)
+
+    for i, case in enumerate(error_cases, 1):
+        report_lines.append("")
+        report_lines.append(f"## 案例 {i}: {case['exam_id']}")
+        report_lines.append("-" * 40)
+        report_lines.append(
+            f"GT侧别: {case['gt_side']} | 预测侧别: {case['pred_side']} | 错误类型: {case['error_type']}")
+        report_lines.append("")
+
+        # 提取证据
+        evidence = case.get("evidence", {})
+
+        report_lines.append("### 判决依据分析:")
+        report_lines.append("")
+
+        if not evidence:
+            report_lines.append("  (无详细证据)")
+        else:
+            for indicator_name, indicator_data in evidence.items():
+                report_lines.append(f"  **{indicator_name}:**")
+
+                if isinstance(indicator_data, dict):
+                    raw_value = indicator_data.get("raw_value", indicator_data.get("raw_value_px", "N/A"))
+                    normalized = indicator_data.get("normalized_value", indicator_data.get("offset_norm", "N/A"))
+                    threshold = indicator_data.get("threshold", "N/A")
+                    is_abnormal = indicator_data.get("is_abnormal", "N/A")
+                    contribution = indicator_data.get("contribution", "N/A")
+                    description = indicator_data.get("description", "")
+
+                    report_lines.append(f"    - 原始值: {raw_value}")
+                    if normalized != "N/A":
+                        report_lines.append(f"    - 归一化值: {normalized}")
+                    report_lines.append(f"    - 阈值: {threshold}")
+                    report_lines.append(f"    - 是否异常: {is_abnormal}")
+                    report_lines.append(f"    - 贡献方向: {contribution}")
+                    if description:
+                        report_lines.append(f"    - 说明: {description}")
+                else:
+                    report_lines.append(f"    - 值: {indicator_data}")
+
+                report_lines.append("")
+
+        # 投票信息
+        votes = case.get("votes", [])
+        if votes:
+            report_lines.append("### 投票汇总:")
+            for vote in votes:
+                indicator = vote.get("indicator", "?")
+                side = vote.get("side", 0)
+                side_str = {0: "对称", 1: "左瘫", 2: "右瘫"}.get(side, "?")
+                conf = vote.get("confidence", 0)
+                weight = vote.get("weight", 0)
+                report_lines.append(f"    - {indicator}: {side_str} (置信度={conf:.2f}, 权重={weight:.2f})")
+            report_lines.append("")
+
+        # 解释
+        interpretation = case.get("interpretation", "")
+        if interpretation:
+            report_lines.append(f"### 系统解释: {interpretation}")
+
+        report_lines.append("")
+        report_lines.append("=" * 80)
+
+    # 写入文件
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(report_lines))
+
+    print(f"[INFO] 错误报告已保存: {output_path}")
+
+
+def analyze_threshold_sensitivity(cases: List[Dict[str, Any]],
+                                  indicator_name: str,
+                                  threshold_field: str = "threshold") -> Dict[str, Any]:
+    """
+    分析阈值敏感性 - 找出边界案例
+
+    Args:
+        cases: 所有案例
+        indicator_name: 指标名称
+        threshold_field: 阈值字段名
+
+    Returns:
+        {
+            "threshold": float,
+            "correct_below_threshold": int,
+            "wrong_below_threshold": int,
+            "correct_above_threshold": int,
+            "wrong_above_threshold": int,
+            "boundary_cases": [...]  # 值接近阈值的案例
+        }
+    """
+    result = {
+        "indicator": indicator_name,
+        "threshold": None,
+        "correct_below": 0,
+        "wrong_below": 0,
+        "correct_above": 0,
+        "wrong_above": 0,
+        "boundary_cases": [],
+    }
+
+    threshold = None
+    values_and_results = []
+
+    for case in cases:
+        evidence = case.get("evidence", {})
+        indicator_data = evidence.get(indicator_name, {})
+
+        if not isinstance(indicator_data, dict):
+            continue
+
+        value = indicator_data.get("normalized_value", indicator_data.get("offset_norm"))
+        thr = indicator_data.get(threshold_field)
+
+        if value is None or thr is None:
+            continue
+
+        if threshold is None:
+            threshold = thr
+
+        is_correct = case.get("is_correct", case.get("error_type") == "OK")
+
+        values_and_results.append({
+            "exam_id": case.get("exam_id", "?"),
+            "value": value,
+            "is_correct": is_correct,
+        })
+
+    result["threshold"] = threshold
+
+    if threshold is None:
+        return result
+
+    # 统计
+    for item in values_and_results:
+        if item["value"] < threshold:
+            if item["is_correct"]:
+                result["correct_below"] += 1
+            else:
+                result["wrong_below"] += 1
+        else:
+            if item["is_correct"]:
+                result["correct_above"] += 1
+            else:
+                result["wrong_above"] += 1
+
+        # 边界案例：值在阈值的±20%范围内
+        if abs(item["value"] - threshold) / threshold < 0.20:
+            result["boundary_cases"].append(item)
+
+    return result
+
+
+def save_action_error_analysis(src_root: Path,
+                               dst_root: Path,
+                               action: str,
+                               exam_results: List[Dict[str, Any]]) -> None:
+    """
+    保存单个动作的错误分析报告
+
+    Args:
+        src_root: 源数据根目录
+        dst_root: 输出根目录
+        action: 动作名称
+        exam_results: 该动作的所有检查结果
+    """
+    # 筛选错误案例
+    error_cases = []
+    all_cases = []
+
+    for result in exam_results:
+        exam_id = result.get("exam_id", "")
+        gt_side = result.get("gt_palsy_side", 0)
+        pred_side = result.get("pred_palsy_side", 0)
+
+        # 确定错误类型
+        if gt_side == pred_side:
+            error_type = "OK"
+            is_correct = True
+        elif gt_side == 0 and pred_side != 0:
+            error_type = "FP"  # 假阳性
+            is_correct = False
+        elif gt_side != 0 and pred_side == 0:
+            error_type = "FN"  # 假阴性
+            is_correct = False
+        else:
+            error_type = "WRONG"  # 错侧
+            is_correct = False
+
+        # 解析exam_id获取路径
+        parts = exam_id.split('_')
+        if len(parts) >= 2:
+            patient_id, exam_code = parts[0], parts[1]
+            exam_dir = src_root / patient_id / exam_code
+        else:
+            continue
+
+        # 加载indicators.json
+        indicators = load_indicators_json(exam_dir, action)
+
+        # 提取证据
+        evidence_data = {}
+        votes = []
+        interpretation = ""
+
+        if indicators:
+            palsy_info = extract_palsy_evidence(indicators)
+            evidence_data = palsy_info.get("evidence", {})
+            votes = palsy_info.get("votes", [])
+            interpretation = palsy_info.get("interpretation", "")
+
+        case_data = {
+            "exam_id": exam_id,
+            "gt_side": gt_side,
+            "pred_side": pred_side,
+            "error_type": error_type,
+            "is_correct": is_correct,
+            "evidence": evidence_data,
+            "votes": votes,
+            "interpretation": interpretation,
+        }
+
+        all_cases.append(case_data)
+
+        if not is_correct:
+            error_cases.append(case_data)
+
+    # 生成错误报告
+    if error_cases:
+        error_report_path = dst_root / f"{action}_error_analysis.md"
+        generate_error_report(error_cases, error_report_path, action)
+
+    # 生成阈值敏感性分析（如果有嘴唇偏移指标）
+    if all_cases:
+        sensitivity = analyze_threshold_sensitivity(all_cases, "lip_offset")
+        if sensitivity.get("threshold") is not None:
+            sensitivity_path = dst_root / f"{action}_threshold_sensitivity.json"
+            with open(sensitivity_path, 'w', encoding='utf-8') as f:
+                json.dump(sensitivity, f, indent=2, ensure_ascii=False)
+            print(f"[INFO] 阈值敏感性分析已保存: {sensitivity_path}")
+
+
+# =============================================================================
+# 主函数升级（添加到 collect_keyframes.py 的 main 函数中）
+# =============================================================================
+
+def enhanced_error_analysis(src_root: Path, dst_root: Path, action_results: Dict[str, List]) -> None:
+    """
+    增强版错误分析 - 添加到主流程末尾
+
+    Args:
+        src_root: 源数据根目录
+        dst_root: 输出根目录
+        action_results: {action_name: [exam_results...]}
+    """
+    print("\n" + "=" * 70)
+    print("开始生成错误分析报告...")
+    print("=" * 70)
+
+    for action, results in action_results.items():
+        if not results:
+            continue
+
+        # 统计错误数
+        error_count = sum(1 for r in results if r.get("gt_palsy_side", 0) != r.get("pred_palsy_side", 0))
+
+        if error_count > 0:
+            print(f"\n[{action}] 错误案例: {error_count}/{len(results)}")
+            save_action_error_analysis(src_root, dst_root, action, results)
+
+        # 为嘴部动作生成带evidence的CSV
+        if action in ["BlowCheek", "LipPucker", "ShowTeeth", "Smile"]:
+            csv_path = dst_root / f"{action}_evidence.csv"
+            # 构建案例数据（需要从indicators.json读取）
+            cases_with_evidence = []
+            for r in results:
+                exam_id = r.get("exam_id", "")
+                parts = exam_id.split('_')
+                if len(parts) >= 2:
+                    exam_dir = src_root / parts[0] / parts[1]
+                    indicators = load_indicators_json(exam_dir, action)
+                    if indicators:
+                        palsy_info = extract_palsy_evidence(indicators)
+                        cases_with_evidence.append({
+                            "exam_id": exam_id,
+                            "gt_side": r.get("gt_palsy_side", 0),
+                            "pred_side": r.get("pred_palsy_side", 0),
+                            "error_type": "OK" if r.get("gt_palsy_side", 0) == r.get("pred_palsy_side",
+                                                                                     0) else "ERROR",
+                            "confidence": palsy_info.get("confidence", 0),
+                            "interpretation": palsy_info.get("interpretation", ""),
+                            "evidence": palsy_info.get("evidence", {}),
+                        })
+            if cases_with_evidence:
+                save_debug_csv_with_evidence(cases_with_evidence, csv_path, action)
+
+    print("\n" + "=" * 70)
+    print("错误分析报告生成完成")
+    print("=" * 70)
+
+
+# =============================================================================
+# 新增：生成综合调试CSV（包含evidence）
+# =============================================================================
+
+def save_debug_csv_with_evidence(results: List[Dict[str, Any]],
+                                 output_path: Path,
+                                 action: str) -> None:
+    """
+    保存包含详细evidence的调试CSV
+
+    每行一个案例，列包括：
+    - 基本信息
+    - 各指标的value
+    - 各指标的threshold
+    - 各指标的is_abnormal
+    - 最终判断
+    """
+    if not results:
+        return
+
+    # 收集所有可能的evidence字段
+    all_evidence_keys = set()
+    for r in results:
+        evidence = r.get("evidence", {})
+        for key in evidence.keys():
+            all_evidence_keys.add(key)
+
+    # 构建列头
+    base_columns = ["exam_id", "gt_side", "pred_side", "error_type", "confidence", "interpretation"]
+
+    evidence_columns = []
+    for key in sorted(all_evidence_keys):
+        evidence_columns.extend([
+            f"{key}_value",
+            f"{key}_threshold",
+            f"{key}_is_abnormal",
+            f"{key}_contribution",
+        ])
+
+    all_columns = base_columns + evidence_columns
+
+    # 写入CSV
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=all_columns)
+        writer.writeheader()
+
+        for r in results:
+            row = {
+                "exam_id": r.get("exam_id", ""),
+                "gt_side": r.get("gt_side", ""),
+                "pred_side": r.get("pred_side", ""),
+                "error_type": r.get("error_type", ""),
+                "confidence": r.get("confidence", ""),
+                "interpretation": r.get("interpretation", ""),
+            }
+
+            # 添加evidence字段
+            evidence = r.get("evidence", {})
+            for key in all_evidence_keys:
+                data = evidence.get(key, {})
+                if isinstance(data, dict):
+                    row[f"{key}_value"] = data.get("normalized_value", data.get("raw_value", ""))
+                    row[f"{key}_threshold"] = data.get("threshold", "")
+                    row[f"{key}_is_abnormal"] = data.get("is_abnormal", "")
+                    row[f"{key}_contribution"] = data.get("contribution", "")
+
+            writer.writerow(row)
+
+    print(f"[INFO] 调试CSV已保存: {output_path}")
+
 # =============================================================================
 # 主函数
 # =============================================================================
@@ -1500,7 +1971,8 @@ def main():
     total_copied = 0
     total_skipped = 0
     all_palsy_records = []
-    all_session_records = []  # 新增：收集Session诊断记录
+    all_session_records = []
+    action_results = {action: [] for action in ACTIONS}
 
     print("=" * 60)
     print("开始收集关键帧和面瘫预测统计")
@@ -1512,6 +1984,12 @@ def main():
         total_copied += c
         total_skipped += s
         all_palsy_records.extend(records)
+
+        # 按动作分类收集结果（用于错误分析）
+        for record in records:
+            action_name = record.get("action", "")
+            if action_name in action_results:
+                action_results[action_name].append(record)
 
         # 收集Session诊断记录
         if session_record:
@@ -1585,19 +2063,12 @@ def main():
     classified_dir = DST_ROOT / "classified_images"
     copy_classified_images(all_palsy_records, classified_dir)
 
+    enhanced_error_analysis(SRC_ROOT, DST_ROOT, action_results)
+
     print("\n" + "=" * 60)
     print("完成!")
     print("=" * 60)
     print(f"输出目录: {DST_ROOT}")
-    print(f"  - palsy_<Action>.csv        : 每个动作的基本预测")
-    print(f"  - palsy_all_records.csv     : 所有记录汇总")
-    print(f"  - palsy_summary.csv         : 统计摘要")
-    print(f"  - palsy_confusion.txt       : 混淆矩阵")
-    print(f"  - error_cases/              : 错误案例分析")
-    print(f"  - severity_summary.csv      : 严重度分数统计")
-    print(f"  - classified_images/        : 按结果分类的关键帧图片")
-    print(f"  - session_diagnosis.csv     : Session级诊断预测记录 (新增)")
-    print(f"  - session_diagnosis_summary.txt : Session级诊断统计摘要 (新增)")
 
 
 if __name__ == "__main__":

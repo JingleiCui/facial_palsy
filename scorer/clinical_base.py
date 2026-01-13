@@ -1057,6 +1057,182 @@ def draw_face_midline(img: np.ndarray, midline: Dict[str, Any],
     return result
 
 
+def draw_lip_to_midline_perpendicular(img: np.ndarray,
+                                      lip_center: Tuple[float, float],
+                                      midline: Dict[str, Any],
+                                      color=(0, 165, 255),
+                                      thickness=2) -> np.ndarray:
+    """
+    绘制嘴唇中心到面中线的垂线（正确的几何距离可视化）
+
+    Args:
+        img: 输入图像
+        lip_center: 嘴唇中心点
+        midline: compute_face_midline的返回值
+        color: 颜色 (BGR)
+        thickness: 线宽
+
+    Returns:
+        绘制了垂线的图像
+    """
+    result = img.copy()
+
+    if midline is None:
+        return result
+
+    center = midline["center"]
+    direction = midline["direction"]
+
+    # 计算投影点
+    proj = project_point_to_line(lip_center, center, direction)
+
+    # 绘制垂线
+    cv2.line(result,
+             (int(lip_center[0]), int(lip_center[1])),
+             (int(proj[0]), int(proj[1])),
+             color, thickness)
+
+    # 绘制投影点
+    cv2.circle(result, (int(proj[0]), int(proj[1])), 5, color, -1)
+
+    # 计算并显示距离
+    signed_dist = signed_dist_point_to_line(lip_center, center, direction)
+    dist = abs(signed_dist)
+
+    # 标注
+    mid_x = int((lip_center[0] + proj[0]) / 2)
+    mid_y = int((lip_center[1] + proj[1]) / 2)
+
+    direction_label = "L" if signed_dist > 0 else "R"
+    cv2.putText(result, f"{dist:.1f}px({direction_label})",
+                (mid_x + 5, mid_y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    return result
+
+
+def signed_dist_point_to_line(point: Tuple[float, float],
+                              line_point: Tuple[float, float],
+                              line_direction: Tuple[float, float]) -> float:
+    """
+    计算点到直线的有符号垂直距离
+
+    正值表示点在直线的"右侧"（相对于方向向量）
+    负值表示点在直线的"左侧"
+
+    几何原理：
+    - 给定直线上一点 L 和方向向量 D
+    - 点 P 到直线的有符号距离 = (P - L) × D / |D|
+    - 其中 × 是2D叉积（返回标量）
+
+    Args:
+        point: 待计算的点 (x, y)
+        line_point: 直线上的一点 (x, y)
+        line_direction: 直线方向向量 (dx, dy)，通常是单位向量
+
+    Returns:
+        有符号距离（像素）
+        - 正值：点在直线右侧（从直线方向看）
+        - 负值：点在直线左侧
+    """
+    px, py = point
+    lx, ly = line_point
+    dx, dy = line_direction
+
+    # 2D叉积: (P - L) × D = (px-lx)*dy - (py-ly)*dx
+    cross = (px - lx) * dy - (py - ly) * dx
+
+    # 如果方向向量不是单位向量，需要归一化
+    length = math.sqrt(dx * dx + dy * dy)
+    if length < 1e-6:
+        return 0.0
+
+    return cross / length
+
+
+def dist_point_to_line(point: Tuple[float, float],
+                       line_point: Tuple[float, float],
+                       line_direction: Tuple[float, float]) -> float:
+    """
+    计算点到直线的绝对垂直距离
+
+    Args:
+        point: 待计算的点 (x, y)
+        line_point: 直线上的一点 (x, y)
+        line_direction: 直线方向向量 (dx, dy)
+
+    Returns:
+        绝对距离（像素）
+    """
+    return abs(signed_dist_point_to_line(point, line_point, line_direction))
+
+
+def project_point_to_line(point: Tuple[float, float],
+                          line_point: Tuple[float, float],
+                          line_direction: Tuple[float, float]) -> Tuple[float, float]:
+    """
+    计算点在直线上的投影点
+
+    几何原理：
+    - P_proj = L + ((P - L)·D / |D|²) * D
+
+    Args:
+        point: 待投影的点 (x, y)
+        line_point: 直线上的一点 (x, y)
+        line_direction: 直线方向向量 (dx, dy)
+
+    Returns:
+        投影点坐标 (x, y)
+    """
+    px, py = point
+    lx, ly = line_point
+    dx, dy = line_direction
+
+    # 计算投影系数 t = (P - L)·D / |D|²
+    dot = (px - lx) * dx + (py - ly) * dy
+    length_sq = dx * dx + dy * dy
+
+    if length_sq < 1e-6:
+        return (lx, ly)
+
+    t = dot / length_sq
+
+    # 投影点
+    proj_x = lx + t * dx
+    proj_y = ly + t * dy
+
+    return (proj_x, proj_y)
+
+
+def get_side_of_line(point: Tuple[float, float],
+                     line_point: Tuple[float, float],
+                     line_direction: Tuple[float, float]) -> str:
+    """
+    判断点在直线的哪一侧
+
+    约定：面中线方向向量指向下方（从额头到下巴）
+    - 患者左侧（图像右侧）在直线右边 -> "patient_left"
+    - 患者右侧（图像左侧）在直线左边 -> "patient_right"
+
+    Args:
+        point: 待判断的点
+        line_point: 直线上的一点
+        line_direction: 直线方向向量
+
+    Returns:
+        "patient_left" / "patient_right" / "on_line"
+    """
+    signed_dist = signed_dist_point_to_line(point, line_point, line_direction)
+
+    if abs(signed_dist) < 1e-3:
+        return "on_line"
+    elif signed_dist > 0:
+        # 在方向向量右侧 = 患者左侧（假设方向向量向下）
+        return "patient_left"
+    else:
+        return "patient_right"
+
+
 # =============================================================================
 # 数据库操作函数
 # =============================================================================
@@ -2093,77 +2269,117 @@ def compute_lip_region_centroid(landmarks, w: int, h: int, left: bool = True) ->
 
 def compute_lip_midline_symmetry(landmarks, w: int, h: int) -> Dict[str, Any]:
     """
-    计算嘴唇相对于面中线的对称性
+    计算嘴唇相对于面中线的对称性 - 向量几何版本
 
-    核心原理:
-    - 面中线: 双内眦中点的x坐标
-    - 左侧嘴唇区域质心到面中线的水平距离
-    - 右侧嘴唇区域质心到面中线的水平距离
-    - 如果嘴唇被拉向一侧，该侧距离会增大，另一侧减小
-
-    判断逻辑:
-    - 嘴唇偏向健侧（被健侧肌肉拉动）
-    - 所以：偏向的那侧是健侧，另一侧是面瘫侧
+    核心改进：
+    - 使用向量化面中线（处理头部倾斜）
+    - 计算点到直线的垂直距离（而非简单x坐标差）
+    - 返回更丰富的几何信息用于调试
 
     Returns:
         Dict包含:
-        - midline_x: 面中线x坐标
-        - left_centroid: 左侧嘴唇质心 (x, y)
-        - right_centroid: 右侧嘴唇质心 (x, y)
-        - left_to_midline: 左侧嘴唇质心到中线的水平距离（正值）
-        - right_to_midline: 右侧嘴唇质心到中线的水平距离（正值）
-        - lip_offset: 嘴唇整体偏移 = (左侧距离 - 右侧距离)
-                      正值表示偏向左侧（患者左侧），负值表示偏向右侧（患者右侧）
-        - symmetry_ratio: 对称比 = min(L,R) / max(L,R)，越接近1越对称
-        - asymmetry_ratio: 不对称比 = |L-R| / max(L,R)
-        - palsy_side_suggestion: 根据偏移建议的面瘫侧 (0=对称, 1=左侧面瘫, 2=右侧面瘫)
+        - midline: 面中线信息 {center, direction, top_point, bottom_point}
+        - left_centroid: 左侧嘴唇质心
+        - right_centroid: 右侧嘴唇质心
+        - left_dist_to_midline: 左侧质心到面中线的垂直距离
+        - right_dist_to_midline: 右侧质心到面中线的垂直距离
+        - lip_offset: 偏移量 = left_dist - right_dist
+        - lip_offset_norm: 归一化偏移量 (offset / ICD)
+        - symmetry_ratio: 对称比
+        - palsy_side_suggestion: 面瘫侧建议
+        - evidence: 详细判决依据
     """
-    # 面中线（双内眦中点）
-    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
-    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
-    midline_x = (left_canthus[0] + right_canthus[0]) / 2
+    # 1. 计算向量化面中线
+    midline = compute_face_midline(landmarks, w, h)
+    if midline is None:
+        return {"error": "无法计算面中线"}
 
-    # 左右嘴唇质心
+    center = midline["center"]
+    direction = midline["direction"]
+    icd = midline["icd"]
+
+    # 确保方向向量指向下方（y增大方向）
+    # 这样右侧（正值）= 患者左侧
+    nx, ny = direction
+    if ny < 0:
+        # 如果指向上方，反转
+        nx, ny = -nx, -ny
+        direction = (nx, ny)
+
+    # 2. 计算左右嘴唇质心
     left_centroid = compute_lip_region_centroid(landmarks, w, h, left=True)
     right_centroid = compute_lip_region_centroid(landmarks, w, h, left=False)
 
-    # 到面中线的水平距离
-    # 患者左侧嘴唇在图像右侧，x > midline_x
-    # 患者右侧嘴唇在图像左侧，x < midline_x
-    left_to_midline = abs(left_centroid[0] - midline_x)
-    right_to_midline = abs(right_centroid[0] - midline_x)
+    # 3. 计算到面中线的垂直距离（使用向量几何）
+    left_signed_dist = signed_dist_point_to_line(left_centroid, center, direction)
+    right_signed_dist = signed_dist_point_to_line(right_centroid, center, direction)
 
-    # 嘴唇整体偏移
-    # 如果左侧距离 > 右侧距离，说明嘴唇偏向左侧（患者左侧）
-    lip_offset = left_to_midline - right_to_midline
+    # 绝对距离
+    left_dist = abs(left_signed_dist)
+    right_dist = abs(right_signed_dist)
 
-    # 对称比和不对称比
-    max_dist = max(left_to_midline, right_to_midline)
-    min_dist = min(left_to_midline, right_to_midline)
+    # 4. 计算嘴唇中心点
+    lip_center = compute_lip_midline_center(landmarks, w, h)
+    lip_center_signed_dist = signed_dist_point_to_line(lip_center, center, direction)
+    lip_center_dist = abs(lip_center_signed_dist)
+
+    # 5. 投影点（用于可视化）
+    lip_center_proj = project_point_to_line(lip_center, center, direction)
+
+    # 6. 对称性计算
+    lip_offset = left_dist - right_dist
+    lip_offset_norm = lip_offset / icd if icd > 1e-6 else 0.0
+
+    max_dist = max(left_dist, right_dist)
+    min_dist = min(left_dist, right_dist)
     symmetry_ratio = min_dist / max_dist if max_dist > 1e-6 else 1.0
-    asymmetry_ratio = abs(lip_offset) / max_dist if max_dist > 1e-6 else 0
+    asymmetry_ratio = abs(lip_offset) / max_dist if max_dist > 1e-6 else 0.0
 
-    # 面瘫侧建议
-    # 嘴唇偏向健侧，所以偏向的那侧是健侧，另一侧是面瘫侧
-    if asymmetry_ratio < 0.08:  # 偏移小于8%认为对称
+    # 7. 面瘫侧判断
+    offset_threshold = THR.MOUTH_CENTER_PALSY_OFFSET
+
+    is_abnormal = abs(lip_offset_norm) > offset_threshold
+
+    if not is_abnormal:
         palsy_side_suggestion = 0
-    elif lip_offset > 0:
-        # 嘴唇偏向左侧（患者左侧）= 被左侧拉 = 左侧是健侧 = 右侧面瘫
+        contribution = "None"
+    elif lip_center_signed_dist > 0:
+        # 嘴唇中心偏向患者左侧 = 被左侧拉 = 右侧面瘫
         palsy_side_suggestion = 2
+        contribution = "Right Palsy"
     else:
-        # 嘴唇偏向右侧（患者右侧）= 被右侧拉 = 右侧是健侧 = 左侧面瘫
+        # 嘴唇中心偏向患者右侧 = 被右侧拉 = 左侧面瘫
         palsy_side_suggestion = 1
+        contribution = "Left Palsy"
+
+    # 8. 构建详细证据
+    evidence = {
+        "offset_raw_px": float(lip_center_signed_dist),
+        "offset_norm": float(abs(lip_center_signed_dist) / icd) if icd > 1e-6 else 0.0,
+        "threshold": float(offset_threshold),
+        "is_abnormal": is_abnormal,
+        "contribution": contribution,
+        "left_dist_to_midline": float(left_dist),
+        "right_dist_to_midline": float(right_dist),
+        "symmetry_ratio": float(symmetry_ratio),
+    }
 
     return {
-        "midline_x": float(midline_x),
+        "midline": midline,
         "left_centroid": (float(left_centroid[0]), float(left_centroid[1])),
         "right_centroid": (float(right_centroid[0]), float(right_centroid[1])),
-        "left_to_midline": float(left_to_midline),
-        "right_to_midline": float(right_to_midline),
+        "left_dist_to_midline": float(left_dist),
+        "right_dist_to_midline": float(right_dist),
+        "lip_center": (float(lip_center[0]), float(lip_center[1])),
+        "lip_center_signed_dist": float(lip_center_signed_dist),
+        "lip_center_proj": (float(lip_center_proj[0]), float(lip_center_proj[1])),
         "lip_offset": float(lip_offset),
+        "lip_offset_norm": float(lip_offset_norm),
         "symmetry_ratio": float(symmetry_ratio),
         "asymmetry_ratio": float(asymmetry_ratio),
         "palsy_side_suggestion": palsy_side_suggestion,
+        "evidence": evidence,
+        "icd": float(icd),
     }
 
 
@@ -2491,97 +2707,253 @@ def compute_lip_midline_center(landmarks, w: int, h: int) -> Tuple[float, float]
 
 
 def compute_lip_midline_offset_from_face_midline(landmarks, w: int, h: int,
-                                                 baseline_landmarks=None) -> Dict[str, Any]:
+                                                    baseline_landmarks=None) -> Dict[str, Any]:
     """
-    计算嘴唇中线相对于面中线的偏移（用于BlowCheek/LipPucker面瘫侧判断）
+    计算嘴唇中线相对于面中线的偏移 - 向量几何版本
 
-    原理:
-    - 面中线: 双内眦中点的x坐标
-    - 嘴唇中线: 上下唇中线点的平均x坐标
-    - 面瘫时嘴唇被健侧肌肉拉动，偏向健侧
-    - 和基线相比，偏移变化方向指示面瘫侧
+    核心改进：
+    - 使用向量化面中线
+    - 计算点到直线的垂直距离
+    - 返回详细的几何信息和判决依据
 
     Args:
         landmarks: 当前帧landmarks
         w, h: 图像尺寸
-        baseline_landmarks: 基线帧landmarks
+        baseline_landmarks: 基线帧landmarks（可选）
+
+    Returns:
+        Dict包含完整的几何信息和evidence
+    """
+    # 1. 计算向量化面中线
+    midline = compute_face_midline(landmarks, w, h)
+    if midline is None:
+        return {"error": "无法计算面中线"}
+
+    center = midline["center"]
+    direction = midline["direction"]
+    icd = midline["icd"]
+
+    # 确保方向向量指向下方
+    nx, ny = direction
+    if ny < 0:
+        nx, ny = -nx, -ny
+        direction = (nx, ny)
+
+    # 2. 计算嘴唇中线中心
+    lip_center = compute_lip_midline_center(landmarks, w, h)
+
+    # 3. 计算嘴唇中心到面中线的有符号距离
+    current_signed_dist = signed_dist_point_to_line(lip_center, center, direction)
+    current_dist = abs(current_signed_dist)
+
+    # 4. 计算投影点（用于可视化）
+    lip_center_proj = project_point_to_line(lip_center, center, direction)
+
+    # 5. 归一化偏移
+    offset_norm = current_dist / icd if icd > 1e-6 else 0.0
+
+    # 基础结果
+    result = {
+        "midline": midline,
+        "face_midline_center": center,
+        "face_midline_direction": direction,
+        "lip_midline_x": float(lip_center[0]),
+        "lip_midline_y": float(lip_center[1]),
+        "lip_center_proj": (float(lip_center_proj[0]), float(lip_center_proj[1])),
+        "current_signed_dist": float(current_signed_dist),
+        "current_dist": float(current_dist),
+        "offset_norm": float(offset_norm),
+        "icd": float(icd),
+        # 兼容旧接口
+        "face_midline_x": float(center[0]),
+        "current_offset": float(current_signed_dist),  # 有符号距离
+    }
+
+    # 6. 判断阈值
+    threshold = THR.MOUTH_CENTER_PALSY_OFFSET
+    is_abnormal = offset_norm > threshold
+
+    if baseline_landmarks is None:
+        # 无基线：直接根据当前偏移判断
+        if not is_abnormal:
+            palsy_side_suggestion = 0
+            contribution = "None"
+        elif current_signed_dist > 0:
+            # 偏向患者左侧 = 右侧面瘫
+            palsy_side_suggestion = 2
+            contribution = "Right Palsy (lip shifted to patient left)"
+        else:
+            palsy_side_suggestion = 1
+            contribution = "Left Palsy (lip shifted to patient right)"
+
+        result["palsy_side_suggestion"] = palsy_side_suggestion
+        result["evidence"] = {
+            "offset_raw_px": float(current_signed_dist),
+            "offset_norm": float(offset_norm),
+            "threshold": float(threshold),
+            "is_abnormal": is_abnormal,
+            "contribution": contribution,
+            "method": "absolute_offset",
+        }
+        return result
+
+    # 7. 有基线：计算偏移变化
+    baseline_midline = compute_face_midline(baseline_landmarks, w, h)
+    if baseline_midline is None:
+        result["palsy_side_suggestion"] = 0
+        result["evidence"] = {"error": "无法计算基线面中线"}
+        return result
+
+    baseline_center = baseline_midline["center"]
+    baseline_direction = baseline_midline["direction"]
+    baseline_icd = baseline_midline["icd"]
+
+    # 确保基线方向也指向下方
+    bnx, bny = baseline_direction
+    if bny < 0:
+        bnx, bny = -bnx, -bny
+        baseline_direction = (bnx, bny)
+
+    baseline_lip_center = compute_lip_midline_center(baseline_landmarks, w, h)
+    baseline_signed_dist = signed_dist_point_to_line(
+        baseline_lip_center, baseline_center, baseline_direction
+    )
+
+    # 计算尺度因子
+    scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
+
+    # 偏移变化（考虑尺度）
+    scaled_current_dist = current_signed_dist * scale
+    offset_change = scaled_current_dist - baseline_signed_dist
+    offset_change_norm = abs(offset_change) / baseline_icd if baseline_icd > 1e-6 else 0.0
+
+    result["baseline_signed_dist"] = float(baseline_signed_dist)
+    result["baseline_offset"] = float(baseline_signed_dist)  # 兼容
+    result["offset_change"] = float(offset_change)
+    result["offset_change_norm"] = float(offset_change_norm)
+    result["scale"] = float(scale)
+
+    # 8. 基于变化量判断
+    change_threshold = 0.015  # 1.5% ICD
+    is_change_abnormal = offset_change_norm > change_threshold
+
+    if not is_change_abnormal:
+        palsy_side_suggestion = 0
+        contribution = "None"
+    elif offset_change > 0:
+        palsy_side_suggestion = 2
+        contribution = "Right Palsy (lip shifted more to patient left vs baseline)"
+    else:
+        palsy_side_suggestion = 1
+        contribution = "Left Palsy (lip shifted more to patient right vs baseline)"
+
+    result["palsy_side_suggestion"] = palsy_side_suggestion
+    result["evidence"] = {
+        "offset_raw_px": float(current_signed_dist),
+        "offset_norm": float(offset_norm),
+        "offset_change_px": float(offset_change),
+        "offset_change_norm": float(offset_change_norm),
+        "threshold_absolute": float(threshold),
+        "threshold_change": float(change_threshold),
+        "is_abnormal_absolute": is_abnormal,
+        "is_abnormal_change": is_change_abnormal,
+        "contribution": contribution,
+        "method": "relative_change",
+    }
+
+    return result
+
+
+def compute_lip_shape_symmetry(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    计算嘴唇形状关于面中线的对称性
+
+    方法：
+    1. 获取嘴唇轮廓点
+    2. 将各点投影到面中线，分割为左右两部分
+    3. 比较左右两部分的"展开度"（到面中线的平均距离）
+
+    这比单纯看质心偏移更能反映实际形状的对称性
 
     Returns:
         Dict包含:
-        - face_midline_x: 面中线x坐标
-        - lip_midline_x: 嘴唇中线x坐标
-        - current_offset: 当前偏移 (lip_x - face_x, 正=偏左，负=偏右)
-        - baseline_offset: 基线偏移（如有）
-        - offset_change: 偏移变化量（如有基线）
-        - palsy_side_suggestion: 面瘫侧建议
+        - left_avg_dist: 左侧嘴唇点到面中线的平均距离
+        - right_avg_dist: 右侧嘴唇点到面中线的平均距离
+        - shape_ratio: 形状对称比 min/max
+        - shape_asymmetry: 形状不对称度 |L-R|/max
     """
-    # 面中线
-    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
-    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
-    face_midline_x = (left_canthus[0] + right_canthus[0]) / 2
+    # 1. 计算面中线
+    midline = compute_face_midline(landmarks, w, h)
+    if midline is None:
+        return {"error": "无法计算面中线"}
 
-    # 嘴唇中线中心
-    lip_center = compute_lip_midline_center(landmarks, w, h)
-    lip_midline_x = lip_center[0]
+    center = midline["center"]
+    direction = midline["direction"]
+    icd = midline["icd"]
 
-    # 当前偏移
-    current_offset = lip_midline_x - face_midline_x
+    # 确保方向向量指向下方
+    nx, ny = direction
+    if ny < 0:
+        nx, ny = -nx, -ny
+        direction = (nx, ny)
 
-    result = {
-        "face_midline_x": float(face_midline_x),
-        "lip_midline_x": float(lip_midline_x),
-        "lip_midline_y": float(lip_center[1]),
-        "current_offset": float(current_offset),
-    }
+    # 2. 获取外嘴唇轮廓点
+    outer_lip_indices = LM.OUTER_LIP  # [61, 146, 91, 181, 84, 17, ...]
 
-    if baseline_landmarks is None:
-        # 没有基线，直接根据当前偏移判断
-        icd = compute_icd(landmarks, w, h)
-        offset_norm = abs(current_offset) / icd if icd > 1e-6 else 0
-        result["offset_norm"] = float(offset_norm)
+    left_dists = []
+    right_dists = []
 
-        if offset_norm < 0.025:  # 以内认为对称
-            result["palsy_side_suggestion"] = 0
-        elif current_offset > 0:
-            # 偏向患者左侧 = 被左侧拉 = 左侧健侧 = 右侧面瘫
-            result["palsy_side_suggestion"] = 2
+    for idx in outer_lip_indices:
+        pt = pt2d(landmarks[idx], w, h)
+        signed_dist = signed_dist_point_to_line(pt, center, direction)
+
+        if signed_dist > 0:
+            # 在面中线右侧（患者左侧）
+            left_dists.append(signed_dist)
         else:
-            result["palsy_side_suggestion"] = 1
-        return result
+            # 在面中线左侧（患者右侧）
+            right_dists.append(abs(signed_dist))
 
-    # 有基线：计算偏移变化
-    baseline_lip_center = compute_lip_midline_center(baseline_landmarks, w, h)
-    baseline_left_canthus = pt2d(baseline_landmarks[LM.EYE_INNER_L], w, h)
-    baseline_right_canthus = pt2d(baseline_landmarks[LM.EYE_INNER_R], w, h)
-    baseline_face_midline_x = (baseline_left_canthus[0] + baseline_right_canthus[0]) / 2
+    # 3. 计算平均距离
+    left_avg_dist = sum(left_dists) / len(left_dists) if left_dists else 0.0
+    right_avg_dist = sum(right_dists) / len(right_dists) if right_dists else 0.0
 
-    baseline_offset = baseline_lip_center[0] - baseline_face_midline_x
+    # 4. 计算对称性
+    max_dist = max(left_avg_dist, right_avg_dist)
+    min_dist = min(left_avg_dist, right_avg_dist)
 
-    result["baseline_offset"] = float(baseline_offset)
+    shape_ratio = min_dist / max_dist if max_dist > 1e-6 else 1.0
+    shape_asymmetry = (max_dist - min_dist) / max_dist if max_dist > 1e-6 else 0.0
 
-    # 偏移变化量（考虑尺度）
-    scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
-    scaled_current_offset = current_offset * scale
+    # 5. 归一化
+    left_avg_norm = left_avg_dist / icd if icd > 1e-6 else 0.0
+    right_avg_norm = right_avg_dist / icd if icd > 1e-6 else 0.0
 
-    offset_change = scaled_current_offset - baseline_offset
-    result["offset_change"] = float(offset_change)
-    result["scale"] = float(scale)
-
-    # 归一化偏移变化
-    icd_base = compute_icd(baseline_landmarks, w, h)
-    offset_change_norm = abs(offset_change) / icd_base if icd_base > 1e-6 else 0
-    result["offset_change_norm"] = float(offset_change_norm)
-
-    # 面瘫侧判断：偏移变化方向
-    if offset_change_norm < 0.02:  # 2%以内认为无变化
-        result["palsy_side_suggestion"] = 0
-    elif offset_change > 0:
-        # 相对基线偏向左侧 = 被左侧拉 = 右侧面瘫
-        result["palsy_side_suggestion"] = 2
+    # 6. 判断不对称方向
+    if shape_asymmetry < 0.08:  # 8%以内认为对称
+        asymmetry_direction = "symmetric"
+        palsy_suggestion = 0
+    elif left_avg_dist > right_avg_dist:
+        # 左侧展开更大 = 被拉向左侧 = 右侧面瘫
+        asymmetry_direction = "left_larger"
+        palsy_suggestion = 2
     else:
-        result["palsy_side_suggestion"] = 1
+        asymmetry_direction = "right_larger"
+        palsy_suggestion = 1
 
-    return result
+    return {
+        "left_avg_dist": float(left_avg_dist),
+        "right_avg_dist": float(right_avg_dist),
+        "left_avg_norm": float(left_avg_norm),
+        "right_avg_norm": float(right_avg_norm),
+        "shape_ratio": float(shape_ratio),
+        "shape_asymmetry": float(shape_asymmetry),
+        "asymmetry_direction": asymmetry_direction,
+        "palsy_suggestion": palsy_suggestion,
+        "left_point_count": len(left_dists),
+        "right_point_count": len(right_dists),
+        "icd": float(icd),
+    }
 
 
 def compute_mouth_corner_to_eye_line_distance(landmarks, w: int, h: int,
