@@ -342,7 +342,7 @@ def detect_palsy_side(smile_metrics: Dict[str, Any]) -> Dict[str, Any]:
             result["evidence"]["reduction_asymmetry"] = asymmetry
             result["confidence"] = min(1.0, asymmetry * 2)
 
-            if asymmetry < 0.15:
+            if asymmetry < THR.SMILE_ASYM_SYMMETRIC:
                 result["palsy_side"] = 0
                 result["interpretation"] = (
                     f"双侧嘴角上提对称 (L减小{left_reduction:.1f}px, R减小{right_reduction:.1f}px)"
@@ -375,7 +375,7 @@ def detect_palsy_side(smile_metrics: Dict[str, Any]) -> Dict[str, Any]:
             result["evidence"]["distance_asymmetry"] = asymmetry
             result["confidence"] = min(1.0, asymmetry * 3)
 
-            if asymmetry < 0.02:
+            if asymmetry < THR.SMILE_ASYM_SYMMETRIC:
                 result["palsy_side"] = 0
                 result["interpretation"] = (
                     f"双侧嘴角到眼线距离对称 (L={left_dist:.1f}px, R={right_dist:.1f}px, "

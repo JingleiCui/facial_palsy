@@ -29,7 +29,7 @@ class Thresholds:
     # =========================================================================
 
     # EAR (Eye Aspect Ratio) 闭眼阈值
-    EYE_CLOSURE_EAR: float = 0.2  # EAR < 此值认为眼睛闭合
+    EYE_CLOSURE_EAR: float = 0.22  # EAR < 此值认为眼睛闭合
 
     # =========================================================================
     # 眼睛闭合度相关阈值（基于面积比）
@@ -51,7 +51,7 @@ class Thresholds:
     EYE_SYNC_PEAK_DIFF_MAX: int = 5  # 峰值帧差 < 5帧 认为同步
 
     # 对称度阈值 - 降低以提高敏感度
-    EYE_PALSY_ASYMMETRY_THRESHOLD: float = 0.08  # 8%差异即判定不对称 (原15%)
+    EYE_PALSY_ASYMMETRY_THRESHOLD: float = 0.07  # 7%差异即判定不对称
 
     # 同步度阈值 - 峰值帧差异
     EYE_PALSY_SYNC_PEAK_DIFF: int = 3  # 峰值帧差>3帧判定不同步
@@ -60,12 +60,19 @@ class Thresholds:
     EYE_PALSY_COMPLETE_CLOSURE: float = 0.85  # 闭合度>85%认为完全闭合
 
     # 综合判断权重
-    EYE_PALSY_SYMMETRY_WEIGHT: float = 0.50  # 对称度权重
-    EYE_PALSY_SYNC_WEIGHT: float = 0.30  # 同步度权重
+    EYE_PALSY_SYMMETRY_WEIGHT: float = 0.60  # 对称度权重
+    EYE_PALSY_SYNC_WEIGHT: float = 0.20  # 同步度权重
     EYE_PALSY_COMPLETE_WEIGHT: float = 0.20  # 完整性权重
 
     # Pearson相关系数阈值
     EYE_PALSY_PEARSON_THRESHOLD: float = 0.70  # <0.70认为不同步
+
+    # 面积差异阈值：单帧面积差异超过此比例才计入统计
+    EYE_AREA_DIFF_THRESHOLD = 0.10  # 10%面积差异
+    # 帧数比例阈值：超过此比例的帧表现差才判定为患侧
+    FRAME_RATIO_THRESHOLD = 0.30  # 30%的帧表现差
+    # 最小闭合度：只统计闭眼期间的帧
+    MIN_CLOSURE_FOR_COUNT = 0.50  # 闭合度>50%才统计
 
     # =========================================================================
     # 鼓腮 BlowCheek 阈值
@@ -74,7 +81,7 @@ class Thresholds:
     # bulge = (base_rel_z - current_rel_z) / ICD，rel_z = cheek_z - nose_z
     BLOW_CHEEK_BULGE_MIN: float = 0.005  # bulge > 0.5% 认为有鼓腮动作
     BLOW_CHEEK_BULGE_GOOD: float = 0.02  # bulge > 2% 认为鼓腮明显
-    BLOW_CHEEK_ASYM_THRESHOLD: float = 0.15  # 左右不对称比 > 15% 判定患侧
+    BLOW_CHEEK_ASYM_THRESHOLD: float = 0.10  # 左右不对称比 > 15% 判定患侧
     BLOW_CHEEK_BASELINE_FRAMES: int = 10  # 用视频前10帧建立内部baseline
 
     # 唇封闭距离归一化阈值 (seal_total / ICD)
@@ -86,6 +93,9 @@ class Thresholds:
     # 嘴唇内圈面积增幅阈值
     MOUTH_INNER_AREA_INC: float = 3.5
     MOUTH_INNER_AREA_BASE_EPS: float = 1e-4
+
+    # 嘴唇中心偏移阈值 (归一化到ICD)
+    MOUTH_CENTER_PALSY_OFFSET: float = 0.020  # 偏移>% ICD
 
     # =========================================================================
     # 撅嘴 LipPucker 阈值
@@ -99,23 +109,23 @@ class Thresholds:
     LIP_PUCKER_Z_DELTA: float = 0.01
 
     # LipPucker 面瘫检测阈值
-    LIP_PUCKER_OFFSET_THRESHOLD: float = 0.020  # 偏移 > 2% 判定有面瘫
+    LIP_PUCKER_OFFSET_THRESHOLD: float = 0.015  # 偏移 > 2% 判定有面瘫
     LIP_PUCKER_CORNER_ASYM_TRACE: float = 0.10
     LIP_PUCKER_CORNER_ASYM_MILD: float = 0.20
     LIP_PUCKER_CORNER_ASYM_MODERATE: float = 0.35
     LIP_PUCKER_CORNER_ASYM_SEVERE: float = 0.50
 
     # 嘴角收缩不对称阈值 - 降低以提高敏感度
-    LIP_PUCKER_PALSY_ASYMMETRY_THRESHOLD: float = 0.10  # 10%差异判定不对称 (原15%)
+    LIP_PUCKER_PALSY_ASYMMETRY_THRESHOLD: float = 0.06  # 6%差异判定不对称
 
     # 最小收缩量阈值 - 降低以捕获更多运动
-    LIP_PUCKER_PALSY_MIN_CONTRACTION: float = 1.0  # 1px即可分析 (原2px)
+    LIP_PUCKER_PALSY_MIN_CONTRACTION: float = 1.0  # 1px即可分析
 
     # 嘴唇中线角度阈值
-    LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD: float = 4.0  # 角度>4度判定偏斜
+    LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD: float = 3.0  # 角度>4度判定偏斜
 
     # 嘴唇中心偏移阈值 (归一化到ICD)
-    LIP_PUCKER_PALSY_OFFSET_THRESHOLD: float = 0.012  # 偏移>1.2% ICD (原2%)
+    LIP_PUCKER_PALSY_OFFSET_THRESHOLD: float = 0.020  # 偏移>% ICD
 
     # 综合判断权重
     LIP_PUCKER_CONTRACTION_WEIGHT: float = 0.40  # 收缩量权重
@@ -155,14 +165,14 @@ class Thresholds:
     SEVERITY_SEVERE: float = 0.15  # < 15% 重度
 
     # =========================================================================
-    # NeutralFace 静息面阈值
+    # NeutralFace 静息阈值
     # =========================================================================
 
     NEUTRAL_MIN_EAR: float = 0.20  # EAR > 此值认为眼睛睁开
     NEUTRAL_MAX_MOUTH_RATIO: float = 0.15  # 嘴高/嘴宽 < 此值认为嘴闭合
-    NEUTRAL_PALP_DEVIATION: float = 0.12  # 眼睑裂比偏离 > 12% 认为不对称
-    NEUTRAL_NLF_DEVIATION: float = 0.12  # 鼻唇沟比偏离 > 12% 认为不对称
-    NEUTRAL_AREA_DEVIATION: float = 0.10  # 眼睛面积比偏离 > 10% 认为不对称
+    NEUTRAL_PALP_DEVIATION: float = 0.08  # 眼睑裂比偏离 > 12% 认为不对称
+    NEUTRAL_NLF_DEVIATION: float = 0.08  # 鼻唇沟比偏离 > 12% 认为不对称
+    NEUTRAL_AREA_DEVIATION: float = 0.08  # 眼睛面积比偏离 > 10% 认为不对称
 
     # =========================================================================
     # CloseEye 闭眼动作阈值
@@ -192,11 +202,11 @@ class Thresholds:
     # =========================================================================
 
     RAISE_EYEBROW_CHANGE_MIN: float = 5.0  # 最小变化量(像素)
-    RAISE_EYEBROW_SYMMETRY: float = 0.30
+    RAISE_EYEBROW_SYMMETRY: float = 0.20
     RAISE_EYEBROW_SMOOTH_WIN: int = 5
 
     # 面瘫检测阈值
-    RAISE_EYEBROW_ASYM_NORMAL: float = 0.10  # 不对称 < 10% 正常
+    RAISE_EYEBROW_ASYM_NORMAL: float = 0.08  # 不对称 < 10% 正常
 
     # 严重度分级
     RAISE_EYEBROW_CHANGE_SEVERE: float = 0.20
@@ -216,7 +226,7 @@ class Thresholds:
     SMILE_SYMMETRY: float = 0.20
 
     # 面瘫检测阈值
-    SMILE_ASYM_SYMMETRIC: float = 0.15  # 不对称 < 15% 对称
+    SMILE_ASYM_SYMMETRIC: float = 0.08  # 不对称 < 15% 对称
 
     # 严重度分级 (基于嘴角上提不对称)
     SMILE_ASYM_TRACE: float = 0.02  # < 2% 完美

@@ -33,6 +33,7 @@ from clinical_base import (
     add_valid_region_shading, get_palsy_side_text,
     draw_palsy_side_label, compute_lip_midline_symmetry,
     compute_lip_midline_offset_from_face_midline,
+    compute_face_midline, draw_face_midline,
 )
 
 import matplotlib
@@ -479,7 +480,7 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
         if np.isfinite(right_rel_z[i]):
             right_bulge[i] = (base_r_rel_z - right_rel_z[i]) / base_icd
         if np.isfinite(left_bulge[i]) and np.isfinite(right_bulge[i]):
-            score[i] = left_bulge[i] + right_bulge[i]
+            score[i] = max(left_bulge[i], right_bulge[i])
 
     # 门控：嘴唇闭合
     valid = np.isfinite(seal_norm) & (np.array(seal_norm) <= MOUTH_SEAL_THR)
@@ -666,8 +667,8 @@ def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
         offset_norm = abs(current_offset) / icd
         result["evidence"]["offset_norm"] = offset_norm
 
-        # 判断阈值：偏移超过ICD的2.5%
-        if offset_norm > 0.025:
+        # 判断阈值：偏移超过ICD的
+        if offset_norm > THR.MOUTH_CENTER_PALSY_OFFSET:
             result["method"] = "lip_midline_offset"
             result["confidence"] = min(1.0, offset_norm * 5)
 
@@ -839,6 +840,11 @@ def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: i
     """可视化鼓腮指标 - 字体放大版"""
     img = frame.copy()
 
+    # ========== 添加面中线绘制 ==========
+    midline = compute_face_midline(landmarks, w, h)
+    if midline:
+        img = draw_face_midline(img, midline, color=(0, 255, 255), thickness=2, dashed=True)
+
     # 字体参数
     FONT = cv2.FONT_HERSHEY_SIMPLEX
     FONT_SCALE_TITLE = 1.4
@@ -919,32 +925,12 @@ def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: i
                     FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
         y += LINE_HEIGHT
 
-        # ========== 绘制面中线和嘴唇中线 ==========
+        # ========== 绘制嘴唇中线 ==========
         if "lip_midline_offset" in metrics:
             offset_data = metrics["lip_midline_offset"]
             face_midline_x = offset_data.get("face_midline_x", None)
             lip_midline_x = offset_data.get("lip_midline_x", None)
             lip_midline_y = offset_data.get("lip_midline_y", None)
-
-            if face_midline_x is not None:
-                face_midline_x_int = int(face_midline_x)
-
-                # 面中线的起点和终点（从眉间到下巴）
-                # 获取内眦y坐标作为参考
-                left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
-                right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
-                eye_y = int((left_canthus[1] + right_canthus[1]) / 2)
-
-                midline_start_y = max(20, eye_y - 80)  # 从眼睛上方开始
-                midline_end_y = min(h - 20, eye_y + 300)  # 到下巴位置
-
-                # 绘制面中线（青色虚线）
-                for yy in range(midline_start_y, midline_end_y, 15):
-                    cv2.line(img, (face_midline_x_int, yy),
-                             (face_midline_x_int, min(yy + 8, midline_end_y)),
-                             (255, 255, 0), 2)
-                cv2.putText(img, "Face Mid", (face_midline_x_int + 5, midline_start_y + 20),
-                            FONT, 0.5, (255, 255, 0), 2)
 
             # ========== 绘制嘴唇中线 ==========
             if lip_midline_x is not None and lip_midline_y is not None:

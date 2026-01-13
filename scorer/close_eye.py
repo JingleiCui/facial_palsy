@@ -2,22 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 CloseEye 动作处理模块
-==============================
+==================================
 
-分析闭眼动作:
-1. 眼睛闭合程度 (EAR)
-2. 眼睛面积变化
-3. 左右眼对称性
-4. 面瘫侧别检测 - 检测两只眼是否都闭上
-5. 联动运动检测
-
-修复内容:
-- 添加面瘫侧别检测：基于两只眼是否都能完全闭合
-- 面瘫侧的眼睛无法完全闭合(EAR较大)
+核心修改：
+1. 逐帧对比两只眼睛的闭合度（面积），统计哪侧更多帧表现差
+2. 曲线图改为：上边画眼睛面积，下边画眼睛闭合度
+3. 移除EAR相关的判断逻辑
 
 面瘫侧别编码: 0=无/对称, 1=左, 2=右
-
-对应Sunnybrook: Gentle Eye closure (OCS)
 """
 
 import cv2
@@ -47,11 +39,8 @@ def find_peak_frame_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: 
                               baseline_landmarks=None) -> int:
     """
     找闭眼峰值帧 - 使用眼睛面积
-
-    改进: 使用眼睛面积相对于基线的闭合程度来找峰值帧
     """
     if baseline_landmarks is not None:
-        # 有基线：使用面积闭合度
         baseline_left_area, _ = compute_eye_area(baseline_landmarks, w, h, True)
         baseline_right_area, _ = compute_eye_area(baseline_landmarks, w, h, False)
 
@@ -80,7 +69,6 @@ def find_peak_frame_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: 
 
         return max_idx
     else:
-        # 没有基线：使用面积最小的帧
         min_area = float('inf')
         min_idx = 0
 
@@ -135,26 +123,21 @@ def extract_eye_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, Dict[
 
 
 def detect_palsy_side(
-        symmetry_at_peak: Dict[str, Any],
-        synchrony: Dict[str, Any],
-        left_closure: float,
-        right_closure: float
+        closure_data: Dict[str, Any],
+        peak_idx: int,
 ) -> Dict[str, Any]:
     """
-    综合对称度和同步度检测面瘫侧别
+    逐帧对比两只眼睛的闭合度检测面瘫侧别
 
-    判断逻辑:
-    1. 对称度差 (asymmetry > 8%) → 闭合差的一侧是患侧
-    2. 同步度差 (peak_diff > 3帧) → 峰值帧晚的一侧是患侧
-    3. 完整性差 (一侧<85%但另一侧>=85%) → 闭合不完全的一侧是患侧
-    4. Pearson相关 (<0.70) → 加权同步度判断
-    5. 综合加权投票
+    核心逻辑：
+    - 逐帧比较左右眼的面积
+    - 闭眼期间，面积大的一侧 = 闭不紧 = 患侧
+    - 统计哪侧更多帧表现差（面积更大）
+    - 这样可以捕捉到闭眼过程中任意时刻的差异，不会遗漏早期差异
 
     Args:
-        symmetry_at_peak: 峰值帧对称度分析结果
-        synchrony: 同步度分析结果
-        left_closure: 左眼峰值闭合度
-        right_closure: 右眼峰值闭合度
+        closure_data: 闭合度序列数据
+        peak_idx: 峰值帧索引
 
     Returns:
         palsy_detection dict
@@ -162,146 +145,112 @@ def detect_palsy_side(
     result = {
         "palsy_side": 0,
         "confidence": 0.0,
-        "method": "comprehensive",
+        "method": "frame_by_frame_area_comparison",
         "interpretation": "",
         "evidence": {},
     }
 
-    # 提取指标
-    asymmetry_ratio = symmetry_at_peak.get("asymmetry_ratio", 0)
-    symmetry_palsy = symmetry_at_peak.get("palsy_side", 0)
+    # ========== 提取数据 ==========
+    left_closure_seq = closure_data.get("left_closure", [])
+    right_closure_seq = closure_data.get("right_closure", [])
+    left_area_seq = closure_data.get("left_area", [])
+    right_area_seq = closure_data.get("right_area", [])
 
-    peak_diff = synchrony.get("peak_frame_diff", 0)
-    left_peak = synchrony.get("left_peak_frame", 0)
-    right_peak = synchrony.get("right_peak_frame", 0)
-    pearson = synchrony.get("pearson_correlation", 1.0)
+    # 峰值帧数据
+    left_closure_peak = left_closure_seq[peak_idx] if peak_idx < len(left_closure_seq) else 0
+    right_closure_peak = right_closure_seq[peak_idx] if peak_idx < len(right_closure_seq) else 0
+
+    # ========== 逐帧对比 ==========
+    left_worse_count = 0  # 左眼面积更大（闭合差）的帧数
+    right_worse_count = 0  # 右眼面积更大（闭合差）的帧数
+    total_closing_frames = 0  # 闭眼期间的总帧数
+
+    frame_details = []  # 记录每帧的对比结果
+
+    for i, (lc, rc, la, ra) in enumerate(zip(
+            left_closure_seq, right_closure_seq, left_area_seq, right_area_seq)):
+
+        if not (np.isfinite(lc) and np.isfinite(rc) and np.isfinite(la) and np.isfinite(ra)):
+            continue
+
+        avg_closure = (lc + rc) / 2
+
+        # 只统计闭眼期间的帧
+        if avg_closure >= THR.MIN_CLOSURE_FOR_COUNT:
+            total_closing_frames += 1
+
+            # 计算面积差异比例
+            max_area = max(la, ra)
+            if max_area > 1:
+                area_diff_ratio = abs(la - ra) / max_area
+
+                # 面积差异超过阈值才计入
+                if area_diff_ratio >= THR.EYE_AREA_DIFF_THRESHOLD:
+                    if la > ra:  # 左眼面积大 = 左眼闭不紧 = 左侧表现差
+                        left_worse_count += 1
+                        frame_details.append((i, "left_worse", area_diff_ratio))
+                    else:  # 右眼面积大 = 右眼闭不紧 = 右侧表现差
+                        right_worse_count += 1
+                        frame_details.append((i, "right_worse", area_diff_ratio))
+
+    # ========== 计算比例 ==========
+    if total_closing_frames > 0:
+        left_worse_ratio = left_worse_count / total_closing_frames
+        right_worse_ratio = right_worse_count / total_closing_frames
+    else:
+        left_worse_ratio = 0
+        right_worse_ratio = 0
 
     # 收集证据
     evidence = {
-        "asymmetry_ratio": asymmetry_ratio,
-        "symmetry_palsy_vote": symmetry_palsy,
-        "peak_frame_diff": peak_diff,
-        "left_peak_frame": left_peak,
-        "right_peak_frame": right_peak,
-        "pearson_correlation": pearson,
-        "left_closure": left_closure,
-        "right_closure": right_closure,
-    }
-
-    # ========== 1. 对称度分析 ==========
-    sym_vote = 0
-    sym_weight = 0.0
-
-    if asymmetry_ratio >= THR.EYE_PALSY_ASYMMETRY_THRESHOLD:
-        sym_vote = symmetry_palsy
-        # 不对称越大，权重越高
-        sym_weight = THR.EYE_PALSY_SYMMETRY_WEIGHT * min(1.0, asymmetry_ratio * 5)
-        evidence["symmetry_triggered"] = True
-    else:
-        evidence["symmetry_triggered"] = False
-
-    # ========== 2. 同步度分析 ==========
-    sync_vote = 0
-    sync_weight = 0.0
-
-    if peak_diff > THR.EYE_PALSY_SYNC_PEAK_DIFF:
-        # 峰值帧晚的一侧 = 反应慢 = 患侧
-        sync_vote = 1 if left_peak > right_peak else 2
-        sync_weight = THR.EYE_PALSY_SYNC_WEIGHT * min(1.0, peak_diff / 10)
-        evidence["sync_triggered"] = True
-        evidence["sync_palsy_vote"] = sync_vote
-    else:
-        evidence["sync_triggered"] = False
-        evidence["sync_palsy_vote"] = 0
-
-    # Pearson相关性低也是不同步的证据
-    if pearson < THR.EYE_PALSY_PEARSON_THRESHOLD:
-        # 如果Pearson低但peak_diff不大，额外加权
-        if not evidence.get("sync_triggered"):
-            sync_weight += THR.EYE_PALSY_SYNC_WEIGHT * 0.5
-        evidence["low_pearson_triggered"] = True
-    else:
-        evidence["low_pearson_triggered"] = False
-
-    # ========== 3. 完整性分析 ==========
-    complete_vote = 0
-    complete_weight = 0.0
-
-    max_closure = max(left_closure, right_closure)
-    min_closure = min(left_closure, right_closure)
-
-    if max_closure >= THR.EYE_PALSY_COMPLETE_CLOSURE:
-        # 有一侧能完全闭合
-        if min_closure < THR.EYE_PALSY_COMPLETE_CLOSURE:
-            # 另一侧闭不完全 → 患侧
-            complete_vote = 1 if left_closure < right_closure else 2
-            complete_weight = THR.EYE_PALSY_COMPLETE_WEIGHT
-            evidence["completeness_triggered"] = True
-            evidence["incomplete_side"] = "left" if complete_vote == 1 else "right"
-
-    if "completeness_triggered" not in evidence:
-        evidence["completeness_triggered"] = False
-
-    # ========== 4. 综合投票 ==========
-    votes = {0: 0.0, 1: 0.0, 2: 0.0}
-
-    if sym_vote != 0:
-        votes[sym_vote] += sym_weight
-    if sync_vote != 0:
-        votes[sync_vote] += sync_weight
-    if complete_vote != 0:
-        votes[complete_vote] += complete_weight
-
-    evidence["vote_scores"] = {
-        "symmetric": votes[0],
-        "left_palsy": votes[1],
-        "right_palsy": votes[2],
+        "left_closure_at_peak": float(left_closure_peak),
+        "right_closure_at_peak": float(right_closure_peak),
+        "total_closing_frames": total_closing_frames,
+        "left_worse_count": left_worse_count,
+        "right_worse_count": right_worse_count,
+        "left_worse_ratio": float(left_worse_ratio),
+        "right_worse_ratio": float(right_worse_ratio),
+        "frame_area_diff_threshold": THR.EYE_AREA_DIFF_THRESHOLD,
     }
 
     result["evidence"] = evidence
 
-    # ========== 5. 最终判定 ==========
-    # 选择得票最高的（需要超过阈值）
-    min_confidence = 0.15  # 最低置信度阈值
+    # ========== 判断逻辑 ==========
 
-    if votes[1] >= min_confidence and votes[1] >= votes[2]:
-        result["palsy_side"] = 1
-        result["confidence"] = min(1.0, votes[1])
-    elif votes[2] >= min_confidence and votes[2] > votes[1]:
-        result["palsy_side"] = 2
-        result["confidence"] = min(1.0, votes[2])
-    else:
-        result["palsy_side"] = 0
-        result["confidence"] = 0.0
+    # 检查闭眼帧数是否足够
+    if total_closing_frames < 5:
+        result["interpretation"] = f"闭眼帧数不足 ({total_closing_frames}帧)，无法判断"
+        return result
 
-    # ========== 6. 生成解释 ==========
-    if result["palsy_side"] == 0:
+    # 判断哪侧更多帧表现差
+    if left_worse_ratio >= THR.FRAME_RATIO_THRESHOLD and left_worse_ratio > right_worse_ratio:
+        result["palsy_side"] = 1  # 左侧面瘫
+        result["confidence"] = min(1.0, left_worse_ratio / 0.60)
         result["interpretation"] = (
-            f"双眼闭合对称 (差异{asymmetry_ratio:.1%}, "
-            f"峰值差{peak_diff}帧, Pearson={pearson:.2f})"
+            f"左侧面瘫: {left_worse_count}/{total_closing_frames}帧 "
+            f"({left_worse_ratio:.0%}) 左眼闭合差"
+        )
+    elif right_worse_ratio >= THR.FRAME_RATIO_THRESHOLD and right_worse_ratio > left_worse_ratio:
+        result["palsy_side"] = 2  # 右侧面瘫
+        result["confidence"] = min(1.0, right_worse_ratio / 0.60)
+        result["interpretation"] = (
+            f"右侧面瘫: {right_worse_count}/{total_closing_frames}帧 "
+            f"({right_worse_ratio:.0%}) 右眼闭合差"
         )
     else:
-        side_name = "左" if result["palsy_side"] == 1 else "右"
-        reasons = []
-
-        if evidence.get("symmetry_triggered") and sym_vote == result["palsy_side"]:
-            reasons.append(f"闭合度差异{asymmetry_ratio:.1%}")
-        if evidence.get("sync_triggered") and sync_vote == result["palsy_side"]:
-            reasons.append(f"峰值延迟{peak_diff}帧")
-        if evidence.get("low_pearson_triggered"):
-            reasons.append(f"相关性低{pearson:.2f}")
-        if evidence.get("completeness_triggered") and complete_vote == result["palsy_side"]:
-            reasons.append("闭合不完全")
-
-        result["interpretation"] = f"{side_name}侧面瘫: " + ", ".join(reasons) if reasons else f"{side_name}侧面瘫"
+        # 对称
+        result["palsy_side"] = 0
+        result["confidence"] = 1.0 - max(left_worse_ratio, right_worse_ratio)
+        result["interpretation"] = (
+            f"双眼闭合对称 (左差{left_worse_ratio:.0%}, 右差{right_worse_ratio:.0%})"
+        )
 
     return result
 
 
 def compute_close_eye_metrics(landmarks, w: int, h: int,
                               baseline_landmarks=None) -> Dict[str, Any]:
-    """计算闭眼特有指标 - 使用统一 scale"""
-    # 当前EAR和面积
+    """计算闭眼特有指标"""
     l_ear = compute_ear(landmarks, w, h, True)
     r_ear = compute_ear(landmarks, w, h, False)
     l_area, _ = compute_eye_area(landmarks, w, h, True)
@@ -321,76 +270,44 @@ def compute_close_eye_metrics(landmarks, w: int, h: int,
         "height_ratio": l_height / r_height if r_height > 1e-9 else 1.0,
     }
 
-    # 如果有基线，计算闭合程度
     if baseline_landmarks is not None:
-        # ========== 计算统一 scale ==========
         scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
         metrics["scale"] = scale
-        # ====================================
 
-        baseline_l_ear = compute_ear(baseline_landmarks, w, h, True)
-        baseline_r_ear = compute_ear(baseline_landmarks, w, h, False)
-        baseline_l_height = compute_palpebral_height(baseline_landmarks, w, h, True)
-        baseline_r_height = compute_palpebral_height(baseline_landmarks, w, h, False)
+        baseline_l_area, _ = compute_eye_area(baseline_landmarks, w, h, True)
+        baseline_r_area, _ = compute_eye_area(baseline_landmarks, w, h, False)
 
-        # EAR 是比值，不需要缩放
-        # 眼睑裂高度需要缩放
-        l_height_scaled = l_height * scale
-        r_height_scaled = r_height * scale
+        scaled_l_area = l_area * (scale ** 2)
+        scaled_r_area = r_area * (scale ** 2)
 
-        # 闭合比例 (当前/基线)
-        left_closure_ratio = l_ear / baseline_l_ear if baseline_l_ear > 1e-9 else 1.0
-        right_closure_ratio = r_ear / baseline_r_ear if baseline_r_ear > 1e-9 else 1.0
+        left_closure_ratio = 1.0 - (scaled_l_area / baseline_l_area) if baseline_l_area > 1e-6 else 0
+        right_closure_ratio = 1.0 - (scaled_r_area / baseline_r_area) if baseline_r_area > 1e-6 else 0
 
-        # 闭合百分比 (1 - ratio) * 100%
-        metrics["left_closure_percent"] = (1 - left_closure_ratio) * 100
-        metrics["right_closure_percent"] = (1 - right_closure_ratio) * 100
+        left_closure_ratio = max(0, min(1, left_closure_ratio))
+        right_closure_ratio = max(0, min(1, right_closure_ratio))
+
+        metrics["left_closure_percent"] = left_closure_ratio * 100
+        metrics["right_closure_percent"] = right_closure_ratio * 100
         metrics["left_closure_ratio"] = left_closure_ratio
         metrics["right_closure_ratio"] = right_closure_ratio
-
-        # 高度变化（缩放后）
-        metrics["left_height_change"] = l_height_scaled - baseline_l_height
-        metrics["right_height_change"] = r_height_scaled - baseline_r_height
-
-    # ========== 使用眼睛面积计算闭合度 ==========
-    area_closure = compute_eye_closure_by_area(landmarks, w, h, baseline_landmarks)
-    metrics["area_closure"] = area_closure
-
-    # 使用面积闭合度作为主要的闭合指标
-    if "left_closure_ratio" in area_closure:
-        metrics["left_closure_ratio"] = area_closure["left_closure_ratio"]
-        metrics["right_closure_ratio"] = area_closure["right_closure_ratio"]
-        metrics["left_closure_percent"] = area_closure["left_closure_ratio"] * 100
-        metrics["right_closure_percent"] = area_closure["right_closure_ratio"] * 100
+        metrics["baseline_left_area"] = baseline_l_area
+        metrics["baseline_right_area"] = baseline_r_area
 
     return metrics
 
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
-    """
-    计算Voluntary Movement评分
-
-    基于闭眼程度的对称性
-
-    评分标准:
-    - 5=完整: 双眼完全闭合且对称
-    - 4=几乎完整: 闭合良好，轻度不对称
-    - 3=启动但不对称: 有闭眼动作但明显不对称
-    - 2=轻微启动: 闭眼动作很弱
-    - 1=无法启动: 几乎无闭眼动作
-    """
+    """计算Voluntary Movement评分"""
     if baseline_landmarks is not None and "left_closure_percent" in metrics:
         left_closure = metrics["left_closure_percent"]
         right_closure = metrics["right_closure_percent"]
 
-        # 检查是否有闭眼
         max_closure = max(left_closure, right_closure)
         min_closure = min(left_closure, right_closure)
 
-        if max_closure < 30:  # 几乎没闭眼
+        if max_closure < 30:
             return 1, "无法启动运动 (闭眼不足30%)"
 
-        # 计算对称性
         if max_closure < 1e-9:
             symmetry_ratio = 1.0
         else:
@@ -410,7 +327,6 @@ def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) ->
         else:
             return 1, "无法启动"
     else:
-        # 没有基线，使用静态EAR比值
         ratio = metrics.get("ear_ratio", 1.0)
         deviation = abs(ratio - 1.0)
 
@@ -427,27 +343,11 @@ def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) ->
 
 
 def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
-    """
-    计算动作严重度分数(医生标注标准)
-
-    计算依据: 闭眼程度的对称性
-
-    修改: 调整阈值使判定更严格
-    """
-    # 优先使用闭合百分比
+    """计算严重度分数"""
     left_closure = metrics.get("left_closure_percent")
     right_closure = metrics.get("right_closure_percent")
 
-    # 如果没有闭合百分比数据，尝试从area_closure获取
     if left_closure is None or right_closure is None:
-        area_closure = metrics.get("area_closure", {})
-        left_ratio = area_closure.get("left_closure_ratio", 0)
-        right_ratio = area_closure.get("right_closure_ratio", 0)
-        left_closure = left_ratio * 100
-        right_closure = right_ratio * 100
-
-    # 如果仍然没有数据，使用面积比
-    if left_closure == 0 and right_closure == 0:
         area_ratio = metrics.get("area_ratio", 1.0)
         deviation = abs(area_ratio - 1.0)
 
@@ -465,14 +365,11 @@ def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
     max_closure = max(left_closure, right_closure)
     min_closure = min(left_closure, right_closure)
 
-    # 检查是否有足够的闭眼动作
     if max_closure < 20:
         return 1, f"闭眼幅度过小 (L={left_closure:.1f}%, R={right_closure:.1f}%)"
 
-    # 计算对称性比值
     symmetry_ratio = min_closure / max_closure if max_closure > 0 else 1.0
 
-    # 阈值调整 - 更严格
     if symmetry_ratio >= 0.95:
         return 1, f"正常 (对称性{symmetry_ratio:.2%})"
     elif symmetry_ratio >= 0.85:
@@ -487,16 +384,12 @@ def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
 
 def detect_synkinesis(baseline_result: Optional[ActionResult],
                       current_landmarks, w: int, h: int) -> Dict[str, int]:
-    """检测闭眼时的联动运动"""
-    synkinesis = {
-        "mouth_synkinesis": 0,
-        "cheek_synkinesis": 0,
-    }
+    """检测联动运动"""
+    synkinesis = {"mouth_synkinesis": 0, "cheek_synkinesis": 0}
 
     if baseline_result is None:
         return synkinesis
 
-    # 检测嘴部联动
     mouth = compute_mouth_metrics(current_landmarks, w, h)
     baseline_mouth_w = baseline_result.mouth_width
 
@@ -514,50 +407,98 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
 
 def plot_eye_curve(eye_seq: Dict, fps: float, peak_idx: int,
                    output_path: Path, action_name: str,
+                   closure_data: Dict = None,
                    valid_mask: List[bool] = None,
                    palsy_detection: Dict[str, Any] = None) -> None:
-    """绘制眼睛变化曲线"""
+    """
+    绘制眼睛曲线 - 修改版
+    上图：眼睛面积
+    下图：眼睛闭合度
+    """
     from clinical_base import add_valid_region_shading, get_palsy_side_text
 
-    fig, axes = plt.subplots(2, 1, figsize=(16, 9))  # 增加宽度
+    fig, axes = plt.subplots(2, 1, figsize=(16, 9))
 
-    frames = np.arange(len(eye_seq["ear"]["left"]))
+    frames = np.arange(len(eye_seq["area"]["left"]))
     time_sec = frames / fps if fps > 0 else frames
+    x_label = 'Time (seconds)' if fps > 0 else 'Frame'
+    peak_time = time_sec[peak_idx] if peak_idx < len(time_sec) else 0
 
-    # 上图: EAR曲线
+    # ========== 上图: 眼睛面积 ==========
     ax1 = axes[0]
 
     if valid_mask is not None:
         add_valid_region_shading(ax1, valid_mask, time_sec)
 
-    ax1.plot(time_sec, eye_seq["ear"]["left"], 'b-', label='Left Eye EAR', linewidth=2)
-    ax1.plot(time_sec, eye_seq["ear"]["right"], 'r-', label='Right Eye EAR', linewidth=2)
-    ax1.plot(time_sec, eye_seq["ear"]["average"], 'g--', label='Average EAR', linewidth=1.5, alpha=0.7)
-    ax1.axvline(x=time_sec[peak_idx], color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
-    ax1.axhline(y=THR.EYE_CLOSURE_EAR, color='orange', linestyle=':', alpha=0.7, label='Closure Threshold')
-    ax1.set_xlabel('Time (seconds)' if fps > 0 else 'Frame', fontsize=11)
-    ax1.set_ylabel('Eye Aspect Ratio (EAR)', fontsize=11)
+    ax1.plot(time_sec, eye_seq["area"]["left"], 'b-', label='Left Eye Area', linewidth=2)
+    ax1.plot(time_sec, eye_seq["area"]["right"], 'r-', label='Right Eye Area', linewidth=2)
+    ax1.axvline(x=peak_time, color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
 
-    title = f'{action_name} - Eye Aspect Ratio Over Time'
+    title = f'{action_name} - Eye Area Over Time'
     if palsy_detection:
         palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
-        title += f' | Detected: {palsy_text}'
-    ax1.set_title(title, fontsize=13)
+        confidence = palsy_detection.get("confidence", 0)
+        title += f' | Detected: {palsy_text} (conf={confidence:.0%})'
+    ax1.set_title(title, fontsize=13, fontweight='bold')
+
+    ax1.set_xlabel(x_label, fontsize=11)
+    ax1.set_ylabel('Eye Area (pixels²)', fontsize=11)
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
 
-    # 下图: 面积曲线
+    # 添加面积差异信息
+    if palsy_detection and "evidence" in palsy_detection:
+        ev = palsy_detection["evidence"]
+        left_worse = ev.get("left_worse_ratio", 0)
+        right_worse = ev.get("right_worse_ratio", 0)
+        info_text = f"Left worse: {left_worse:.0%} frames | Right worse: {right_worse:.0%} frames"
+        ax1.text(0.02, 0.98, info_text, transform=ax1.transAxes, fontsize=10,
+                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    # ========== 下图: 眼睛闭合度 ==========
     ax2 = axes[1]
 
-    if valid_mask is not None:
-        add_valid_region_shading(ax2, valid_mask, time_sec)
+    if closure_data is not None:
+        left_closure = closure_data.get("left_closure", [])
+        right_closure = closure_data.get("right_closure", [])
 
-    ax2.plot(time_sec, eye_seq["area"]["left"], 'b-', label='Left Eye Area', linewidth=2)
-    ax2.plot(time_sec, eye_seq["area"]["right"], 'r-', label='Right Eye Area', linewidth=2)
-    ax2.axvline(x=time_sec[peak_idx], color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
-    ax2.set_xlabel('Time (seconds)' if fps > 0 else 'Frame', fontsize=11)
-    ax2.set_ylabel('Eye Area (pixels²)', fontsize=11)
-    ax2.set_title(f'{action_name} - Eye Area Over Time', fontsize=13)
+        if len(left_closure) > 0 and len(right_closure) > 0:
+            if valid_mask is not None:
+                add_valid_region_shading(ax2, valid_mask, time_sec)
+
+            ax2.plot(time_sec, left_closure, 'b-', label='Left Eye Closure', linewidth=2)
+            ax2.plot(time_sec, right_closure, 'r-', label='Right Eye Closure', linewidth=2)
+
+            # 平均闭合度
+            avg_closure = [(l + r) / 2 if (np.isfinite(l) and np.isfinite(r)) else np.nan
+                           for l, r in zip(left_closure, right_closure)]
+            ax2.plot(time_sec, avg_closure, 'g--', label='Average Closure', linewidth=1.5, alpha=0.7)
+
+            ax2.axvline(x=peak_time, color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
+
+            # 阈值线
+            ax2.axhline(y=0.85, color='green', linestyle=':', alpha=0.5, label='Complete (85%)')
+            ax2.axhline(y=0.20, color='orange', linestyle=':', alpha=0.5, label='Threshold (20%)')
+
+            ax2.set_ylim(0, 1.1)
+            ax2.set_ylabel('Closure Ratio (1=fully closed)', fontsize=11)
+
+            # 峰值帧闭合度信息
+            if 0 <= peak_idx < len(left_closure):
+                left_peak = left_closure[peak_idx] if np.isfinite(left_closure[peak_idx]) else 0
+                right_peak = right_closure[peak_idx] if np.isfinite(right_closure[peak_idx]) else 0
+                info_text = f"Peak: L={left_peak:.1%}, R={right_peak:.1%}"
+                ax2.text(0.02, 0.98, info_text, transform=ax2.transAxes, fontsize=10,
+                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    else:
+        # 没有闭合度数据，显示EAR（参考）
+        ax2.plot(time_sec, eye_seq["ear"]["left"], 'b-', label='Left EAR (ref)', linewidth=1.5, alpha=0.7)
+        ax2.plot(time_sec, eye_seq["ear"]["right"], 'r-', label='Right EAR (ref)', linewidth=1.5, alpha=0.7)
+        ax2.axvline(x=peak_time, color='k', linestyle='--', alpha=0.5)
+        ax2.set_ylabel('EAR (reference)', fontsize=11)
+
+    ax2.set_title(f'{action_name} - Eye Closure Over Time', fontsize=13)
+    ax2.set_xlabel(x_label, fontsize=11)
     ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
 
@@ -568,11 +509,11 @@ def plot_eye_curve(eye_seq: Dict, fps: float, peak_idx: int,
 
 def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
                         result: ActionResult,
-                        metrics: Dict[str, Any]) -> np.ndarray:
-    """可视化闭眼指标 - 字体放大版"""
+                        metrics: Dict[str, Any],
+                        palsy_detection: Dict[str, Any] = None) -> np.ndarray:
+    """可视化闭眼指标"""
     img = frame.copy()
 
-    # 字体参数
     FONT = cv2.FONT_HERSHEY_SIMPLEX
     FONT_SCALE_TITLE = 1.4
     FONT_SCALE_NORMAL = 0.9
@@ -581,8 +522,8 @@ def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
     LINE_HEIGHT = 45
 
     # 患侧标签
-    palsy_detection = metrics.get("palsy_detection", {})
-    img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
+    if palsy_detection:
+        img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
 
     # 绘制眼部轮廓
     draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_L, (255, 0, 0), 3)
@@ -597,24 +538,23 @@ def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.putText(img, f"{result.action_name}", (25, y), FONT, FONT_SCALE_TITLE, (0, 255, 0), THICKNESS_TITLE)
     y += LINE_HEIGHT + 15
 
-    cv2.putText(img, "=== Eye Aspect Ratio ===", (25, y), FONT, FONT_SCALE_NORMAL, (0, 255, 255), THICKNESS_NORMAL)
+    # 眼睛面积
+    cv2.putText(img, "=== Eye Area ===", (25, y), FONT, FONT_SCALE_NORMAL, (0, 255, 255), THICKNESS_NORMAL)
     y += LINE_HEIGHT
 
-    cv2.putText(img, f"Left EAR: {metrics['left_ear']:.4f}", (25, y), FONT, FONT_SCALE_NORMAL, (255, 0, 0),
-                THICKNESS_NORMAL)
-    y += LINE_HEIGHT
+    left_area = metrics["left_area"]
+    right_area = metrics["right_area"]
+    left_color = (0, 0, 255) if left_area > right_area * 1.15 else (255, 255, 255)
+    right_color = (0, 0, 255) if right_area > left_area * 1.15 else (255, 255, 255)
 
-    cv2.putText(img, f"Right EAR: {metrics['right_ear']:.4f}", (25, y), FONT, FONT_SCALE_NORMAL, (0, 165, 255),
-                THICKNESS_NORMAL)
+    cv2.putText(img, f"Left: {left_area:.0f} px²", (25, y), FONT, FONT_SCALE_NORMAL, left_color, THICKNESS_NORMAL)
     y += LINE_HEIGHT
-
-    ratio = metrics['ear_ratio']
-    ratio_color = (0, 255, 0) if 0.85 <= ratio <= 1.15 else (0, 0, 255)
-    cv2.putText(img, f"EAR Ratio: {ratio:.3f}", (25, y), FONT, FONT_SCALE_NORMAL, ratio_color, THICKNESS_NORMAL)
+    cv2.putText(img, f"Right: {right_area:.0f} px²", (25, y), FONT, FONT_SCALE_NORMAL, right_color, THICKNESS_NORMAL)
     y += LINE_HEIGHT + 10
 
+    # 闭合度
     if "left_closure_percent" in metrics:
-        cv2.putText(img, "=== Closure from Baseline ===", (25, y), FONT, FONT_SCALE_NORMAL, (0, 255, 255),
+        cv2.putText(img, "=== Closure (from baseline) ===", (25, y), FONT, FONT_SCALE_NORMAL, (0, 255, 255),
                     THICKNESS_NORMAL)
         y += LINE_HEIGHT
         cv2.putText(img,
@@ -622,12 +562,28 @@ def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
                     (25, y), FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
         y += LINE_HEIGHT + 10
 
+    # 逐帧对比结果
+    if palsy_detection and "evidence" in palsy_detection:
+        ev = palsy_detection["evidence"]
+        cv2.putText(img, "=== Frame-by-Frame Analysis ===", (25, y), FONT, 0.8, (0, 255, 255), 2)
+        y += 35
+        left_worse = ev.get("left_worse_ratio", 0)
+        right_worse = ev.get("right_worse_ratio", 0)
+        total_frames = ev.get("total_closing_frames", 0)
+        cv2.putText(img, f"Closing frames: {total_frames}", (25, y), FONT, 0.7, (200, 200, 200), 2)
+        y += 30
+        cv2.putText(img, f"Left worse: {left_worse:.0%}  Right worse: {right_worse:.0%}",
+                    (25, y), FONT, 0.7, (200, 200, 200), 2)
+        y += LINE_HEIGHT
+
     # 面瘫侧别
     if palsy_detection:
         palsy_side = palsy_detection.get("palsy_side", 0)
-        palsy_text = {0: "Symmetric", 1: "Left Palsy", 2: "Right Palsy"}.get(palsy_side, "Unknown")
+        palsy_text = {0: "Symmetric", 1: "LEFT PALSY", 2: "RIGHT PALSY"}.get(palsy_side, "Unknown")
         palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
-        cv2.putText(img, f"Palsy: {palsy_text}", (25, y), FONT, FONT_SCALE_NORMAL, palsy_color, THICKNESS_NORMAL)
+        confidence = palsy_detection.get("confidence", 0)
+        cv2.putText(img, f"Result: {palsy_text} ({confidence:.0%})", (25, y), FONT, FONT_SCALE_TITLE, palsy_color,
+                    THICKNESS_TITLE)
         y += LINE_HEIGHT
 
     cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (25, y),
@@ -676,28 +632,27 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 计算整个视频的闭合度序列
     closure_data = compute_eye_closure_sequence(landmarks_seq, w, h, baseline_landmarks)
 
-    # 找峰值帧 (眼睛面积最小/闭合度最大)
+    # 找峰值帧
     peak_idx = find_peak_frame_close_eye(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
-    # 计算同步度（整个视频）
+    if peak_landmarks is None:
+        return None
+
+    # 计算同步度（用于记录）
     synchrony = compute_eye_synchrony(
         closure_data["left_closure"],
         closure_data["right_closure"]
     )
 
-    # 计算峰值帧对称度
+    # 峰值帧闭合度
     left_closure_at_peak = closure_data["left_closure"][peak_idx]
     right_closure_at_peak = closure_data["right_closure"][peak_idx]
     symmetry_at_peak = compute_eye_symmetry_at_peak(left_closure_at_peak, right_closure_at_peak)
 
-    if peak_landmarks is None:
-        return None
-
     fps = video_info.get("fps", 30.0)
 
-    # 创建结果对象
     result = ActionResult(
         action_name=action_name,
         action_name_cn=action_name_cn,
@@ -708,35 +663,26 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
         fps=fps
     )
 
-    # 提取通用指标
     extract_common_indicators(peak_landmarks, w, h, result, baseline_landmarks)
 
-    # 计算闭眼特有指标
     metrics = compute_close_eye_metrics(peak_landmarks, w, h, baseline_landmarks)
 
-    # 提取眼睛变化序列
     eye_seq = extract_eye_sequence(landmarks_seq, w, h)
 
-    # 计算Voluntary Movement评分
     score, interpretation = compute_voluntary_score(metrics, baseline_landmarks)
     result.voluntary_movement_score = score
 
-    # 检测联动
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
-    # 面瘫侧别检测 - 综合对称度和同步度
+    # ========== 面瘫侧别检测 - 逐帧对比 ==========
     palsy_detection = detect_palsy_side(
-        symmetry_at_peak=symmetry_at_peak,
-        synchrony=synchrony,
-        left_closure=left_closure_at_peak,
-        right_closure=right_closure_at_peak
+        closure_data=closure_data,
+        peak_idx=peak_idx,
     )
 
-    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
     severity_score, severity_desc = compute_severity_score(metrics)
 
-    # 存储动作特有指标
     result.action_specific = {
         "close_eye_metrics": {
             "left_ear": metrics["left_ear"],
@@ -752,19 +698,14 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
             "area_left": [float(x) if not np.isnan(x) else None for x in eye_seq["area"]["left"]],
             "area_right": [float(x) if not np.isnan(x) else None for x in eye_seq["area"]["right"]],
         },
-        # 闭合度序列（用于曲线绘制）
         "closure_sequence": {
             "left": [float(v) if np.isfinite(v) else None for v in closure_data["left_closure"]],
             "right": [float(v) if np.isfinite(v) else None for v in closure_data["right_closure"]],
         },
-
-        # 基线信息
         "baseline": {
             "left_area": float(closure_data["baseline_left_area"]),
             "right_area": float(closure_data["baseline_right_area"]),
         },
-
-        # 峰值帧信息
         "peak_frame": {
             "idx": int(peak_idx),
             "left_closure": float(left_closure_at_peak),
@@ -772,23 +713,16 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
             "left_area": float(closure_data["left_area"][peak_idx]),
             "right_area": float(closure_data["right_area"][peak_idx]),
         },
-
-        # 对称度分析
         "symmetry_analysis": symmetry_at_peak,
-
-        # 同步度分析
         "synchrony_analysis": synchrony,
-
-        # 面瘫检测
         "palsy_detection": palsy_detection,
-
-        # 诊断汇总
         "diagnosis_summary": {
             "palsy_side": palsy_detection["palsy_side"],
-            "symmetry_score": symmetry_at_peak["symmetry_score"],
-            "synchrony_score": synchrony["synchrony_score"],
-            "pearson_correlation": synchrony["pearson_correlation"],
-        }
+            "confidence": palsy_detection["confidence"],
+            "method": palsy_detection["method"],
+        },
+        "severity_score": severity_score,
+        "severity_desc": severity_desc,
     }
 
     if "left_closure_percent" in metrics:
@@ -799,27 +733,24 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
             "right_closure_ratio": metrics["right_closure_ratio"],
         }
 
-    # 创建输出目录
     action_dir = output_dir / action_name
     action_dir.mkdir(parents=True, exist_ok=True)
 
-    # 保存原始帧
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
-    # 保存可视化
-    vis = visualize_close_eye(peak_frame, peak_landmarks, w, h, result, metrics)
+    vis = visualize_close_eye(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
-    # 绘制眼睛变化曲线
+    # 绘制曲线 - 上边面积，下边闭合度
     plot_eye_curve(eye_seq, fps, peak_idx, action_dir / "peak_selection_curve.png", action_name,
+                   closure_data=closure_data,
                    valid_mask=None,
                    palsy_detection=palsy_detection)
 
-    # 保存JSON
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
-    print(f"    [OK] {action_name}: EAR L={metrics['left_ear']:.4f} R={metrics['right_ear']:.4f}")
+    print(f"    [OK] {action_name}: Area L={metrics['left_area']:.0f} R={metrics['right_area']:.0f}")
     if "left_closure_percent" in metrics:
         print(f"         Closure L={metrics['left_closure_percent']:.1f}% R={metrics['right_closure_percent']:.1f}%")
     print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")

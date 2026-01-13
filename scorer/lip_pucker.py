@@ -37,7 +37,7 @@ from clinical_base import (
     kabsch_rigid_transform, apply_rigid_transform,
     compute_lip_midline_symmetry,
     compute_lip_midline_offset_from_face_midline,
-    compute_lip_midline_center,
+    compute_lip_midline_center, compute_face_midline, draw_face_midline,
 )
 
 from thresholds import THR
@@ -829,6 +829,11 @@ def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
     """可视化撅嘴指标"""
     img = frame.copy()
 
+    # ========== 添加面中线绘制 ==========
+    midline = compute_face_midline(landmarks, w, h)
+    if midline:
+        img = draw_face_midline(img, midline, color=(0, 255, 255), thickness=2, dashed=True)
+
     # 绘制嘴部轮廓
     draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 2)
     draw_polygon(img, landmarks, w, h, LM.INNER_LIP, (0, 200, 200), 1)
@@ -950,26 +955,6 @@ def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
         face_midline_x = offset_data.get("face_midline_x", None)
         lip_midline_x = offset_data.get("lip_midline_x", None)
         lip_midline_y = offset_data.get("lip_midline_y", None)
-
-        if face_midline_x is not None:
-            face_midline_x_int = int(face_midline_x)
-
-            # 面中线的起点和终点
-            # 获取内眦y坐标作为参考
-            left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
-            right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
-            eye_y = int((left_canthus[1] + right_canthus[1]) / 2)
-
-            midline_start_y = max(20, eye_y - 80)
-            midline_end_y = min(h - 20, eye_y + 300)
-
-            # 绘制面中线（青色虚线）
-            for yy in range(midline_start_y, midline_end_y, 15):
-                cv2.line(img, (face_midline_x_int, yy),
-                         (face_midline_x_int, min(yy + 8, midline_end_y)),
-                         (255, 255, 0), 2)
-            cv2.putText(img, "Face Mid", (face_midline_x_int + 5, midline_start_y + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
         # ========== 绘制嘴唇中线 ==========
         if lip_midline_x is not None and lip_midline_y is not None:

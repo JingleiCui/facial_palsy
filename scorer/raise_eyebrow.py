@@ -45,19 +45,17 @@ def find_peak_frame(
     frames_seq: List,
     w: int,
     h: int,
-    baseline_landmarks=None,
+    baseline_landmarks=None,  # 保留参数但不使用
     smooth_win: int = 5,
 ) -> Tuple[int, Dict[str, Any]]:
     """
-    找抬眉峰值帧 + 生成可解释性曲线数据（peak_debug）
+    找抬眉峰值帧 - 眉眼距最大
 
     选择逻辑：
-    - 有 baseline_landmarks：使用 “眉眼距变化量 change = current - baseline” 的均值（左右平均）最大作为峰值
-    - 无 baseline_landmarks：使用 “眉眼距 bed” 的均值（左右平均）最大作为峰值
-
-    同时输出曲线（左右/均值），并在 peak_debug 里记录 peak_idx，方便画图标注。
+    - 抬眉时眉毛上抬，眉眼距增大
+    - 选择眉眼距（左右平均）最大的帧
+    - 不和静息帧基准做比较
     """
-
     n = len(landmarks_seq)
     if n == 0:
         return 0, {}
@@ -66,18 +64,12 @@ def find_peak_frame(
     right_series = [None] * n
     mean_series = [None] * n
 
-    # 记录原始值（用于你调试：bed 或 change 的 px 值）
     left_raw = [None] * n
     right_raw = [None] * n
     mean_raw = [None] * n
 
-    # 选择依据
-    if baseline_landmarks is not None:
-        metric_name = "BED_change_px"  # 相对静息变化（像素）
-    else:
-        metric_name = "BED_abs_px"     # 绝对眉眼距（像素）
+    metric_name = "BED_abs_px"  # 绝对眉眼距
 
-    # 逐帧计算
     best_val = -1e18
     best_idx = 0
 
@@ -86,18 +78,10 @@ def find_peak_frame(
             continue
 
         try:
-            if baseline_landmarks is not None:
-                # 变化量：当前 - baseline
-                lc = compute_brow_eye_distance_change(lm, baseline_landmarks, w, h, left=True)
-                rc = compute_brow_eye_distance_change(lm, baseline_landmarks, w, h, left=False)
-
-                lv = float(lc["change"])
-                rv = float(rc["change"])
-            else:
-                # 绝对值：当前眉眼距
-                bed = compute_brow_eye_distance_ratio(lm, w, h)
-                lv = float(bed["left_distance"])
-                rv = float(bed["right_distance"])
+            # 始终使用绝对值（不和基线比较）
+            bed = compute_brow_eye_distance_ratio(lm, w, h)
+            lv = float(bed["left_distance"])
+            rv = float(bed["right_distance"])
 
             mv = 0.5 * (lv + rv)
 
@@ -105,18 +89,18 @@ def find_peak_frame(
             right_raw[i] = rv
             mean_raw[i] = mv
 
-            # 用 raw 值作为时序曲线（同一视频内像素尺度一致，可解释性直观）
             left_series[i] = lv
             right_series[i] = rv
             mean_series[i] = mv
 
+            # 选择眉眼距最大的帧
             if mv > best_val:
                 best_val = mv
                 best_idx = i
         except Exception:
             continue
 
-    # 简单平滑（避免抖动导致选到噪声尖峰）
+    # 平滑处理
     def _smooth(arr: List[Optional[float]], win: int) -> List[Optional[float]]:
         if win <= 1:
             return arr
@@ -133,7 +117,7 @@ def find_peak_frame(
     right_s = _smooth(right_series, smooth_win)
     mean_s = _smooth(mean_series, smooth_win)
 
-    # 平滑后重新选一次峰值（更稳）
+    # 平滑后重新选峰值
     best_val2 = -1e18
     best_idx2 = best_idx
     for i, v in enumerate(mean_s):
@@ -148,17 +132,15 @@ def find_peak_frame(
     peak_debug = {
         "metric": metric_name,
         "smooth_win": int(smooth_win),
-
         "left_curve": left_s,
         "right_curve": right_s,
         "mean_curve": mean_s,
-
         "left_raw": left_raw,
         "right_raw": right_raw,
         "mean_raw": mean_raw,
-
         "peak_idx": peak_idx,
         "peak_value": float(mean_s[peak_idx]) if mean_s[peak_idx] is not None else None,
+        "selection_criterion": "max_brow_eye_distance",
     }
 
     return peak_idx, peak_debug

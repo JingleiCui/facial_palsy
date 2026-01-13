@@ -41,7 +41,7 @@ from sunnybrook_scorer import (
     compute_resting_symmetry, compute_voluntary_score_from_ratio,
     compute_sunnybrook_composite, SUNNYBROOK_EXPRESSION_MAPPING
 )
-
+from session_diagnosis import compute_session_diagnosis
 from thresholds import THR
 
 # 导入动作模块
@@ -69,12 +69,16 @@ TARGET_EXAM_ID = None
 # 调试筛选：只分析特定患者/特定检查（其余跳过）
 # =============================================================================
 # 1) 只跑指定患者（常用）
-TARGET_PATIENT_IDS = ["XW000125"]
+TARGET_PATIENT_IDS = []
 
 # 2) 只跑指定检查ID（优先级更高）
 TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
+"NeutralFace",
+"BlowCheek",
+"ShowTeeth",
+"LipPucker",
 ]
 
 # ENABLED_ACTIONS = [
@@ -426,8 +430,6 @@ def compute_full_diagnosis(
     Returns:
         SessionDiagnosis 对象
     """
-    from session_diagnosis import compute_session_diagnosis
-
     return compute_session_diagnosis(
         action_results=action_results,
         sunnybrook_score_obj=sunnybrook_score_obj

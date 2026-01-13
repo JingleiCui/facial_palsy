@@ -42,17 +42,17 @@ SEVERITY_DESCRIPTIONS = {
 
 # 动作权重（用于投票）
 ACTION_WEIGHTS = {
-    "CloseEyeHardly": 1.6,  # 闭眼最敏感
-    "CloseEyeSoftly": 1.4,
-    "Smile": 1.3,
-    "ShowTeeth": 1.3,
-    "VoluntaryEyeBlink": 1.1,
-    "BlowCheek": 1.1,
-    "RaiseEyebrow": 1.0,
-    "LipPucker": 1.0,
+    "CloseEyeHardly": 1.2,  # 闭眼最敏感
+    "CloseEyeSoftly": 1.2,
+    "VoluntaryEyeBlink": 1,
+    "SpontaneousEyeBlink": 1,
+    "ShowTeeth": 1.1,
+    "Smile": 0.9,
+    "RaiseEyebrow": 1,
     "ShrugNose": 1.0,
-    "SpontaneousEyeBlink": 1.0,
-    "NeutralFace": 0.4,  # 静息只作参考
+    "BlowCheek": 0.4,
+    "LipPucker": 0.4,
+    "NeutralFace": 0.0,  # 静息只作参考
 }
 
 # 动作对应的面部区域

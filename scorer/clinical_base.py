@@ -120,7 +120,9 @@ class LM:
     BLOW_CHEEK_L = [280, 376, 433, 367, 364, 287, 410, 423, 266, ]
     BLOW_CHEEK_R = [50, 147, 213, 138, 135, 57, 92, 203, 36, ]
 
-    # =============================================================================
+    # ========== 面部轮廓点 ==========
+    FACE_CONTOUR_TOP = 10
+    FACE_CONTOUR_BOTTOM = 152
 
 
 # JSON 序列化安全转换（处理 numpy.bool_ / numpy.float32 等）
@@ -944,41 +946,52 @@ def compute_face_midline(landmarks, w: int, h: int) -> Dict[str, Any]:
         }
     """
     # 获取内眦点
-    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)  # 362
-    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)  # 133
+    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
 
     lx, ly = left_canthus
     rx, ry = right_canthus
 
     # 中点
-    cx, cy = (lx + rx) / 2, (ly + ry) / 2
-
-    # 内眦距
+    center_x, center_y = (lx + rx) / 2.0, (ly + ry) / 2.0
     icd = math.sqrt((rx - lx) ** 2 + (ry - ly) ** 2)
 
-    # 连线方向
     dx, dy = rx - lx, ry - ly
-
-    # 中垂线方向（法向量，归一化）
-    length = math.sqrt(dx ** 2 + dy ** 2)
-    if length < 1e-6:
+    if abs(dx) + abs(dy) < 1e-6:
         return None
-    nx, ny = -dy / length, dx / length  # 旋转90度
 
-    # 计算上下端点（延伸到图像边界）
-    # 向上延伸到眉毛上方，向下延伸到下巴
-    extend_up = cy + 50  # 向上延伸
-    extend_down = h - cy  # 向下延伸
+    center = np.array([center_x, center_y], dtype=np.float32)
+    normal = np.array([-dy, dx], dtype=np.float32)  # 中垂线方向
+    denom = float(np.dot(normal, normal)) + 1e-6
 
-    top_point = (cx + nx * extend_up, cy + ny * extend_up)
-    bottom_point = (cx - nx * extend_down, cy - ny * extend_down)
+    top_lm = pt2d(landmarks[LM.FACE_CONTOUR_TOP], w, h)
+    bot_lm = pt2d(landmarks[LM.FACE_CONTOUR_BOTTOM], w, h)
+
+    top = np.array([top_lm[0], top_lm[1]], dtype=np.float32)
+    bot = np.array([bot_lm[0], bot_lm[1]], dtype=np.float32)
+
+    # 投影到面中线上
+    # 投影公式：P_proj = center + ((P - center)·normal / (normal·normal)) * normal
+    t_top = float(np.dot(top - center, normal)) / denom
+    t_bot = float(np.dot(bot - center, normal)) / denom
+
+    p_top = center + t_top * normal
+    p_bot = center + t_bot * normal
+
+    top_point = (int(round(p_top[0])), int(round(p_top[1])))
+    bottom_point = (int(round(p_bot[0])), int(round(p_bot[1])))
+
+    length = math.sqrt(float(normal[0]) ** 2 + float(normal[1]) ** 2)
+    nx, ny = float(normal[0] / length), float(normal[1] / length)
 
     return {
-        "center": (cx, cy),
+        "center": (center_x, center_y),
         "direction": (nx, ny),
         "top_point": top_point,
         "bottom_point": bottom_point,
         "icd": icd,
+        "left_canthus": left_canthus,
+        "right_canthus": right_canthus,
     }
 
 
