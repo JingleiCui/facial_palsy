@@ -27,11 +27,14 @@ import csv
 # ========== 配置区 ==========
 BASE_DIR = "/Users/cuijinglei/Documents/facialPalsy/videos"  # 数据根目录
 
+START_PATIENT_ID = "XW000157"  # 设置为 None 则不限制
+END_PATIENT_ID = "XW000157"    # 设置为 None 则不限制
+
 DO_DELETE = True           # True: 真实删除未引用视频
 OVERWRITE_JSON = True     # True: 覆盖原 JSON；False: 写 .filtered.json
 MAKE_BACKUP = False         # 覆盖 JSON 前是否创建 .bak 备份
 
-# === 新增：裁剪视频开关 ===
+# === 裁剪视频开关 ===
 DO_TRIM = True                 # True=会真实裁剪并覆盖原视频
 USE_FFMPEG = True              # 推荐 True：保留音频/旋转元数据更稳；OpenCV 会丢音频
 FFMPEG_BIN = "ffmpeg"
@@ -888,6 +891,26 @@ def run():
         return
 
     json_files = scan_all_jsons(base_dir)
+
+    # === 过滤 json_files ===
+    filtered_jsons = []
+    for jp in json_files:
+        # 从路径中尝试提取患者ID (假设ID格式为 XW + 数字)
+        # 路径示例: /Data/XW000001/20230101/metadata.json
+        match = re.search(r"(XW\d+)", jp, re.IGNORECASE)
+        if match:
+            pid = match.group(1).upper()  # 提取到的ID，如 XW000001
+
+            # 范围判断
+            if START_PATIENT_ID and pid < START_PATIENT_ID:
+                continue
+            if END_PATIENT_ID and pid > END_PATIENT_ID:
+                continue
+
+        filtered_jsons.append(jp)
+
+    json_files = filtered_jsons  # 使用过滤后的列表
+
     if not json_files:
         print("[INFO] 未找到任何 .json 文件。")
         return

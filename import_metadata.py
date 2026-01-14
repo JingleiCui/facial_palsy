@@ -19,6 +19,7 @@ import os
 import json
 import sqlite3
 import cv2
+import json as json_module
 from datetime import datetime
 from pathlib import Path
 
@@ -123,7 +124,9 @@ def check_video_changed(cursor, examination_id, action_id, new_start_frame, new_
 def import_metadata(
     db_path,
     videos_base_path,
-    update_mode='smart'
+    update_mode,
+    start_patient_id=None,
+    end_patient_id=None
 ):
     """
     导入检查元数据 - 智能增量更新版
@@ -158,7 +161,7 @@ def import_metadata(
         'errors': []
     }
 
-    # ⚠️ 危险模式警告
+    # 危险模式警告
     if update_mode == 'full_reset':
         print("="*60)
         print("⚠️⚠️⚠️  警告: 完全清空模式 ⚠️⚠️⚠️")
@@ -196,6 +199,10 @@ def import_metadata(
     for item in sorted(os.listdir(videos_base_path)):
         item_path = os.path.join(videos_base_path, item)
         if os.path.isdir(item_path) and item.startswith('XW'):
+            if start_patient_id and item < start_patient_id:
+                continue
+            if end_patient_id and item > end_patient_id:
+                continue
             patient_dirs.append((item, item_path))
 
     print(f"发现 {len(patient_dirs)} 个患者目录\n")
@@ -415,7 +422,6 @@ def import_metadata(
     conn.commit()
 
     # 记录导入日志
-    import json as json_module
     cursor.execute('''
         INSERT INTO import_logs (
             import_type,
@@ -469,5 +475,7 @@ if __name__ == '__main__':
     import_metadata(
         db_path='facialPalsy.db',
         videos_base_path='/Users/cuijinglei/Documents/facialPalsy/videos',
-        update_mode='smart'
+        update_mode='smart',
+        start_patient_id='XW000157',  # 指定开始
+        end_patient_id='XW000157'  # 指定结束
     )
