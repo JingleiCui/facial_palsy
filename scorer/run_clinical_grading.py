@@ -69,26 +69,28 @@ TARGET_EXAM_ID = None
 # 调试筛选：只分析特定患者/特定检查（其余跳过）
 # =============================================================================
 # 1) 只跑指定患者（常用）
-TARGET_PATIENT_IDS = ["XW000157",]
+TARGET_PATIENT_IDS = []
 
 # 2) 只跑指定检查ID（优先级更高）
 TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
+"ShowTeeth",
+"LipPucker",
 ]
 
 # ENABLED_ACTIONS = [
 #     "NeutralFace",
-#     "Smile",
-#     "ShowTeeth",
-#     "RaiseEyebrow",
 #     "CloseEyeSoftly",
 #     "CloseEyeHardly",
 #     "VoluntaryEyeBlink",
 #     "SpontaneousEyeBlink",
-#     "LipPucker",
-#     "BlowCheek",
+#     "RaiseEyebrow",
+#     "Smile",
 #     "ShrugNose",
+#     "ShowTeeth",
+#     "BlowCheek",
+#     "LipPucker",
 # ]
 
 # 是否复用已有的 NeutralFace 结果（用于调试其他动作时跳过基线重算）
@@ -160,55 +162,6 @@ def process_action_generic(landmarks_seq, frames_seq, w, h, video_info, output_d
         baseline_result=baseline_result,
         baseline_landmarks=baseline_landmarks
     )
-
-
-def visualize_generic_action(frame, landmarks, w, h, result):
-    """通用动作可视化"""
-
-    img = frame.copy()
-
-    # 绘制眼部
-    draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_L, (255, 0, 0), 2)
-    draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_R, (0, 165, 255), 2)
-
-    # 绘制眉毛
-    draw_polygon(img, landmarks, w, h, LM.BROW_L, (255, 100, 100), 1, False)
-    draw_polygon(img, landmarks, w, h, LM.BROW_R, (100, 165, 255), 1, False)
-
-    # 绘制嘴部
-    draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 2)
-
-    # 信息面板
-    y = 25
-    cv2.putText(img, f"{result.action_name} - {result.action_name_cn}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    y += 30
-
-    cv2.putText(img, f"EAR L:{result.left_ear:.3f} R:{result.right_ear:.3f}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    y += 22
-
-    cv2.putText(img, f"Eye Area Ratio: {result.eye_area_ratio:.3f}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    y += 22
-
-    cv2.putText(img, f"Brow H Ratio: {result.brow_height_ratio:.3f}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    y += 22
-
-    cv2.putText(img, f"Mouth W: {result.mouth_width:.1f}px", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    y += 22
-
-    if result.oral_angle:
-        cv2.putText(img, f"AOE:{result.oral_angle.AOE_angle:+.1f} BOF:{result.oral_angle.BOF_angle:+.1f}", (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        y += 22
-
-    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-    return img
 
 
 # =============================================================================

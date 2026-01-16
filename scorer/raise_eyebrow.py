@@ -31,7 +31,7 @@ from clinical_base import (
     compute_brow_centroid, compute_scale_to_baseline,
     ActionResult, draw_polygon, draw_landmarks,
     add_valid_region_shading, get_palsy_side_text,
-    draw_palsy_side_label,
+    draw_palsy_side_label, draw_palsy_annotation_header
 )
 
 from thresholds import THR
@@ -39,6 +39,23 @@ from thresholds import THR
 ACTION_NAME = "RaiseEyebrow"
 ACTION_NAME_CN = "抬眉/皱额"
 
+# OpenCV字体
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# 字体大小
+FONT_SCALE_TITLE = 1.4      # 标题
+FONT_SCALE_LARGE = 1.2      # 大号文字
+FONT_SCALE_NORMAL = 0.9     # 正常文字
+FONT_SCALE_SMALL = 0.7      # 小号文字
+
+# 线条粗细
+THICKNESS_TITLE = 3
+THICKNESS_NORMAL = 2
+THICKNESS_THIN = 1
+
+# 行高
+LINE_HEIGHT = 45
+LINE_HEIGHT_SMALL = 30
 
 def find_peak_frame(
     landmarks_seq: List,
@@ -616,9 +633,6 @@ def visualize_raise_eyebrow(frame: np.ndarray, landmarks, w: int, h: int,
     """可视化眉眼距"""
     img = frame.copy()
 
-    # 添加患侧标签
-    img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
-
     # 绘制眉毛轮廓
     draw_polygon(img, landmarks, w, h, LM.BROW_L, (255, 100, 100), 2, False)
     draw_polygon(img, landmarks, w, h, LM.BROW_R, (100, 165, 255), 2, False)
@@ -673,11 +687,12 @@ def visualize_raise_eyebrow(frame: np.ndarray, landmarks, w: int, h: int,
         cv2.circle(img, (int(footR[0]), int(footR[1])), 4, (0, 255, 255), -1)
 
     # 信息面板
-    panel_h = 280
-    cv2.rectangle(img, (5, 5), (380, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (380, panel_h), (255, 255, 255), 1)
+    panel_h = 350  # 增加高度
+    panel_top = 80  # 面板顶部留出空间
+    cv2.rectangle(img, (5, panel_top), (450, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, panel_top), (450, panel_h), (255, 255, 255), 1)
 
-    y = 50
+    y = panel_top + 40
     cv2.putText(img, f"{ACTION_NAME}", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 2)
     y += 50
@@ -735,6 +750,9 @@ def visualize_raise_eyebrow(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.putText(img, "Eye Inner", (165, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
     cv2.line(img, (260, legend_y), (290, legend_y), (0, 255, 255), 2)
     cv2.putText(img, "BED", (295, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
+
+    # ========== 最后绘制患侧标注（放在最上方，不被覆盖）==========
+    img, _ = draw_palsy_annotation_header(img, palsy_detection, ACTION_NAME)
 
     return img
 

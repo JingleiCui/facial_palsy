@@ -29,10 +29,29 @@ from clinical_base import (
     ActionResult, draw_polygon, compute_scale_to_baseline,
     draw_palsy_side_label, compute_eye_closure_by_area,
     compute_eye_closure_sequence, compute_eye_synchrony,
-    compute_eye_symmetry_at_peak,
+    compute_eye_symmetry_at_peak, draw_palsy_annotation_header,
 )
 
 from thresholds import THR
+
+
+# OpenCV字体
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# 字体大小
+FONT_SCALE_TITLE = 1.4      # 标题
+FONT_SCALE_LARGE = 1.2      # 大号文字
+FONT_SCALE_NORMAL = 0.9     # 正常文字
+FONT_SCALE_SMALL = 0.7      # 小号文字
+
+# 线条粗细
+THICKNESS_TITLE = 3
+THICKNESS_NORMAL = 2
+THICKNESS_THIN = 1
+
+# 行高
+LINE_HEIGHT = 45
+LINE_HEIGHT_SMALL = 30
 
 
 def find_peak_frame_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
@@ -514,27 +533,19 @@ def visualize_close_eye(frame: np.ndarray, landmarks, w: int, h: int,
     """可视化闭眼指标"""
     img = frame.copy()
 
-    FONT = cv2.FONT_HERSHEY_SIMPLEX
-    FONT_SCALE_TITLE = 1.4
-    FONT_SCALE_NORMAL = 0.9
-    THICKNESS_TITLE = 3
-    THICKNESS_NORMAL = 2
-    LINE_HEIGHT = 45
-
-    # 患侧标签
-    if palsy_detection:
-        img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
+    # ========== 第一行绘制患侧标注 ==========
+    img, header_end_y = draw_palsy_annotation_header(img, palsy_detection, result.action_name)
 
     # 绘制眼部轮廓
     draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_L, (255, 0, 0), 3)
     draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_R, (0, 165, 255), 3)
 
-    # 信息面板
-    panel_w, panel_h = 700, 600
-    cv2.rectangle(img, (10, 100), (panel_w, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (10, 100), (panel_w, panel_h), (255, 255, 255), 2)
+    # 信息面板 - 顶部下移
+    panel_top = header_end_y + 20
+    panel_w, panel_h = 700, panel_top + 520
+    cv2.rectangle(img, (10, panel_top), (panel_w, panel_h), (0, 0, 0), -1)
 
-    y = 160
+    y = panel_top + 60
     cv2.putText(img, f"{result.action_name}", (25, y), FONT, FONT_SCALE_TITLE, (0, 255, 0), THICKNESS_TITLE)
     y += LINE_HEIGHT + 15
 

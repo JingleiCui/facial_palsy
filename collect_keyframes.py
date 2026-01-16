@@ -51,135 +51,6 @@ PALSY_SIDE_MAP = {
 }
 
 # =============================================================================
-# 各动作的关键指标Schema (用于CSV列排序)
-# =============================================================================
-ACTION_METRICS_SCHEMA = {
-    "NeutralFace": [
-        # NeutralFace不做面瘫检测,主要是基线指标
-        "left_ear", "right_ear", "ear_ratio",
-        "left_palpebral_height", "right_palpebral_height", "palpebral_ratio",
-        "left_nlf_length", "right_nlf_length", "nlf_ratio",
-        "oral_angle_diff"
-    ],
-
-    "SpontaneousEyeBlink": [
-        "method", "palsy_side", "confidence",
-        "left_closure_pct", "right_closure_pct",
-        "persistent_asymmetry_side", "left_worse_frame_ratio", "right_worse_frame_ratio",
-        "asymmetry_ratio", "status"
-    ],
-
-    "VoluntaryEyeBlink": [
-        "method", "palsy_side", "confidence",
-        "left_closure_pct", "right_closure_pct",
-        "persistent_asymmetry_side", "left_worse_frame_ratio", "right_worse_frame_ratio",
-        "asymmetry_ratio", "status"
-    ],
-
-    "CloseEyeSoftly": [
-        "method", "palsy_side", "confidence",
-        "left_ear", "right_ear",
-        "baseline_left_area", "baseline_right_area",
-        "left_closure_pct", "right_closure_pct",
-        "asymmetry_ratio", "status"
-    ],
-
-    "CloseEyeHardly": [
-        "method", "palsy_side", "confidence",
-        "left_ear", "right_ear",
-        "baseline_left_area", "baseline_right_area",
-        "left_closure_pct", "right_closure_pct",
-        "asymmetry_ratio", "status"
-    ],
-
-    "RaiseEyebrow": [
-        "method", "palsy_side", "confidence",
-        "left_change", "right_change",
-        "asymmetry_ratio", "brow_eye_distance_ratio",
-        "status"
-    ],
-
-    "Smile": [
-        "method", "palsy_side", "confidence",
-        # 嘴唇中线对称性(来自lip_symmetry)
-        "lip_left_to_midline", "lip_right_to_midline",
-        "lip_offset", "lip_asymmetry_ratio", "lip_symmetry_ratio",
-        # 口角角度
-        "AOE_right", "BOF_left", "angle_diff",
-        # 嘴角上提幅度(eye_line_excursion,如果有基线)
-        "left_reduction", "right_reduction", "reduction_asymmetry",
-        "status"
-    ],
-
-    "ShowTeeth": [
-        "method", "palsy_side", "confidence",
-        # 嘴唇中线偏移（主要指标）
-        "face_midline_x", "lip_midline_x",
-        "current_offset", "baseline_offset",
-        "offset_change", "offset_change_norm",
-        # 口角角度（备用指标）
-        "AOE_right", "BOF_left", "angle_diff",
-        # 嘴角位移（参考指标）
-        "left_excursion", "right_excursion", "excursion_ratio",
-        "status"
-    ],
-
-    "ShrugNose": [
-        "method", "palsy_side", "confidence",
-        # 鼻翼到眼部水平线的距离
-        "left_ala_to_eye_line", "right_ala_to_eye_line",
-        "distance_diff", "tilt_angle",
-        # 鼻翼-内眦距离变化(如果有基线)
-        "left_reduction", "right_reduction", "reduction_asymmetry",
-        "asymmetry_ratio", "status"
-    ],
-
-    "BlowCheek": [
-        "method", "palsy_side", "confidence",
-        # 脸颊深度变化
-        "cheek_left_delta", "cheek_right_delta", "cheek_asymmetry",
-        # 嘴唇中线对称性(来自lip_symmetry)
-        "lip_left_to_midline", "lip_right_to_midline",
-        "lip_offset", "lip_asymmetry_ratio",
-        # 口角角度
-        "AOE_right", "BOF_left", "angle_diff",
-        # 门控状态
-        "seal_valid", "mouth_valid", "inner_area_valid",
-        "status"
-    ],
-
-    "LipPucker": [
-        "method", "palsy_side", "confidence",
-        # 嘴唇中线偏移变化(来自lip_midline_offset,如果有基线)
-        "current_offset", "baseline_offset", "offset_change", "offset_change_norm",
-        # 嘴唇中线对称性(来自lip_symmetry)
-        "lip_left_to_midline", "lip_right_to_midline",
-        "lip_offset", "lip_asymmetry_ratio",
-        # 口角角度
-        "AOE_right", "BOF_left", "angle_diff",
-        # 嘴宽变化
-        "width_ratio", "width_change_percent",
-        "status"
-    ],
-}
-
-# 各动作的对称阈值 (用于边界案例识别)
-SYMMETRY_THRESHOLDS = {
-    "NeutralFace": {"ear_ratio_dev": 0.15, "palpebral_ratio_dev": 0.15, "nlf_ratio_dev": 0.15},
-    "SpontaneousEyeBlink": {"asymmetry_ratio": 0.15, "persistent_ratio": 0.60},
-    "VoluntaryEyeBlink": {"asymmetry_ratio": 0.15, "persistent_ratio": 0.60},
-    "CloseEyeSoftly": {"asymmetry_ratio": 0.15, "min_closure": 0.25},
-    "CloseEyeHardly": {"asymmetry_ratio": 0.15, "min_closure": 0.25},
-    "RaiseEyebrow": {"asymmetry_ratio": 0.15, "min_change": 2.0, "bed_ratio_dev": 0.10},
-    "Smile": {"asymmetry_ratio": 0.15, "angle_diff": 3.0, "min_reduction": 5.0},
-    "ShowTeeth": {"offset_change_norm": 0.02, "angle_diff": 3.0, "min_offset_change": 5.0},
-    "ShrugNose": {"asymmetry_ratio": 0.15, "tilt_angle": 2.0, "min_reduction": 3.0},
-    "BlowCheek": {"cheek_asymmetry": 0.15, "angle_diff": 3.0, "min_delta": 0.02},
-    "LipPucker": {"asymmetry_ratio": 0.08, "angle_diff": 3.0, "min_offset_change": 0.02},
-}
-
-
-# =============================================================================
 # 辅助函数
 # =============================================================================
 def ensure_dirs():
@@ -350,13 +221,11 @@ def format_metrics_summary(action: str, metrics: Dict[str, Any]) -> str:
         return f"变化: L={lc:+.1f}px R={rc:+.1f}px asym={asym:.2f} ratio={bed_ratio:.3f}"
 
     elif action in ["Smile", "ShowTeeth", "BlowCheek", "LipPucker"]:
-        # ShowTeeth使用嘴唇中线偏移
-        if action == "ShowTeeth" and method == "lip_midline_offset_change":
-            current = metrics.get("current_offset", 0)
-            baseline = metrics.get("baseline_offset", 0)
-            change = metrics.get("offset_change", 0)
-            change_norm = metrics.get("offset_change_norm", 0)
-            return f"中线偏移: 当前={current:+.1f}px 基线={baseline:+.1f}px 变化={change:+.1f}px ({change_norm:.1%})"
+        # ShowTeeth和LipPucker使用嘴唇偏移
+        if action in ["ShowTeeth", "LipPucker"]:
+            offset = metrics.get("current_offset", 0)
+            offset_norm = metrics.get("offset_norm", 0)
+            return f"嘴唇偏移: {offset:+.1f}px ({offset_norm:.1%})"
         elif method == "lip_midline_offset_change":
             current = metrics.get("current_offset", 0)
             baseline = metrics.get("baseline_offset", 0)
@@ -388,47 +257,6 @@ def format_metrics_summary(action: str, metrics: Dict[str, Any]) -> str:
         return f"鼻翼距: L={ld:.1f}px R={rd:.1f}px 倾斜={tilt:+.1f}° asym={asym:.2f}"
 
     return f"method={method}"
-
-
-def identify_boundary_case(action: str, metrics: Dict[str, Any]) -> Optional[str]:
-    """识别阈值边界案例"""
-    thresholds = SYMMETRY_THRESHOLDS.get(action, {})
-    boundary_notes = []
-
-    # 检查asymmetry_ratio
-    asym = metrics.get("asymmetry_ratio")
-    asym_thr = thresholds.get("asymmetry_ratio")
-    if asym is not None and asym_thr is not None:
-        margin = abs(asym - asym_thr) / asym_thr
-        if margin < 0.3:  # 30%以内
-            boundary_notes.append(f"asym={asym:.3f}≈thr={asym_thr}")
-
-    # 检查angle_diff
-    angle_diff = metrics.get("angle_diff")
-    angle_thr = thresholds.get("angle_diff")
-    if angle_diff is not None and angle_thr is not None:
-        margin = abs(angle_diff - angle_thr) / angle_thr
-        if margin < 0.3:
-            boundary_notes.append(f"angle_diff={angle_diff:.1f}≈thr={angle_thr}")
-
-    # 检查tilt_angle
-    tilt = metrics.get("tilt_angle")
-    tilt_thr = thresholds.get("tilt_angle")
-    if tilt is not None and tilt_thr is not None:
-        margin = abs(abs(tilt) - tilt_thr) / tilt_thr
-        if margin < 0.3:
-            boundary_notes.append(f"|tilt|={abs(tilt):.1f}≈thr={tilt_thr}")
-
-    # 检查offset_change_norm (ShowTeeth/BlowCheek/LipPucker专用)
-    if action in ["ShowTeeth", "BlowCheek", "LipPucker"]:
-        offset_norm = metrics.get("offset_change_norm")
-        offset_thr = thresholds.get("offset_change_norm", 0.02)
-        if offset_norm is not None and offset_thr > 0:
-            margin = abs(offset_norm - offset_thr) / offset_thr
-            if margin < 0.5:  # 50%以内认为边界
-                boundary_notes.append(f"offset_norm={offset_norm:.3f}≈thr={offset_thr}")
-
-    return "; ".join(boundary_notes) if boundary_notes else None
 
 
 # =============================================================================
@@ -510,9 +338,6 @@ def collect_one_exam(exam_dir: Path) -> Tuple[int, int, List[Dict[str, Any]], Op
         # 生成指标摘要
         metrics_summary = format_metrics_summary(action_name, detailed_metrics)
 
-        # 识别边界案例
-        boundary_note = identify_boundary_case(action_name, detailed_metrics)
-
         record = {
             "exam_id": exam_id,
             "action": action_name,
@@ -526,7 +351,6 @@ def collect_one_exam(exam_dir: Path) -> Tuple[int, int, List[Dict[str, Any]], Op
             "method": prediction.get("method"),
             "interpretation": prediction.get("interpretation"),
             "metrics_summary": metrics_summary,
-            "boundary_note": boundary_note,
             "detailed_metrics": detailed_metrics,
             "severity_score": prediction.get("severity_score"),
             "severity_desc": prediction.get("severity_desc", ""),
@@ -1474,17 +1298,6 @@ def copy_classified_images(records: List[Dict[str, Any]], output_dir: Path):
                   f"{stats.get('FN', 0):>4} {stats.get('FP', 0):>4} {stats.get('both_sym', 0):>8}")
 
 
-def print_threshold_reference():
-    """打印阈值参考"""
-    print("\n" + "=" * 60)
-    print("阈值参考 (各动作对称性判断阈值)")
-    print("=" * 60)
-    for action, thresholds in SYMMETRY_THRESHOLDS.items():
-        thr_str = ", ".join([f"{k}={v}" for k, v in thresholds.items()])
-        print(f"  {action}: {thr_str}")
-    print()
-
-
 def load_indicators_json(exam_dir: Path, action: str) -> Optional[Dict[str, Any]]:
     """
     加载指定动作的indicators.json
@@ -1965,8 +1778,6 @@ def main():
         raise FileNotFoundError(f"SRC_ROOT 不存在: {SRC_ROOT}")
 
     ensure_dirs()
-    print_threshold_reference()
-
     total_exam = 0
     total_copied = 0
     total_skipped = 0

@@ -32,7 +32,8 @@ from clinical_base import (
     compute_scale_to_baseline, draw_palsy_side_label,
     compute_lip_midline_offset_from_face_midline,
     compute_mouth_corner_to_eye_line_distance, compute_mouth_metrics,
-    compute_face_midline, draw_face_midline,
+    compute_face_midline, draw_face_midline, draw_palsy_annotation_header,
+    compute_lip_midline_angle,
 )
 
 from sunnybrook_scorer import (
@@ -43,6 +44,24 @@ from thresholds import THR
 
 ACTION_NAME = "ShowTeeth"
 ACTION_NAME_CN = "露齿"
+
+# OpenCV字体
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# 字体大小
+FONT_SCALE_TITLE = 1.4      # 标题
+FONT_SCALE_LARGE = 1.2      # 大号文字
+FONT_SCALE_NORMAL = 0.9     # 正常文字
+FONT_SCALE_SMALL = 0.7      # 小号文字
+
+# 线条粗细
+THICKNESS_TITLE = 3
+THICKNESS_NORMAL = 2
+THICKNESS_THIN = 1
+
+# 行高
+LINE_HEIGHT = 45
+LINE_HEIGHT_SMALL = 30
 
 
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
@@ -211,6 +230,33 @@ def compute_show_teeth_metrics(landmarks, w: int, h: int,
     inner_pts = np.array(pts2d(landmarks, LM.INNER_LIP, w, h), dtype=np.float32)
     inner_mouth_area = float(abs(polygon_area(inner_pts))) if len(inner_pts) >= 3 else 0.0
 
+    # ========== 计算被面中线分开的左右嘴唇面积 ==========
+    # 外唇左右面积
+    outer_lip_left_pts = np.array(pts2d(landmarks, LM.LIP_L, w, h), dtype=np.float32)
+    outer_lip_right_pts = np.array(pts2d(landmarks, LM.LIP_R, w, h), dtype=np.float32)
+    outer_left_area = float(abs(polygon_area(outer_lip_left_pts))) if len(outer_lip_left_pts) >= 3 else 0.0
+    outer_right_area = float(abs(polygon_area(outer_lip_right_pts))) if len(outer_lip_right_pts) >= 3 else 0.0
+
+    # 内唇左右面积
+    inner_lip_left_pts = np.array(pts2d(landmarks, LM.INNER_LIP_L, w, h), dtype=np.float32)
+    inner_lip_right_pts = np.array(pts2d(landmarks, LM.INNER_LIP_R, w, h), dtype=np.float32)
+    inner_left_area = float(abs(polygon_area(inner_lip_left_pts))) if len(inner_lip_left_pts) >= 3 else 0.0
+    inner_right_area = float(abs(polygon_area(inner_lip_right_pts))) if len(inner_lip_right_pts) >= 3 else 0.0
+
+    # 计算面积差异
+    outer_area_diff = abs(outer_left_area - outer_right_area)
+    inner_area_diff = abs(inner_left_area - inner_right_area)
+
+    # 计算面积比例（较小/较大）
+    outer_area_ratio = min(outer_left_area, outer_right_area) / max(outer_left_area, outer_right_area) if max(
+        outer_left_area, outer_right_area) > 1e-6 else 1.0
+    inner_area_ratio = min(inner_left_area, inner_right_area) / max(inner_left_area, inner_right_area) if max(
+        inner_left_area, inner_right_area) > 1e-6 else 1.0
+
+    # ICD归一化
+    icd = float(compute_icd(landmarks, w, h))
+    icd_sq = icd * icd + 1e-9
+
     # 嘴角位置
     left_corner = mouth["left_corner"]
     right_corner = mouth["right_corner"]
@@ -233,6 +279,18 @@ def compute_show_teeth_metrics(landmarks, w: int, h: int,
         "mouth_width": float(mouth["width"]),
         "mouth_height": float(mouth["height"]),
         "inner_mouth_area": float(inner_mouth_area),
+        "lip_areas": {
+            "outer_left": float(outer_left_area),
+            "outer_right": float(outer_right_area),
+            "outer_diff": float(outer_area_diff),
+            "outer_ratio": float(outer_area_ratio),
+            "outer_diff_norm": float(outer_area_diff / icd_sq),
+            "inner_left": float(inner_left_area),
+            "inner_right": float(inner_right_area),
+            "inner_diff": float(inner_area_diff),
+            "inner_ratio": float(inner_area_ratio),
+            "inner_diff_norm": float(inner_area_diff / icd_sq),
+        },
         "left_corner": left_corner,
         "right_corner": right_corner,
         "left_height_from_center": float(left_height_from_center),
@@ -292,81 +350,75 @@ def compute_show_teeth_metrics(landmarks, w: int, h: int,
             "right": float((right_height_from_center - baseline_right_height) * scale),
         }
 
-        # ========== 嘴唇中线偏移（用于面瘫侧别判断，有基线版本）==========
-        lip_offset_data = compute_lip_midline_offset_from_face_midline(landmarks, w, h, baseline_landmarks)
-        metrics["lip_midline_offset"] = lip_offset_data
-    else:
-        # ========== 没有基线时也计算嘴唇中线偏移 ==========
-        lip_offset_data = compute_lip_midline_offset_from_face_midline(landmarks, w, h, None)
-        metrics["lip_midline_offset"] = lip_offset_data
+    # ========== 嘴唇中线偏移（用于面瘫侧别判断，有基线版本）==========
+    lip_offset_data = compute_lip_midline_offset_from_face_midline(landmarks, w, h, baseline_landmarks)
+    metrics["lip_midline_offset"] = lip_offset_data
+    # ========== 嘴唇中线角度（用于面瘫侧别判断）==========
+    lip_angle = compute_lip_midline_angle(landmarks, w, h)
+    metrics["lip_midline_angle"] = lip_angle
 
     return metrics
 
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从露齿动作检测面瘫侧别 - 基于嘴唇中线偏移
+    从露齿动作检测面瘫侧别 - 基于嘴唇中心偏移（不依赖baseline）
 
     原理:
-    - 面瘫侧肌肉无力，嘴巴整体被健侧肌肉拉向健侧
-    - 嘴唇中线相对于面中线会偏向健侧
+    - 露齿时，健侧肌肉有力，把嘴唇拉向健侧
+    - 嘴唇中心偏向患者哪侧 → 那侧是健侧 → 对侧是患侧
 
-    重要改进:
-    - 直接看当前帧嘴唇中线偏离面中线的距离和方向
-    - 嘴唇偏向哪侧 → 对侧是面瘫侧
+    判断方法:
+    - 使用嘴唇中心相对面中线的偏移（offset_norm）
+    - 正偏移（偏向图像右侧=患者左侧）→ 患者左侧健侧 → 患者右侧面瘫
+    - 负偏移（偏向图像左侧=患者右侧）→ 患者右侧健侧 → 患者左侧面瘫
     """
     result = {
         "palsy_side": 0,
         "confidence": 0.0,
         "interpretation": "",
-        "method": "",
+        "method": "lip_offset",
         "evidence": {}
     }
 
-    lip_offset_data = metrics.get("lip_midline_offset", {})
+    # ========== 获取偏移数据 ==========
+    lip_offset = metrics.get("lip_midline_offset", {})
+    current_offset = lip_offset.get("current_signed_dist", lip_offset.get("current_offset", 0)) or 0
+    offset_norm = abs(lip_offset.get("offset_norm", 0) or 0)
+    icd = lip_offset.get("icd", 1) or 1
 
-    if lip_offset_data:
-        current_offset = lip_offset_data.get("current_offset", 0)
-        face_midline_x = lip_offset_data.get("face_midline_x", 0)
-        lip_midline_x = lip_offset_data.get("lip_midline_x", 0)
+    result["evidence"] = {
+        "current_offset": current_offset,
+        "offset_norm": offset_norm,
+        "icd": icd,
+    }
 
-        # 获取归一化偏移（兼容有/无基线两种情况）
-        # 无基线时用 offset_norm，有基线时用 offset_change_norm
-        offset_norm = lip_offset_data.get("offset_norm", None)
-        if offset_norm is None:
-            offset_norm = lip_offset_data.get("offset_change_norm", 0)
+    # ========== 判断逻辑 ==========
+    OFFSET_THRESHOLD = getattr(THR, 'SHOW_TEETH_OFFSET_NORM_THR', 0.02)
 
-        result["method"] = "lip_midline_offset"
-        result["evidence"]["current_offset"] = current_offset
-        result["evidence"]["offset_norm"] = offset_norm
-        result["evidence"]["face_midline_x"] = face_midline_x
-        result["evidence"]["lip_midline_x"] = lip_midline_x
+    # 计算置信度（基于偏移大小）
+    result["confidence"] = min(1.0, offset_norm / 0.05)  # 5%偏移 -> 100%置信度
 
-        # 置信度计算
-        result["confidence"] = min(1.0, offset_norm * 10)
-
-        # 阈值调整
-        if offset_norm < 0.025:
-            result["palsy_side"] = 0
-            result["interpretation"] = (
-                f"嘴唇中线居中 (偏移{current_offset:.1f}px, {offset_norm:.1%})"
-            )
-        elif current_offset > 0:
-            # 嘴唇偏向左侧 = 被左侧（健侧）拉动 = 右侧面瘫
-            result["palsy_side"] = 2
-            result["interpretation"] = (
-                f"嘴唇偏向左侧 ({current_offset:+.1f}px, {offset_norm:.1%}) → 右侧面瘫"
-            )
-        else:
-            # 嘴唇偏向右侧 = 被右侧（健侧）拉动 = 左侧面瘫
-            result["palsy_side"] = 1
-            result["interpretation"] = (
-                f"嘴唇偏向右侧 ({current_offset:+.1f}px, {offset_norm:.1%}) → 左侧面瘫"
-            )
-        return result
+    if offset_norm < OFFSET_THRESHOLD:
+        # 偏移很小，认为对称
+        result["palsy_side"] = 0
+        result["interpretation"] = (
+            f"嘴唇中心居中 (偏移={current_offset:+.1f}px, {offset_norm:.1%})"
+        )
+    elif current_offset > 0:
+        # 正偏移 = 偏向图像右侧 = 偏向患者左侧 = 患者左侧健侧 = 患者右侧面瘫
+        result["palsy_side"] = 2
+        result["interpretation"] = (
+            f"嘴唇偏向患者左侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 右侧面瘫"
+        )
+    else:
+        # 负偏移 = 偏向图像左侧 = 偏向患者右侧 = 患者右侧健侧 = 患者左侧面瘫
+        result["palsy_side"] = 1
+        result["interpretation"] = (
+            f"嘴唇偏向患者右侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 左侧面瘫"
+        )
 
     return result
-
 
 def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
     """
@@ -480,22 +532,13 @@ def visualize_show_teeth(frame: np.ndarray, landmarks, w: int, h: int,
     """可视化露齿指标 - 增加左右内唇面积区域可视化"""
     img = frame.copy()
 
+    # ========== 第一行绘制患侧标注 ==========
+    img, header_end_y = draw_palsy_annotation_header(img, palsy_detection, ACTION_NAME)
+
     # 绘制面中线
     midline = compute_face_midline(landmarks, w, h)
     if midline:
         img = draw_face_midline(img, midline, color=(0, 255, 255), thickness=2, dashed=True)
-
-    # 字体参数
-    FONT = cv2.FONT_HERSHEY_SIMPLEX
-    FONT_SCALE_TITLE = 1.4
-    FONT_SCALE_NORMAL = 0.9
-    THICKNESS_TITLE = 3
-    THICKNESS_NORMAL = 2
-    LINE_HEIGHT = 45
-
-    # 患侧标签
-    if palsy_detection:
-        img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
 
     # ========== 绘制嘴唇中线和偏移 ==========
     lip_offset_data = metrics.get("lip_midline_offset", {})
@@ -532,7 +575,12 @@ def visualize_show_teeth(frame: np.ndarray, landmarks, w: int, h: int,
 
     # 绘制嘴部轮廓
     draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 3)
+    # ========== 新增：绘制内缘轮廓 ==========
+    draw_polygon(img, landmarks, w, h, LM.INNER_LIP, (0, 200, 200), 2)
 
+    # ========== 绘制左右内缘区域（不同颜色区分）==========
+    draw_polygon(img, landmarks, w, h, LM.INNER_LIP_L, (255, 100, 100), 1)  # 左侧淡红
+    draw_polygon(img, landmarks, w, h, LM.INNER_LIP_R, (100, 100, 255), 1)  # 右侧淡蓝
     # 绘制嘴角点
     if result.oral_angle:
         oral = result.oral_angle
@@ -540,13 +588,48 @@ def visualize_show_teeth(frame: np.ndarray, landmarks, w: int, h: int,
         cv2.circle(img, (int(oral.B[0]), int(oral.B[1])), 10, (255, 0, 0), -1)
 
     # ========== 信息面板 ==========
-    panel_w, panel_h = 700, 650  # 增加高度以显示更多信息
-    cv2.rectangle(img, (10, 100), (panel_w, panel_h), (0, 0, 0), -1)
+    panel_top = header_end_y + 20
+    panel_w, panel_h = 700, panel_top + 700
+    cv2.rectangle(img, (10, panel_top), (panel_w, panel_h), (0, 0, 0), -1)
     cv2.rectangle(img, (10, 100), (panel_w, panel_h), (255, 255, 255), 2)
 
     y = 160
     cv2.putText(img, f"{ACTION_NAME}", (25, y), FONT, FONT_SCALE_TITLE, (0, 255, 0), THICKNESS_TITLE)
     y += LINE_HEIGHT + 10
+
+    # ========== 显示左右嘴唇面积 ==========
+    lip_areas = metrics.get("lip_areas", {})
+    if lip_areas:
+        cv2.putText(img, "=== Lip Area Analysis ===", (25, y), FONT, FONT_SCALE_NORMAL, (0, 255, 255), THICKNESS_NORMAL)
+        y += LINE_HEIGHT
+
+        # 外缘面积
+        outer_l = lip_areas.get("outer_left", 0)
+        outer_r = lip_areas.get("outer_right", 0)
+        outer_diff = lip_areas.get("outer_diff", 0)
+        outer_ratio = lip_areas.get("outer_ratio", 1.0)
+
+        # 颜色：比例差异大时显示红色
+        outer_color = (0, 255, 0) if outer_ratio > 0.85 else (0, 165, 255) if outer_ratio > 0.7 else (0, 0, 255)
+        cv2.putText(img, f"Outer: L={outer_l:.0f} R={outer_r:.0f} Diff={outer_diff:.0f}", (25, y),
+                    FONT, 0.7, outer_color, 2)
+        y += 35
+
+        # 内缘面积
+        inner_l = lip_areas.get("inner_left", 0)
+        inner_r = lip_areas.get("inner_right", 0)
+        inner_diff = lip_areas.get("inner_diff", 0)
+        inner_ratio = lip_areas.get("inner_ratio", 1.0)
+
+        inner_color = (0, 255, 0) if inner_ratio > 0.85 else (0, 165, 255) if inner_ratio > 0.7 else (0, 0, 255)
+        cv2.putText(img, f"Inner: L={inner_l:.0f} R={inner_r:.0f} Diff={inner_diff:.0f}", (25, y),
+                    FONT, 0.7, inner_color, 2)
+        y += 35
+
+        # 比例
+        cv2.putText(img, f"Ratio: Outer={outer_ratio:.2f} Inner={inner_ratio:.2f}", (25, y),
+                    FONT, 0.7, (255, 255, 255), 2)
+        y += LINE_HEIGHT
 
     cv2.putText(img, f"Width: {metrics['mouth_width']:.1f}px  Height: {metrics['mouth_height']:.1f}px", (25, y),
                 FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)

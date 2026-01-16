@@ -47,6 +47,24 @@ from sunnybrook_scorer import (
 ACTION_NAME = "Smile"
 ACTION_NAME_CN = "微笑"
 
+# OpenCV字体
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# 字体大小
+FONT_SCALE_TITLE = 1.4      # 标题
+FONT_SCALE_LARGE = 1.2      # 大号文字
+FONT_SCALE_NORMAL = 0.9     # 正常文字
+FONT_SCALE_SMALL = 0.7      # 小号文字
+
+# 线条粗细
+THICKNESS_TITLE = 3
+THICKNESS_NORMAL = 2
+THICKNESS_THIN = 1
+
+# 行高
+LINE_HEIGHT = 45
+LINE_HEIGHT_SMALL = 30
+
 
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
                     baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
@@ -489,21 +507,12 @@ def detect_synkinesis_from_smile(baseline_result: Optional[ActionResult],
     return synkinesis
 
 
-def visualize_smile_indicators(frame: np.ndarray, landmarks, w: int, h: int,
+def visualize_smile(frame: np.ndarray, landmarks, w: int, h: int,
                                result: ActionResult,
                                smile_metrics: Dict[str, Any],
                                palsy_detection: Dict[str, Any]) -> np.ndarray:
     """可视化微笑指标 - 字体放大版"""
     img = frame.copy()
-
-    # 字体参数（放大4倍）
-    FONT = cv2.FONT_HERSHEY_SIMPLEX
-    FONT_SCALE_TITLE = 1.4  # 标题字号
-    FONT_SCALE_LARGE = 1.0  # 大字号
-    FONT_SCALE_NORMAL = 0.9  # 普通字号
-    THICKNESS_TITLE = 3
-    THICKNESS_NORMAL = 2
-    LINE_HEIGHT = 50  # 行高
 
     # ========== 在左上角绘制患侧标签 ==========
     img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
@@ -734,7 +743,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
     # 保存可视化
-    vis = visualize_smile_indicators(peak_frame, peak_landmarks, w, h, result,
+    vis = visualize_smile(peak_frame, peak_landmarks, w, h, result,
                                      smile_metrics, palsy_detection)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 

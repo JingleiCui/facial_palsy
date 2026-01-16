@@ -84,11 +84,8 @@ class Thresholds:
     BLOW_CHEEK_ASYM_THRESHOLD: float = 0.10  # 左右不对称比 > 15% 判定患侧
     BLOW_CHEEK_BASELINE_FRAMES: int = 10  # 用视频前10帧建立内部baseline
 
-    # 唇封闭距离归一化阈值 (seal_total / ICD)
-    MOUTH_SEAL: float = 0.032
-
     # 嘴部高度归一化阈值 (mouth_height / ICD)
-    MOUTH_HEIGHT: float = 0.032
+    MOUTH_HEIGHT: float = 0.06
 
     # 嘴唇内圈面积增幅阈值
     MOUTH_INNER_AREA_INC: float = 3.5
@@ -122,10 +119,17 @@ class Thresholds:
     LIP_PUCKER_PALSY_MIN_CONTRACTION: float = 1.0  # 1px即可分析
 
     # 嘴唇中线角度阈值
-    LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD: float = 3.0  # 角度>4度判定偏斜
+    LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD: float = 1.5  # 角度>度判定偏斜
+
+    LIP_PUCKER_OFFSET_NORM_THR = 0.02
+
+    LIP_PUCKER_WIDTH_RATIO_ACTIVATED = 0.6 # 嘴宽比例 <%才算真的做了撅嘴
 
     # 嘴唇中心偏移阈值 (归一化到ICD)
-    LIP_PUCKER_PALSY_OFFSET_THRESHOLD: float = 0.020  # 偏移>% ICD
+    LIP_PUCKER_PALSY_OFFSET_THRESHOLD: float = 0.02  # 偏移>% ICD
+
+    # LipPucker - 内缘面积比例阈值
+    LIP_PUCKER_INNER_AREA_RATIO_THRESHOLD = 0.85  # 比例高于此值认为对称
 
     # 综合判断权重
     LIP_PUCKER_CONTRACTION_WEIGHT: float = 0.40  # 收缩量权重
@@ -252,6 +256,12 @@ class Thresholds:
     # 联动检测
     SHOW_TEETH_SYNKINESIS_SEVERE: float = 0.15
     SHOW_TEETH_SYNKINESIS_MODERATE: float = 0.08
+
+    # LipPucker - 内缘面积比例阈值
+    SHOW_TEETH_INNER_AREA_RATIO_THRESHOLD = 0.85  # 比例高于此值认为对称
+
+    SHOW_TEETH_ANGLE_THRESHOLD = 1.5
+    SHOW_TEETH_OFFSET_NORM_THR = 0.02  # 偏移/ICD > 3%认为异常
 
     # =========================================================================
     # ShrugNose 皱鼻动作阈值

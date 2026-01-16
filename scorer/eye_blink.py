@@ -27,10 +27,28 @@ from clinical_base import (
     compute_oral_angle, compute_icd, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
     add_valid_region_shading, get_palsy_side_text,
-    compute_eye_closure_by_area, draw_palsy_side_label,
+    compute_eye_closure_by_area, draw_palsy_side_label, draw_palsy_annotation_header,
 )
 
 from thresholds import THR
+
+# OpenCV字体
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# 字体大小
+FONT_SCALE_TITLE = 1.4      # 标题
+FONT_SCALE_LARGE = 1.2      # 大号文字
+FONT_SCALE_NORMAL = 0.9     # 正常文字
+FONT_SCALE_SMALL = 0.7      # 小号文字
+
+# 线条粗细
+THICKNESS_TITLE = 3
+THICKNESS_NORMAL = 2
+THICKNESS_THIN = 1
+
+# 行高
+LINE_HEIGHT = 45
+LINE_HEIGHT_SMALL = 30
 
 
 def find_peak_frame_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
@@ -527,12 +545,13 @@ def visualize_blink_indicators(frame: np.ndarray, landmarks, w: int, h: int,
     """可视化眨眼指标"""
     img = frame.copy()
 
-    img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
+    # ========== 第一行绘制患侧标注 ==========
+    img, header_end_y = draw_palsy_annotation_header(img, palsy_detection, result.action_name)
 
     draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_L, (255, 0, 0), 2)
     draw_polygon(img, landmarks, w, h, LM.EYE_CONTOUR_R, (0, 165, 255), 2)
 
-    y = 25
+    y = header_end_y + 10  # 从标注下方开始
     cv2.putText(img, f"{result.action_name}", (10, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     y += 30

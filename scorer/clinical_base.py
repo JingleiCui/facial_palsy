@@ -216,65 +216,6 @@ def compute_scale_to_baseline(current_landmarks, baseline_landmarks, w: int, h: 
     return icd_base / icd_current
 
 
-def scale_distance(distance: float, scale: float) -> float:
-    """将距离缩放到 baseline 尺度"""
-    return distance * scale
-
-
-def scale_point(point: Tuple[float, float], scale: float,
-                anchor: Tuple[float, float] = None) -> Tuple[float, float]:
-    """
-    将点坐标缩放到 baseline 尺度
-
-    Args:
-        point: 当前帧坐标
-        scale: 缩放比例
-        anchor: 缩放锚点（默认为原点）
-
-    Returns:
-        缩放后的坐标
-    """
-    if anchor is None:
-        return (point[0] * scale, point[1] * scale)
-    else:
-        dx = point[0] - anchor[0]
-        dy = point[1] - anchor[1]
-        return (anchor[0] + dx * scale, anchor[1] + dy * scale)
-
-
-class ScaledMetrics:
-    """
-    统一尺度的指标容器
-
-    存储已缩放到 baseline 尺度的指标，方便直接对比
-    """
-
-    def __init__(self, scale: float = 1.0):
-        self.scale = scale
-        self._raw = {}  # 原始值
-        self._scaled = {}  # 缩放后的值
-
-    def add(self, name: str, raw_value: float) -> float:
-        """添加一个距离指标，自动缩放"""
-        self._raw[name] = raw_value
-        scaled = raw_value * self.scale
-        self._scaled[name] = scaled
-        return scaled
-
-    def get_raw(self, name: str) -> float:
-        return self._raw.get(name, 0.0)
-
-    def get_scaled(self, name: str) -> float:
-        return self._scaled.get(name, 0.0)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "scale": self.scale,
-            "raw": self._raw.copy(),
-            "scaled": self._scaled.copy()
-        }
-
-
 # =============================================================================
 # 批量处理函数 - NumPy 向量化
 # =============================================================================
@@ -439,8 +380,6 @@ def compute_centroid(points: np.ndarray) -> Tuple[float, float]:
     """计算点集的质心"""
     return (float(np.mean(points[:, 0])), float(np.mean(points[:, 1])))
 
-
-# 建议添加到 clinical_base.py 或 geometry_utils.py
 
 def kabsch_rigid_transform(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -2122,6 +2061,95 @@ def draw_palsy_side_label(img: np.ndarray, palsy_detection: Dict[str, Any],
 
 
 # =============================================================================
+# 统一的图像顶部标注函数
+# =============================================================================
+
+# 定义统一的标注参数
+ANNOTATION_CONFIG = {
+    "font": cv2.FONT_HERSHEY_SIMPLEX,
+    "font_scale": 1.6,
+    "thickness": 3,
+    "padding": 15,
+    "line_height": 50,
+}
+
+# =============================================================================
+# 统一的可视化参数（供所有动作模块使用）
+# =============================================================================
+
+# OpenCV字体
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# 字体大小
+FONT_SCALE_TITLE = 1.4      # 标题
+FONT_SCALE_LARGE = 1.2      # 大号文字
+FONT_SCALE_NORMAL = 0.9     # 正常文字
+FONT_SCALE_SMALL = 0.7      # 小号文字
+
+# 线条粗细
+THICKNESS_TITLE = 3
+THICKNESS_NORMAL = 2
+THICKNESS_THIN = 1
+
+# 行高
+LINE_HEIGHT = 45
+LINE_HEIGHT_SMALL = 30
+
+
+def draw_palsy_annotation_header(img: np.ndarray, palsy_detection: Dict[str, Any],
+                                  action_name: str = "") -> Tuple[np.ndarray, int]:
+    """
+    在图像顶部第一行绘制统一格式的患侧标注
+
+    Args:
+        img: 输入图像
+        palsy_detection: 面瘫检测结果字典
+        action_name: 动作名称（可选，用于额外显示）
+
+    Returns:
+        (标注后的图像, 下一行起始y坐标)
+    """
+    if img is None:
+        return img, 60
+
+    cfg = ANNOTATION_CONFIG
+    font = cfg["font"]
+    font_scale = cfg["font_scale"]
+    thickness = cfg["thickness"]
+    padding = cfg["padding"]
+
+    x = 15
+    y = 50  # 第一行y坐标
+
+    if palsy_detection:
+        palsy_side = palsy_detection.get("palsy_side", 0)
+        confidence = palsy_detection.get("confidence", 0)
+
+        # 获取颜色和文本
+        color = get_palsy_side_color(palsy_side)
+        text = get_palsy_side_text(palsy_side, confidence)
+
+        # 计算文本大小
+        (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+        # 绘制背景框
+        cv2.rectangle(img, (x - padding, y - text_h - padding),
+                      (x + text_w + padding, y + padding), (0, 0, 0), -1)
+        cv2.rectangle(img, (x - padding, y - text_h - padding),
+                      (x + text_w + padding, y + padding), color, 3)
+
+        # 绘制文本
+        cv2.putText(img, text, (x, y), font, font_scale, color, thickness)
+
+        # 计算下一行起始位置
+        next_y = y + padding + 20
+    else:
+        next_y = 60
+
+    return img, next_y
+
+
+# =============================================================================
 # 通用面瘫侧别检测 - 基于比值的无阈值方法
 # =============================================================================
 
@@ -2955,6 +2983,89 @@ def compute_lip_shape_symmetry(landmarks, w: int, h: int) -> Dict[str, Any]:
         "icd": float(icd),
     }
 
+def compute_lip_midline_angle(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    计算嘴唇中线与面中线的角度
+
+    原理:
+    - 面中线: 鼻尖到下巴中点的连线方向 (垂直向下)
+    - 嘴唇中线: 上唇中点到下唇中点的连线方向
+    - 正常情况两线接近平行，面瘫时形成角度
+
+    Args:
+        landmarks: 面部关键点
+        w, h: 图像尺寸
+
+    Returns:
+        {
+            "angle": 夹角(度),
+            "direction": 偏向 ("left", "right", "center"),
+            "cross_product": 叉积值 (用于判断方向),
+            "face_vec": 面中线向量,
+            "lip_vec": 嘴唇中线向量,
+        }
+    """
+    result = {
+        "angle": 0.0,
+        "direction": "center",
+        "cross_product": 0.0,
+        "face_vec": (0, 1),
+        "lip_vec": (0, 1),
+    }
+
+    try:
+        # 面中线: 鼻尖 -> 下巴中点 (归一化方向)
+        nose_tip = pt2d(landmarks[LM.NOSE_TIP], w, h)
+
+        # 获取下巴点 (LM.CHIN = 152)
+        chin = pt2d(landmarks[LM.CHIN], w, h)
+
+        face_vec = (chin[0] - nose_tip[0], chin[1] - nose_tip[1])
+        result["face_vec"] = face_vec
+
+        # 嘴唇中线: 上唇中点 -> 下唇中点
+        lip_top = pt2d(landmarks[LM.LIP_TOP_CENTER], w, h)
+        lip_bot = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)
+        lip_vec = (lip_bot[0] - lip_top[0], lip_bot[1] - lip_top[1])
+        result["lip_vec"] = lip_vec
+
+        # 计算向量模
+        def magnitude(v):
+            return math.sqrt(v[0] ** 2 + v[1] ** 2)
+
+        mag_face = magnitude(face_vec)
+        mag_lip = magnitude(lip_vec)
+
+        if mag_face < 1e-6 or mag_lip < 1e-6:
+            return result
+
+        # 计算夹角 (点积)
+        dot = face_vec[0] * lip_vec[0] + face_vec[1] * lip_vec[1]
+        cos_angle = dot / (mag_face * mag_lip)
+        cos_angle = max(-1.0, min(1.0, cos_angle))  # 数值稳定
+        angle = math.degrees(math.acos(cos_angle))
+        result["angle"] = angle
+
+        # 判断偏向 (叉积)
+        # cross = face_x * lip_y - face_y * lip_x
+        # cross > 0: lip_vec 在 face_vec 逆时针方向 (嘴唇偏左)
+        # cross < 0: lip_vec 在 face_vec 顺时针方向 (嘴唇偏右)
+        cross = face_vec[0] * lip_vec[1] - face_vec[1] * lip_vec[0]
+        result["cross_product"] = cross
+
+        # 设置方向阈值 (避免噪声)
+        if abs(cross) < 1e-3:
+            result["direction"] = "center"
+        elif cross > 0:
+            result["direction"] = "left"  # 嘴唇偏向左侧
+        else:
+            result["direction"] = "right"  # 嘴唇偏向右侧
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
 
 def compute_mouth_corner_to_eye_line_distance(landmarks, w: int, h: int,
                                               left: bool = True) -> Dict[str, Any]:
@@ -3574,9 +3685,6 @@ def analyze_eye_closure_full(landmarks_seq: List, w: int, h: int,
         "synchrony_analysis": synchrony,
         "diagnosis": diagnosis,
     }
-
-
-# === Add these new functions to the end of clinical_base.py ===
 
 def detect_synkinesis_from_mouth(baseline_result: Optional[ActionResult],
                                  current_landmarks, w: int, h: int) -> Dict[str, int]:

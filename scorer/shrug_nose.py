@@ -28,12 +28,31 @@ from clinical_base import (
     compute_mouth_metrics, compute_icd, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
     compute_nose_midline_symmetry, compute_ala_canthus_change,
+draw_palsy_annotation_header,
 )
 
 from thresholds import THR
 
 ACTION_NAME = "ShrugNose"
 ACTION_NAME_CN = "皱鼻"
+
+# OpenCV字体
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# 字体大小
+FONT_SCALE_TITLE = 1.4      # 标题
+FONT_SCALE_LARGE = 1.2      # 大号文字
+FONT_SCALE_NORMAL = 0.9     # 正常文字
+FONT_SCALE_SMALL = 0.7      # 小号文字
+
+# 线条粗细
+THICKNESS_TITLE = 3
+THICKNESS_NORMAL = 2
+THICKNESS_THIN = 1
+
+# 行高
+LINE_HEIGHT = 45
+LINE_HEIGHT_SMALL = 30
 
 
 def compute_ala_to_canthus_distance(landmarks, w: int, h: int, left: bool = True) -> float:
@@ -633,12 +652,16 @@ def visualize_shrug_nose(frame: np.ndarray, landmarks, w: int, h: int,
                     (int(right_ala[0]) + 5, int((right_ala[1] + eye_line_y) / 2)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
 
-    # 信息面板
-    panel_h = 320
-    cv2.rectangle(img, (5, 5), (420, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, 5), (420, panel_h), (255, 255, 255), 1)
+    # ========== 第一行绘制患侧标注 ==========
+    img, header_end_y = draw_palsy_annotation_header(img, palsy_detection, ACTION_NAME)
 
-    y = 28
+    # 信息面板 - 顶部下移，避免覆盖标注
+    panel_top = header_end_y + 10
+    panel_h = panel_top + 300
+    cv2.rectangle(img, (5, panel_top), (420, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, panel_top), (420, panel_h), (255, 255, 255), 1)
+
+    y = panel_top + 25
     cv2.putText(img, f"{ACTION_NAME} (ShrugNose)", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     y += 28
@@ -705,14 +728,6 @@ def visualize_shrug_nose(frame: np.ndarray, landmarks, w: int, h: int,
 
     cv2.putText(img, f"Ala Width: {metrics['ala_width']:.1f}px", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 25
-
-    # 面瘫侧别检测结果
-    palsy_side = palsy_detection.get("palsy_side", 0)
-    palsy_text = {0: "No", 1: "Left", 2: "Right"}.get(palsy_side, "Unkown")
-    palsy_color = (0, 255, 0) if palsy_side == 0 else (0, 0, 255)
-    cv2.putText(img, f"Palsy Side: {palsy_text}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, palsy_color, 1)
     y += 25
 
     # Voluntary Score

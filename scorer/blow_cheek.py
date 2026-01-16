@@ -44,6 +44,24 @@ import matplotlib.pyplot as plt
 ACTION_NAME = "BlowCheek"
 ACTION_NAME_CN = "鼓腮"
 
+# OpenCV字体
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# 字体大小
+FONT_SCALE_TITLE = 1.4      # 标题
+FONT_SCALE_LARGE = 1.2      # 大号文字
+FONT_SCALE_NORMAL = 0.9     # 正常文字
+FONT_SCALE_SMALL = 0.7      # 小号文字
+
+# 线条粗细
+THICKNESS_TITLE = 3
+THICKNESS_NORMAL = 2
+THICKNESS_THIN = 1
+
+# 行高
+LINE_HEIGHT = 45
+LINE_HEIGHT_SMALL = 30
+
 
 def plot_cheek_bulge_curve(
         peak_debug: Dict[str, Any],
@@ -111,36 +129,6 @@ def _safe_pt3d(landmarks, idx: int, w: int, h: int):
         return p
     except Exception:
         return None
-
-
-def _estimate_face_plane(landmarks, w: int, h: int):
-    """用双内眦+下巴估计面部参考平面，返回 (origin, unit_normal)，并保证法向朝向鼻尖外侧。"""
-    pL = _safe_pt3d(landmarks, LM.EYE_INNER_L, w, h)
-    pR = _safe_pt3d(landmarks, LM.EYE_INNER_R, w, h)
-    pC = _safe_pt3d(landmarks, LM.CHIN, w, h)
-    pN = _safe_pt3d(landmarks, LM.NOSE_TIP, w, h)
-    if pL is None or pR is None or pC is None or pN is None:
-        return None, None
-
-    v1 = pR - pL
-    v2 = pC - pL
-    n = np.cross(v1, v2)
-    norm = float(np.linalg.norm(n))
-    if norm < 1e-8:
-        return None, None
-    n = n / norm
-
-    origin = (pL + pR + pC) / 3.0
-
-    # 让法向指向“面部外侧”（鼻尖方向）
-    if float(np.dot(n, (pN - origin))) < 0:
-        n = -n
-
-    return origin, n
-
-
-def _tri_area_3d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    return 0.5 * float(np.linalg.norm(np.cross(b - a, c - a)))
 
 
 def _mean_region_z_aligned(landmarks, indices: List[int], w: int, h: int,
@@ -433,7 +421,7 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
     # 配置参数
     BASELINE_FRAMES = getattr(THR, 'BLOW_CHEEK_BASELINE_FRAMES', 10)
-    MOUTH_SEAL_THR = THR.MOUTH_SEAL
+    MOUTH_HEIGHT_THR = THR.MOUTH_HEIGHT
 
     # 辅助函数
     def _get_rel_z(lm, region_indices):
@@ -442,13 +430,13 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
         region_z = np.mean([p[2] for p in region_pts_3d])
         return region_z - nose_z
 
-    def _get_seal_norm(lm, icd):
+    def _get_mouth_height_norm(lm, icd):
         upper = pt2d(lm[LM.LIP_TOP], w, h)
         lower = pt2d(lm[LM.LIP_BOT], w, h)
         return dist(upper, lower) / max(icd, 1e-9)
 
     # 扫描所有帧
-    icd_arr, left_rel_z, right_rel_z, seal_norm = [np.nan] * n, [np.nan] * n, [np.nan] * n, [np.nan] * n
+    icd_arr, left_rel_z, right_rel_z, mouth_height_norm = [np.nan] * n, [np.nan] * n, [np.nan] * n, [np.nan] * n
     for i, lm in enumerate(landmarks_seq):
         if lm is None: continue
         try:
@@ -456,7 +444,7 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
             icd_arr[i] = icd
             left_rel_z[i] = _get_rel_z(lm, LM.BLOW_CHEEK_L)
             right_rel_z[i] = _get_rel_z(lm, LM.BLOW_CHEEK_R)
-            seal_norm[i] = _get_seal_norm(lm, icd)
+            mouth_height_norm[i] = _get_mouth_height_norm(lm, icd)
         except Exception:
             continue
 
@@ -483,7 +471,7 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
             score[i] = max(left_bulge[i], right_bulge[i])
 
     # 门控：嘴唇闭合
-    valid = np.isfinite(seal_norm) & (np.array(seal_norm) <= MOUTH_SEAL_THR)
+    valid = np.isfinite(mouth_height_norm) & (np.array(mouth_height_norm) <= MOUTH_HEIGHT_THR)
 
     # 选峰值
     peak_idx = 0
@@ -499,6 +487,12 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "left_bulge": left_bulge,
         "right_bulge": right_bulge,
         "score": score,
+        # 门控曲线
+        "mouth_height_norm": [float(v) if np.isfinite(v) else None for v in mouth_height_norm],
+        # 阈值
+        "thresholds": {
+            "mouth_height_thr": float(MOUTH_HEIGHT_THR),
+        },
         "valid": [bool(v) for v in valid],
         "peak_idx": peak_idx,
         "baseline": {"left_rel_z": base_l_rel_z, "right_rel_z": base_r_rel_z},
@@ -1006,21 +1000,13 @@ def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: i
     """可视化鼓腮指标 - 字体放大版"""
     img = frame.copy()
 
+    # 添加患侧标签
+    img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
+
     # ========== 添加面中线绘制 ==========
     midline = compute_face_midline(landmarks, w, h)
     if midline:
         img = draw_face_midline(img, midline, color=(0, 255, 255), thickness=2, dashed=True)
-
-    # 字体参数
-    FONT = cv2.FONT_HERSHEY_SIMPLEX
-    FONT_SCALE_TITLE = 1.4
-    FONT_SCALE_NORMAL = 0.9
-    THICKNESS_TITLE = 3
-    THICKNESS_NORMAL = 2
-    LINE_HEIGHT = 50
-
-    # 患侧标签
-    img = draw_palsy_side_label(img, palsy_detection, x=20, y=70, font_scale=1.4)
 
     # 画关键点
     draw_landmarks(img, landmarks, w, h, BLOW_CHEEK_VIS_INDICES, radius=2)

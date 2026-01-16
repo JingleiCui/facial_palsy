@@ -27,8 +27,8 @@ import csv
 # ========== 配置区 ==========
 BASE_DIR = "/Users/cuijinglei/Documents/facialPalsy/videos"  # 数据根目录
 
-START_PATIENT_ID = "XW000157"  # 设置为 None 则不限制
-END_PATIENT_ID = "XW000157"    # 设置为 None 则不限制
+START_PATIENT_ID = "XW000208"  # 设置为 None 则不限制
+END_PATIENT_ID = "XW000208"    # 设置为 None 则不限制
 
 DO_DELETE = True           # True: 真实删除未引用视频
 OVERWRITE_JSON = True     # True: 覆盖原 JSON；False: 写 .filtered.json
