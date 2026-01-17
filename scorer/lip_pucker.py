@@ -553,72 +553,159 @@ def compute_lip_pucker_metrics(landmarks, w: int, h: int,
     return metrics
 
 
+# def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
+#     """
+#     从撅嘴动作检测面瘫侧别 - 基于嘴唇中心偏移（不依赖baseline）
+#
+#     原理:
+#     - 撅嘴时，健侧肌肉收缩有力，患侧无力
+#     - 嘴唇被健侧拉向健侧方向
+#     - 嘴唇中心偏向患者哪侧 → 那侧是健侧 → 对侧是患侧
+#
+#     判断方法:
+#     - 使用嘴唇中心相对面中线的偏移（offset_norm）
+#     - 正偏移（偏向图像右侧=患者左侧）→ 患者左侧健侧 → 患者右侧面瘫
+#     - 负偏移（偏向图像左侧=患者右侧）→ 患者右侧健侧 → 患者左侧面瘫
+#     """
+#     result = {
+#         "palsy_side": 0,
+#         "confidence": 0.0,
+#         "interpretation": "",
+#         "method": "lip_offset",
+#         "evidence": {}
+#     }
+#
+#     # ========== 获取偏移数据 ==========
+#     lip_offset = metrics.get("lip_midline_offset", {})
+#     current_offset = lip_offset.get("current_signed_dist", lip_offset.get("current_offset", 0)) or 0
+#     offset_norm = abs(lip_offset.get("offset_norm", 0) or 0)
+#     icd = lip_offset.get("icd", 1) or 1
+#
+#     # ========== 辅助：嘴唇中线角度（作为弱证据）==========
+#     lip_angle = metrics.get("lip_midline_angle", {})
+#     angle = lip_angle.get("angle", 0) or 0
+#     angle_direction = lip_angle.get("direction", "center")
+#
+#     result["evidence"] = {
+#         "current_offset": current_offset,
+#         "offset_norm": offset_norm,
+#         "icd": icd,
+#         "midline_angle": angle,
+#         "angle_direction": angle_direction,
+#     }
+#
+#     # ========== 判断逻辑 ==========
+#     OFFSET_THRESHOLD = getattr(THR, 'LIP_PUCKER_OFFSET_NORM_THR', 0.02)
+#
+#     # 计算置信度（基于偏移大小）
+#     result["confidence"] = min(1.0, offset_norm / 0.05)  # 5%偏移 -> 100%置信度
+#
+#     if offset_norm < OFFSET_THRESHOLD:
+#         # 偏移很小，认为对称
+#         result["palsy_side"] = 0
+#         result["interpretation"] = (
+#             f"嘴唇中心居中 (偏移={current_offset:+.1f}px, {offset_norm:.1%})"
+#         )
+#     elif current_offset > 0:
+#         # 正偏移 = 偏向图像右侧 = 偏向患者左侧 = 患者左侧健侧 = 患者右侧面瘫
+#         result["palsy_side"] = 2
+#         result["interpretation"] = (
+#             f"嘴唇偏向患者左侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 右侧面瘫"
+#         )
+#     else:
+#         # 负偏移 = 偏向图像左侧 = 偏向患者右侧 = 患者右侧健侧 = 患者左侧面瘫
+#         result["palsy_side"] = 1
+#         result["interpretation"] = (
+#             f"嘴唇偏向患者右侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 左侧面瘫"
+#         )
+#
+#     return result
+
+
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从撅嘴动作检测面瘫侧别 - 基于嘴唇中心偏移（不依赖baseline）
+    LipPucker 侧别判定（弱证据，不依赖 baseline）：
 
-    原理:
-    - 撅嘴时，健侧肌肉收缩有力，患侧无力
-    - 嘴唇被健侧拉向健侧方向
-    - 嘴唇中心偏向患者哪侧 → 那侧是健侧 → 对侧是患侧
+    1) 动作门控：必须真的“撅嘴”——用 width_ratio 判断
+       - width_ratio <= THR.LIP_PUCKER_WIDTH_RATIO_MAX 才认为动作有效
+       - 否则直接 Sym(0)
 
-    判断方法:
-    - 使用嘴唇中心相对面中线的偏移（offset_norm）
-    - 正偏移（偏向图像右侧=患者左侧）→ 患者左侧健侧 → 患者右侧面瘫
-    - 负偏移（偏向图像左侧=患者右侧）→ 患者右侧健侧 → 患者左侧面瘫
+    2) 侧别证据（任一满足即可）：
+       - offset_norm >= THR.LIP_PUCKER_OFFSET_THRESHOLD （% ICD）
+       - abs(angle_deg) >= THR.LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD
+
+    3) 侧别方向优先用current_offset 符号，其次用 angle_direction
     """
+
+    # lip offset / angle
+    lip_offset = metrics.get("lip_midline_offset", {}) or {}
+    current_offset = float(lip_offset.get("current_offset", 0.0) or 0.0)
+    offset_norm = float(abs(lip_offset.get("offset_norm", 0.0) or 0.0))
+    thr_offset= THR.LIP_PUCKER_OFFSET_THRESHOLD
+
+    lip_angle = metrics.get("lip_midline_angle", {}) or {}
+    angle = float(lip_angle.get("angle", 0.0) or 0.0)  # 角度已是正值幅度
+    angle_direction = str(lip_angle.get("direction", "center") or "center")
+    thr_angle = THR.LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD
+
+    evidence_used = {
+        "current_offset_px": current_offset,
+        "offset_norm": offset_norm,
+        "thr_offset_norm": thr_offset,
+        "midline_angle_deg": angle,
+        "angle_direction": angle_direction,
+        "thr_angle_deg": thr_angle,
+    }
+
     result = {
         "palsy_side": 0,
         "confidence": 0.0,
         "interpretation": "",
-        "method": "lip_offset",
-        "evidence": {}
+        "method": "lip_offset_weak",
+        "evidence": evidence_used,
+        "evidence_used": evidence_used,
+        "evidence_dump": {
+            "lip_midline_offset": lip_offset,
+            "lip_midline_angle": lip_angle,
+            "corner_contraction_asymmetry": metrics.get("corner_contraction_asymmetry", None),
+            "left_corner_contraction": metrics.get("left_corner_contraction", None),
+            "right_corner_contraction": metrics.get("right_corner_contraction", None),
+        }
     }
 
-    # ========== 获取偏移数据 ==========
-    lip_offset = metrics.get("lip_midline_offset", {})
-    current_offset = lip_offset.get("current_signed_dist", lip_offset.get("current_offset", 0)) or 0
-    offset_norm = abs(lip_offset.get("offset_norm", 0) or 0)
-    icd = lip_offset.get("icd", 1) or 1
+    # 侧别触发条件
+    trig_offset = (offset_norm >= thr_offset)
+    trig_angle = (angle >= thr_angle)
 
-    # ========== 辅助：嘴唇中线角度（作为弱证据）==========
-    lip_angle = metrics.get("lip_midline_angle", {})
-    angle = lip_angle.get("angle", 0) or 0
-    angle_direction = lip_angle.get("direction", "center")
-
-    result["evidence"] = {
-        "current_offset": current_offset,
-        "offset_norm": offset_norm,
-        "icd": icd,
-        "midline_angle": angle,
-        "angle_direction": angle_direction,
-    }
-
-    # ========== 判断逻辑 ==========
-    OFFSET_THRESHOLD = getattr(THR, 'LIP_PUCKER_OFFSET_NORM_THR', 0.02)
-
-    # 计算置信度（基于偏移大小）
-    result["confidence"] = min(1.0, offset_norm / 0.05)  # 5%偏移 -> 100%置信度
-
-    if offset_norm < OFFSET_THRESHOLD:
-        # 偏移很小，认为对称
+    if not (trig_offset or trig_angle):
         result["palsy_side"] = 0
-        result["interpretation"] = (
-            f"嘴唇中心居中 (偏移={current_offset:+.1f}px, {offset_norm:.1%})"
-        )
-    elif current_offset > 0:
-        # 正偏移 = 偏向图像右侧 = 偏向患者左侧 = 患者左侧健侧 = 患者右侧面瘫
-        result["palsy_side"] = 2
-        result["interpretation"] = (
-            f"嘴唇偏向患者左侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 右侧面瘫"
-        )
-    else:
-        # 负偏移 = 偏向图像左侧 = 偏向患者右侧 = 患者右侧健侧 = 患者左侧面瘫
-        result["palsy_side"] = 1
-        result["interpretation"] = (
-            f"嘴唇偏向患者右侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 左侧面瘫"
-        )
+        # 置信度：离阈值的比例
+        conf = max(offset_norm / max(thr_offset, 1e-6), angle / max(thr_angle, 1e-6))
+        result["confidence"] = float(min(1.0, conf) * 0.6)  # 弱证据整体降权
+        result["interpretation"] = f"撅嘴有效，但中线偏移/角度不足以判侧别 → 对称"
+        return result
 
+    # 判方向：优先用 current_offset 符号
+    if current_offset != 0:
+        if current_offset > 0:
+            result["palsy_side"] = 2
+            result["interpretation"] = f"嘴唇偏向患者左侧(offset={current_offset:+.1f}px, norm={offset_norm:.3f}) → 右侧面瘫(弱证据)"
+        else:
+            result["palsy_side"] = 1
+            result["interpretation"] = f"嘴唇偏向患者右侧(offset={current_offset:+.1f}px, norm={offset_norm:.3f}) → 左侧面瘫(弱证据)"
+    else:
+        # 回退用 angle_direction
+        if angle_direction == "left":
+            # 你现有注释：direction="left" => 向患者右侧倾斜 => 左侧面瘫
+            result["palsy_side"] = 1
+            result["interpretation"] = f"嘴唇中线向患者右侧倾斜(angle={angle:.1f}°, dir=left) → 左侧面瘫(弱证据)"
+        else:
+            result["palsy_side"] = 2
+            result["interpretation"] = f"嘴唇中线向患者左侧倾斜(angle={angle:.1f}°, dir=right) → 右侧面瘫(弱证据)"
+
+    # 置信度：offset/angle 触发强度综合（并整体降权）
+    conf_raw = max(offset_norm / max(thr_offset, 1e-6), angle / max(thr_angle, 1e-6))
+    result["confidence"] = float(min(1.0, conf_raw) * 0.6)
     return result
 
 
@@ -879,6 +966,30 @@ def visualize_lip_pucker(frame: np.ndarray, landmarks, w: int, h: int,
                     cv2.putText(img, f"{direction}{dist_val:.0f}",
                                 (mid_x + 3, mid_y - 5),
                                 FONT, FONT_SCALE_SMALL, offset_color, THICKNESS_THIN)
+
+    # ========== 绘制嘴唇中线（从上唇中点到下唇中点）==========
+    lip_top = pt2d(landmarks[LM.LIP_TOP_CENTER], w, h)
+    lip_bot = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)
+
+    # 绘制唇中线（青色粗线）
+    cv2.line(img,
+             (int(lip_top[0]), int(lip_top[1])),
+             (int(lip_bot[0]), int(lip_bot[1])),
+             (255, 255, 0), 3)  # 青色
+
+    # 标注端点
+    cv2.circle(img, (int(lip_top[0]), int(lip_top[1])), 5, (255, 255, 0), -1)
+    cv2.circle(img, (int(lip_bot[0]), int(lip_bot[1])), 5, (255, 255, 0), -1)
+
+    # 计算并显示角度
+    lip_angle = metrics.get("lip_midline_angle", {})
+    angle_deg = lip_angle.get("angle", 0)
+    direction = lip_angle.get("direction", "center")
+    if angle_deg > 0.1:
+        mid_x = (int(lip_top[0]) + int(lip_bot[0])) // 2
+        mid_y = (int(lip_top[1]) + int(lip_bot[1])) // 2
+        cv2.putText(img, f"Lip Line: {angle_deg:.1f}° ({direction})",
+                    (mid_x + 10, mid_y), FONT, 0.5, (255, 255, 0), 2)
 
     return img
 

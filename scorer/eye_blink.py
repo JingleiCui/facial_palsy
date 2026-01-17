@@ -22,12 +22,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from clinical_base import (
-    LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
-    compute_palpebral_height, compute_mouth_metrics,
-    compute_oral_angle, compute_icd, extract_common_indicators,
+    LM, compute_ear, compute_eye_area, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
     add_valid_region_shading, get_palsy_side_text,
-    compute_eye_closure_by_area, draw_palsy_side_label, draw_palsy_annotation_header,
+    compute_eye_closure_by_area, draw_palsy_annotation_header,
 )
 
 from thresholds import THR
@@ -36,10 +34,10 @@ from thresholds import THR
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # 字体大小
-FONT_SCALE_TITLE = 1.4      # 标题
-FONT_SCALE_LARGE = 1.2      # 大号文字
-FONT_SCALE_NORMAL = 0.9     # 正常文字
-FONT_SCALE_SMALL = 0.7      # 小号文字
+FONT_SCALE_TITLE = 1.4  # 标题
+FONT_SCALE_LARGE = 1.2  # 大号文字
+FONT_SCALE_NORMAL = 0.9  # 正常文字
+FONT_SCALE_SMALL = 0.7  # 小号文字
 
 # 线条粗细
 THICKNESS_TITLE = 3
@@ -101,31 +99,6 @@ def find_peak_frame_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
         return min_idx
 
 
-def extract_ear_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, List[float]]:
-    """提取整个序列的EAR值"""
-    left_ear_seq = []
-    right_ear_seq = []
-    avg_ear_seq = []
-
-    for lm in landmarks_seq:
-        if lm is None:
-            left_ear_seq.append(np.nan)
-            right_ear_seq.append(np.nan)
-            avg_ear_seq.append(np.nan)
-        else:
-            l_ear = compute_ear(lm, w, h, True)
-            r_ear = compute_ear(lm, w, h, False)
-            left_ear_seq.append(l_ear)
-            right_ear_seq.append(r_ear)
-            avg_ear_seq.append((l_ear + r_ear) / 2)
-
-    return {
-        "left": left_ear_seq,
-        "right": right_ear_seq,
-        "average": avg_ear_seq
-    }
-
-
 def extract_eye_area_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, List[float]]:
     """提取整个序列的眼睛面积"""
     left_area_seq = []
@@ -150,7 +123,10 @@ def extract_eye_area_sequence(landmarks_seq: List, w: int, h: int) -> Dict[str, 
 def compute_closure_sequence(landmarks_seq: List, w: int, h: int,
                              baseline_landmarks=None) -> Dict[str, Any]:
     """
-    计算整个视频序列的眼睛闭合度（基于面积）
+    计算整个视频序列的眼睛闭合度和睁眼度（基于面积）
+
+    openness = scaled_area / baseline_area  (1=完全睁开, 0=完全闭合)
+    closure = 1 - openness
     """
     n = len(landmarks_seq)
 
@@ -158,6 +134,8 @@ def compute_closure_sequence(landmarks_seq: List, w: int, h: int,
     right_area_seq = []
     left_closure_seq = []
     right_closure_seq = []
+    left_openness_seq = []
+    right_openness_seq = []
 
     if baseline_landmarks is not None:
         baseline_left_area, _ = compute_eye_area(baseline_landmarks, w, h, True)
@@ -188,11 +166,10 @@ def compute_closure_sequence(landmarks_seq: List, w: int, h: int,
             right_area_seq.append(np.nan)
             left_closure_seq.append(np.nan)
             right_closure_seq.append(np.nan)
+            left_openness_seq.append(np.nan)
+            right_openness_seq.append(np.nan)
         else:
-            if baseline_landmarks is not None:
-                scale = compute_scale_to_baseline(lm, baseline_landmarks, w, h)
-            else:
-                scale = 1.0
+            scale = compute_scale_to_baseline(lm, baseline_landmarks, w, h) if baseline_landmarks else 1.0
 
             l_area, _ = compute_eye_area(lm, w, h, True)
             r_area, _ = compute_eye_area(lm, w, h, False)
@@ -203,15 +180,20 @@ def compute_closure_sequence(landmarks_seq: List, w: int, h: int,
             left_area_seq.append(float(scaled_l))
             right_area_seq.append(float(scaled_r))
 
-            l_closure = 1.0 - (scaled_l / baseline_left_area)
-            r_closure = 1.0 - (scaled_r / baseline_right_area)
+            # 直接计算睁眼度
+            l_openness = scaled_l / baseline_left_area
+            r_openness = scaled_r / baseline_right_area
 
-            left_closure_seq.append(float(max(0, min(1, l_closure))))
-            right_closure_seq.append(float(max(0, min(1, r_closure))))
+            left_openness_seq.append(float(max(0, min(2, l_openness))))
+            right_openness_seq.append(float(max(0, min(2, r_openness))))
+            left_closure_seq.append(float(max(0, min(1, 1.0 - l_openness))))
+            right_closure_seq.append(float(max(0, min(1, 1.0 - r_openness))))
 
     return {
         "left_closure": left_closure_seq,
         "right_closure": right_closure_seq,
+        "left_openness": left_openness_seq,
+        "right_openness": right_openness_seq,
         "left_area": left_area_seq,
         "right_area": right_area_seq,
         "baseline_left_area": float(baseline_left_area),
@@ -220,8 +202,7 @@ def compute_closure_sequence(landmarks_seq: List, w: int, h: int,
     }
 
 
-def analyze_blink_dynamics(ear_seq: Dict[str, List[float]],
-                           area_seq: Dict[str, List[float]],
+def analyze_blink_dynamics(area_seq: Dict[str, List[float]],
                            fps: float,
                            baseline_left_area: float = None,
                            baseline_right_area: float = None,
@@ -440,8 +421,7 @@ def detect_synkinesis_from_blink(baseline_result: Optional[ActionResult],
     return synkinesis
 
 
-def plot_ear_curve(ear_seq: Dict[str, List[float]],
-                   area_seq: Dict[str, List[float]],
+def plot_eye_curve(area_seq: Dict[str, List[float]],
                    fps: float,
                    peak_idx: int,
                    output_path: Path,
@@ -491,44 +471,39 @@ def plot_ear_curve(ear_seq: Dict[str, List[float]],
         ax1.text(0.02, 0.98, info_text, transform=ax1.transAxes, fontsize=10,
                  verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
-    # ========== 下图: 眼睛闭合度 ==========
+    # ========== 下图: 眼睛睁眼度 ==========
     ax2 = axes[1]
 
     if closure_data is not None:
-        left_closure = closure_data.get("left_closure", [])
-        right_closure = closure_data.get("right_closure", [])
+        left_openness = closure_data.get("left_openness", [])
+        right_openness = closure_data.get("right_openness", [])
 
-        if len(left_closure) > 0 and len(right_closure) > 0:
+        if len(left_openness) > 0 and len(right_openness) > 0:
             if valid_mask is not None:
                 add_valid_region_shading(ax2, valid_mask, time_sec)
 
-            ax2.plot(time_sec, left_closure, 'b-', label='Left Eye Closure', linewidth=2)
-            ax2.plot(time_sec, right_closure, 'r-', label='Right Eye Closure', linewidth=2)
+            ax2.plot(time_sec, left_openness, 'b-', label='Left Eye Openness', linewidth=2)
+            ax2.plot(time_sec, right_openness, 'r-', label='Right Eye Openness', linewidth=2)
 
-            avg_closure = [(l + r) / 2 if (np.isfinite(l) and np.isfinite(r)) else np.nan
-                           for l, r in zip(left_closure, right_closure)]
-            ax2.plot(time_sec, avg_closure, 'g--', label='Average Closure', linewidth=1.5, alpha=0.7)
+            avg_openness = [(l + r) / 2 if (np.isfinite(l) and np.isfinite(r)) else np.nan
+                            for l, r in zip(left_openness, right_openness)]
+            ax2.plot(time_sec, avg_openness, 'g--', label='Average', linewidth=1.5, alpha=0.7)
 
-            ax2.axvline(x=peak_time, color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
-            ax2.axhline(y=0.85, color='green', linestyle=':', alpha=0.5, label='Complete (85%)')
-            ax2.axhline(y=0.20, color='orange', linestyle=':', alpha=0.5, label='Threshold (20%)')
+            ax2.axvline(x=peak_time, color='k', linestyle='--', alpha=0.5, label=f'Peak ({peak_idx})')
+            ax2.axhline(y=0.15, color='red', linestyle=':', alpha=0.5, label='Closed (<15%)')
+            ax2.axhline(y=0.80, color='green', linestyle=':', alpha=0.5, label='Open (>80%)')
 
-            ax2.set_ylim(0, 1.1)
-            ax2.set_ylabel('Closure Ratio (1=fully closed)', fontsize=11)
+            ax2.set_ylim(-0.05, 1.2)
+            ax2.set_ylabel('Openness (0=closed, 1=open)', fontsize=11)
 
-            if 0 <= peak_idx < len(left_closure):
-                left_peak = left_closure[peak_idx] if np.isfinite(left_closure[peak_idx]) else 0
-                right_peak = right_closure[peak_idx] if np.isfinite(right_closure[peak_idx]) else 0
-                info_text = f"Peak: L={left_peak:.1%}, R={right_peak:.1%}"
-                ax2.text(0.02, 0.98, info_text, transform=ax2.transAxes, fontsize=10,
-                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-    else:
-        ax2.plot(time_sec, ear_seq["left"], 'b-', label='Left EAR (ref)', linewidth=1.5, alpha=0.7)
-        ax2.plot(time_sec, ear_seq["right"], 'r-', label='Right EAR (ref)', linewidth=1.5, alpha=0.7)
-        ax2.axvline(x=peak_time, color='k', linestyle='--', alpha=0.5)
-        ax2.set_ylabel('EAR (reference)', fontsize=11)
+            if 0 <= peak_idx < len(left_openness):
+                lp = left_openness[peak_idx] if np.isfinite(left_openness[peak_idx]) else 0
+                rp = right_openness[peak_idx] if np.isfinite(right_openness[peak_idx]) else 0
+                ax2.text(0.02, 0.98, f"Peak: L={lp:.1%}, R={rp:.1%}", transform=ax2.transAxes,
+                         fontsize=10, verticalalignment='top',
+                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
-    ax2.set_title(f'{action_name} - Eye Closure Over Time', fontsize=13)
+    ax2.set_title(f'{action_name} - Eye Openness Over Time', fontsize=13)
     ax2.set_xlabel(x_label, fontsize=11)
     ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
@@ -663,8 +638,6 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
     )
 
     extract_common_indicators(peak_landmarks, w, h, result)
-
-    ear_seq = extract_ear_sequence(landmarks_seq, w, h)
     area_seq = extract_eye_area_sequence(landmarks_seq, w, h)
 
     # 计算闭合度序列
@@ -681,7 +654,7 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
                 scale_seq.append(1.0)
 
     dynamics = analyze_blink_dynamics(
-        ear_seq, area_seq, fps,
+        area_seq, fps,
         baseline_left_area, baseline_right_area,
         scale_seq
     )
@@ -704,11 +677,6 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
     result.action_specific = {
         "blink_dynamics": dynamics,
         "peak_closure_data": peak_closure_data,
-        "ear_sequence": {
-            "left": [float(x) if not np.isnan(x) else None for x in ear_seq["left"]],
-            "right": [float(x) if not np.isnan(x) else None for x in ear_seq["right"]],
-            "average": [float(x) if not np.isnan(x) else None for x in ear_seq["average"]],
-        },
         "eye_area_sequence": {
             "left": [float(x) if not np.isnan(x) else None for x in area_seq["left"]],
             "right": [float(x) if not np.isnan(x) else None for x in area_seq["right"]],
@@ -716,6 +684,14 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
         "closure_sequence": {
             "left": [float(v) if np.isfinite(v) else None for v in closure_data["left_closure"]],
             "right": [float(v) if np.isfinite(v) else None for v in closure_data["right_closure"]],
+        },
+        "openness_sequence": {
+            "left": [float(v) if np.isfinite(v) else None for v in closure_data["left_openness"]],
+            "right": [float(v) if np.isfinite(v) else None for v in closure_data["right_openness"]],
+        },
+        "baseline_areas": {
+            "left": closure_data["baseline_left_area"],
+            "right": closure_data["baseline_right_area"],
         },
         "synkinesis": synkinesis,
         "palsy_detection": palsy_detection,
@@ -733,7 +709,7 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis_indicators)
 
     # 绘制曲线 - 上边面积，下边闭合度
-    plot_ear_curve(ear_seq, area_seq, fps, peak_idx,
+    plot_eye_curve(area_seq, fps, peak_idx,
                    action_dir / "peak_selection_curve.png", action_name,
                    closure_data=closure_data,
                    palsy_detection=palsy_detection)
@@ -742,8 +718,10 @@ def _process_blink(landmarks_seq: List, frames_seq: List, w: int, h: int,
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
-    print(f"    [OK] {action_name}: Area L={peak_closure_data.get('left_area', 0):.0f} R={peak_closure_data.get('right_area', 0):.0f}")
-    print(f"         Closure: L={dynamics.get('left_closure_ratio', 0) * 100:.1f}% R={dynamics.get('right_closure_ratio', 0) * 100:.1f}%")
+    print(
+        f"    [OK] {action_name}: Area L={peak_closure_data.get('left_area', 0):.0f} R={peak_closure_data.get('right_area', 0):.0f}")
+    print(
+        f"         Closure: L={dynamics.get('left_closure_ratio', 0) * 100:.1f}% R={dynamics.get('right_closure_ratio', 0) * 100:.1f}%")
     print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
 
     return result

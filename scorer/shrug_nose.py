@@ -24,11 +24,13 @@ from typing import Dict, List, Optional, Any, Tuple
 import json
 
 from clinical_base import (
-    LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
-    compute_mouth_metrics, compute_icd, extract_common_indicators,
-    ActionResult, draw_polygon, compute_scale_to_baseline,
+    LM, pt2d, dist, compute_ear,
+    compute_mouth_metrics, extract_common_indicators,
+    ActionResult, compute_scale_to_baseline,
     compute_nose_midline_symmetry, compute_ala_canthus_change,
-draw_palsy_annotation_header,
+    draw_palsy_annotation_header,
+    compute_face_midline, draw_face_midline,
+    compute_ala_to_canthus_distance,
 )
 
 from thresholds import THR
@@ -55,22 +57,6 @@ LINE_HEIGHT = 45
 LINE_HEIGHT_SMALL = 30
 
 
-def compute_ala_to_canthus_distance(landmarks, w: int, h: int, left: bool = True) -> float:
-    """
-    计算鼻翼点到同侧眼角内眦点的距离
-
-    皱鼻动作时，鼻翼上提，此距离变小
-    """
-    if left:
-        ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
-        canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
-    else:
-        ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
-        canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
-
-    return dist(ala, canthus)
-
-
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
                     baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
     """
@@ -83,8 +69,6 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
     Returns:
         (peak_idx, peak_debug): 峰值帧索引和调试信息
     """
-    from clinical_base import compute_ala_to_canthus_distance
-
     n_frames = len(landmarks_seq)
     if n_frames == 0:
         return 0, {"error": "empty_sequence"}
@@ -600,6 +584,11 @@ def visualize_shrug_nose(frame: np.ndarray, landmarks, w: int, h: int,
                          palsy_detection: Dict[str, Any]) -> np.ndarray:
     """可视化皱鼻指标"""
     img = frame.copy()
+
+    # ========== 绘制面中线 ==========
+    midline = compute_face_midline(landmarks, w, h)
+    if midline:
+        img = draw_face_midline(img, midline, color=(0, 255, 255), thickness=2, dashed=True)
 
     # 获取点坐标
     points = metrics.get("points", {})

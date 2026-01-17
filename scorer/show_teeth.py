@@ -360,65 +360,132 @@ def compute_show_teeth_metrics(landmarks, w: int, h: int,
     return metrics
 
 
+# def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
+#     """
+#     从露齿动作检测面瘫侧别 - 基于嘴唇中心偏移（不依赖baseline）
+#
+#     原理:
+#     - 露齿时，健侧肌肉有力，把嘴唇拉向健侧
+#     - 嘴唇中心偏向患者哪侧 → 那侧是健侧 → 对侧是患侧
+#
+#     判断方法:
+#     - 使用嘴唇中心相对面中线的偏移（offset_norm）
+#     - 正偏移（偏向图像右侧=患者左侧）→ 患者左侧健侧 → 患者右侧面瘫
+#     - 负偏移（偏向图像左侧=患者右侧）→ 患者右侧健侧 → 患者左侧面瘫
+#     """
+#     result = {
+#         "palsy_side": 0,
+#         "confidence": 0.0,
+#         "interpretation": "",
+#         "method": "lip_offset",
+#         "evidence": {}
+#     }
+#
+#     # ========== 获取偏移数据 ==========
+#     lip_offset = metrics.get("lip_midline_offset", {})
+#     current_offset = lip_offset.get("current_signed_dist", lip_offset.get("current_offset", 0)) or 0
+#     offset_norm = abs(lip_offset.get("offset_norm", 0) or 0)
+#     icd = lip_offset.get("icd", 1) or 1
+#
+#     result["evidence"] = {
+#         "current_offset": current_offset,
+#         "offset_norm": offset_norm,
+#         "icd": icd,
+#     }
+#
+#     # ========== 判断逻辑 ==========
+#     OFFSET_THRESHOLD = getattr(THR, 'SHOW_TEETH_OFFSET_NORM_THR', 0.02)
+#
+#     # 计算置信度（基于偏移大小）
+#     result["confidence"] = min(1.0, offset_norm / 0.05)  # 5%偏移 -> 100%置信度
+#
+#     if offset_norm < OFFSET_THRESHOLD:
+#         # 偏移很小，认为对称
+#         result["palsy_side"] = 0
+#         result["interpretation"] = (
+#             f"嘴唇中心居中 (偏移={current_offset:+.1f}px, {offset_norm:.1%})"
+#         )
+#     elif current_offset > 0:
+#         # 正偏移 = 偏向图像右侧 = 偏向患者左侧 = 患者左侧健侧 = 患者右侧面瘫
+#         result["palsy_side"] = 2
+#         result["interpretation"] = (
+#             f"嘴唇偏向患者左侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 右侧面瘫"
+#         )
+#     else:
+#         # 负偏移 = 偏向图像左侧 = 偏向患者右侧 = 患者右侧健侧 = 患者左侧面瘫
+#         result["palsy_side"] = 1
+#         result["interpretation"] = (
+#             f"嘴唇偏向患者右侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 左侧面瘫"
+#         )
+#
+#     return result
+
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从露齿动作检测面瘫侧别 - 基于嘴唇中心偏移（不依赖baseline）
+    ShowTeeth 侧别判定（不依赖 baseline）：
 
-    原理:
-    - 露齿时，健侧肌肉有力，把嘴唇拉向健侧
-    - 嘴唇中心偏向患者哪侧 → 那侧是健侧 → 对侧是患侧
+    主指标：嘴唇中线相对面中线的偏移（offset_norm = abs(current_offset)/ICD）
+    - offset_norm < THR.SHOW_TEETH_OFFSET_THRESHOLD => Sym(0)
+    - current_offset > 0（偏向患者左侧/健侧）=> 右侧面瘫(2)
+    - current_offset < 0（偏向患者右侧/健侧）=> 左侧面瘫(1)
 
-    判断方法:
-    - 使用嘴唇中心相对面中线的偏移（offset_norm）
-    - 正偏移（偏向图像右侧=患者左侧）→ 患者左侧健侧 → 患者右侧面瘫
-    - 负偏移（偏向图像左侧=患者右侧）→ 患者右侧健侧 → 患者左侧面瘫
+    注意：current_offset 的定义在 clinical_base.py 中已固定：
+      current_offset = lip_midline_x - face_midline_x
+      正值：偏向患者左侧；负值：偏向患者右侧
     """
+    lip_offset = metrics.get("lip_midline_offset", {}) or {}
+
+    current_offset = float(lip_offset.get("current_offset", 0.0) or 0.0)
+    offset_norm = lip_offset.get("offset_norm", None)
+    if offset_norm is None:
+        # 兼容有 baseline 时可能只写了 offset_change_norm
+        offset_norm = float(lip_offset.get("offset_change_norm", 0.0) or 0.0)
+    else:
+        offset_norm = float(offset_norm)
+
+    thr = THR.SHOW_TEETH_OFFSET_THRESHOLD
+
+    evidence_used = {
+        "current_offset_px": current_offset,
+        "offset_norm": offset_norm,
+        "thr_offset_norm": thr,
+    }
+
+    # 兼容旧统计脚本：evidence 仍然给 used
     result = {
         "palsy_side": 0,
         "confidence": 0.0,
         "interpretation": "",
-        "method": "lip_offset",
-        "evidence": {}
+        "method": "lip_offset_norm",
+        "evidence": evidence_used,
+        "evidence_used": evidence_used,
+        "evidence_dump": {
+            "lip_midline_offset": lip_offset,
+            "lip_midline_angle": metrics.get("lip_midline_angle", {}),
+            "oral_angle": metrics.get("oral_angle", {}),
+            "excursion": metrics.get("excursion", {}),
+        }
     }
 
-    # ========== 获取偏移数据 ==========
-    lip_offset = metrics.get("lip_midline_offset", {})
-    current_offset = lip_offset.get("current_signed_dist", lip_offset.get("current_offset", 0)) or 0
-    offset_norm = abs(lip_offset.get("offset_norm", 0) or 0)
-    icd = lip_offset.get("icd", 1) or 1
-
-    result["evidence"] = {
-        "current_offset": current_offset,
-        "offset_norm": offset_norm,
-        "icd": icd,
-    }
-
-    # ========== 判断逻辑 ==========
-    OFFSET_THRESHOLD = getattr(THR, 'SHOW_TEETH_OFFSET_NORM_THR', 0.02)
-
-    # 计算置信度（基于偏移大小）
-    result["confidence"] = min(1.0, offset_norm / 0.05)  # 5%偏移 -> 100%置信度
-
-    if offset_norm < OFFSET_THRESHOLD:
-        # 偏移很小，认为对称
+    # 对称
+    if offset_norm < thr:
         result["palsy_side"] = 0
-        result["interpretation"] = (
-            f"嘴唇中心居中 (偏移={current_offset:+.1f}px, {offset_norm:.1%})"
-        )
-    elif current_offset > 0:
-        # 正偏移 = 偏向图像右侧 = 偏向患者左侧 = 患者左侧健侧 = 患者右侧面瘫
-        result["palsy_side"] = 2
-        result["interpretation"] = (
-            f"嘴唇偏向患者左侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 右侧面瘫"
-        )
-    else:
-        # 负偏移 = 偏向图像左侧 = 偏向患者右侧 = 患者右侧健侧 = 患者左侧面瘫
-        result["palsy_side"] = 1
-        result["interpretation"] = (
-            f"嘴唇偏向患者右侧 (偏移={current_offset:+.1f}px, {offset_norm:.1%}) → 左侧面瘫"
-        )
+        result["confidence"] = min(1.0, offset_norm / max(thr, 1e-6))
+        result["interpretation"] = f"嘴唇中线偏移很小 (offset_norm={offset_norm:.4f} < {thr:.4f}) → 对称"
+        return result
 
+    # 判侧别（与 clinical_base.py 的建议一致）
+    if current_offset > 0:
+        # 偏向患者左侧 = 被左侧拉 = 左侧健侧 => 右侧面瘫
+        result["palsy_side"] = 2
+        result["interpretation"] = f"嘴唇偏向患者左侧(健侧) (offset={current_offset:+.1f}px, norm={offset_norm:.3f}) → 右侧面瘫"
+    else:
+        result["palsy_side"] = 1
+        result["interpretation"] = f"嘴唇偏向患者右侧(健侧) (offset={current_offset:+.1f}px, norm={offset_norm:.3f}) → 左侧面瘫"
+
+    result["confidence"] = min(1.0, offset_norm / max(thr, 1e-6))
     return result
+
 
 def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
     """
@@ -572,6 +639,20 @@ def visualize_show_teeth(frame: np.ndarray, landmarks, w: int, h: int,
                 mid_y = (int(lip_midline_y) + int(proj_y)) // 2
                 cv2.putText(img, f"{direction} {dist:.1f}px",
                             (mid_x + 5, mid_y - 10), FONT, 0.8, offset_color, 2)
+
+    # ========== 绘制唇中线（从上唇中点到下唇中点）==========
+    lip_top = pt2d(landmarks[LM.LIP_TOP_CENTER], w, h)
+    lip_bot = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)
+    cv2.line(img, (int(lip_top[0]), int(lip_top[1])),
+             (int(lip_bot[0]), int(lip_bot[1])), (255, 255, 0), 3)
+    cv2.circle(img, (int(lip_top[0]), int(lip_top[1])), 5, (255, 255, 0), -1)
+    cv2.circle(img, (int(lip_bot[0]), int(lip_bot[1])), 5, (255, 255, 0), -1)
+    lip_angle = metrics.get("lip_midline_angle", {})
+    if lip_angle and lip_angle.get("angle", 0) > 0.5:
+        mid_x = (int(lip_top[0]) + int(lip_bot[0])) // 2
+        mid_y = (int(lip_top[1]) + int(lip_bot[1])) // 2
+        cv2.putText(img, f"LipLine:{lip_angle['angle']:.1f}°",
+                   (mid_x + 10, mid_y), FONT, 0.5, (255, 255, 0), 2)
 
     # 绘制嘴部轮廓
     draw_polygon(img, landmarks, w, h, LM.OUTER_LIP, (0, 255, 0), 3)

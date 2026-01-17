@@ -106,7 +106,7 @@ class Thresholds:
     LIP_PUCKER_Z_DELTA: float = 0.01
 
     # LipPucker 面瘫检测阈值
-    LIP_PUCKER_OFFSET_THRESHOLD: float = 0.015  # 偏移 > 2% 判定有面瘫
+    LIP_PUCKER_OFFSET_THRESHOLD: float = 0.01  # 偏移 > % 判定有面瘫
     LIP_PUCKER_CORNER_ASYM_TRACE: float = 0.10
     LIP_PUCKER_CORNER_ASYM_MILD: float = 0.20
     LIP_PUCKER_CORNER_ASYM_MODERATE: float = 0.35
@@ -119,7 +119,7 @@ class Thresholds:
     LIP_PUCKER_PALSY_MIN_CONTRACTION: float = 1.0  # 1px即可分析
 
     # 嘴唇中线角度阈值
-    LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD: float = 1.5  # 角度>度判定偏斜
+    LIP_PUCKER_MIDLINE_ANGLE_THRESHOLD: float = 0.3  # 角度>度判定偏斜
 
     LIP_PUCKER_OFFSET_NORM_THR = 0.02
 

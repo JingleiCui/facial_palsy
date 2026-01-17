@@ -1075,6 +1075,30 @@ def visualize_blow_cheek(frame, landmarks, metrics: Dict[str, Any], w: int, h: i
                     cv2.putText(img, f"{direction} {dist:.1f}px",
                                 (mid_x + 5, mid_y - 10), FONT, 0.6, offset_color, 2)
 
+    # ========== 绘制嘴唇中线（从上唇中点到下唇中点）==========
+    lip_top = pt2d(landmarks[LM.LIP_TOP_CENTER], w, h)
+    lip_bot = pt2d(landmarks[LM.LIP_BOT_CENTER], w, h)
+
+    # 绘制唇中线（青色粗线）
+    cv2.line(img,
+             (int(lip_top[0]), int(lip_top[1])),
+             (int(lip_bot[0]), int(lip_bot[1])),
+             (255, 255, 0), 3)  # 青色
+
+    # 标注端点
+    cv2.circle(img, (int(lip_top[0]), int(lip_top[1])), 5, (255, 255, 0), -1)
+    cv2.circle(img, (int(lip_bot[0]), int(lip_bot[1])), 5, (255, 255, 0), -1)
+
+    # 计算并显示角度（如果有）
+    lip_angle = metrics.get("lip_midline_angle", {})
+    angle_deg = lip_angle.get("angle", 0)
+    direction = lip_angle.get("direction", "center")
+    if angle_deg > 0.5:
+        mid_x = (int(lip_top[0]) + int(lip_bot[0])) // 2
+        mid_y = (int(lip_top[1]) + int(lip_bot[1])) // 2
+        cv2.putText(img, f"Lip Line: {angle_deg:.1f}° ({direction})",
+                    (mid_x + 10, mid_y), FONT, 0.5, (255, 255, 0), 2)
+
     return img
 
 

@@ -28,11 +28,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from clinical_base import (
-    LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
+    LM, pt2d, dist, compute_ear,
     compute_mouth_metrics, compute_oral_angle, compute_icd,
     extract_common_indicators, compute_scale_to_baseline,
-    ActionResult, OralAngleMeasure, draw_polygon,
-    add_valid_region_shading, get_palsy_side_text,
+    ActionResult, draw_polygon, get_palsy_side_text,
     draw_palsy_side_label, compute_lip_midline_symmetry,
     compute_mouth_corner_to_eye_line_distance,
     compute_smile_excursion_by_eye_line,

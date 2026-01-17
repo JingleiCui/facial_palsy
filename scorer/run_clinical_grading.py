@@ -75,8 +75,6 @@ TARGET_PATIENT_IDS = []
 TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
-"ShowTeeth",
-"LipPucker",
 ]
 
 # ENABLED_ACTIONS = [
@@ -784,12 +782,11 @@ def generate_html_report(exam_id: str, patient_id: str,
     print(f"[OK] HTML报告已生成: {report_path}")
 
 
-def load_existing_baseline(exam_output_dir: Path) -> Tuple[Optional[ActionResult], Optional[Any]]:
+def load_baseline_from_existing_json(exam_output_dir: Path) -> Tuple[Optional[ActionResult], Optional[Any]]:
     """
-    从已有的 NeutralFace 结果加载基线
-
-    Returns:
-        (baseline_result, baseline_landmarks) 或 (None, None)
+    从已有 NeutralFace/indicators.json 加载基线数值（用于只跑部分动作时复用）
+    注意：baseline_landmarks 无法从 JSON 恢复，所以第二个返回值仍为 None。
+    但我们会把完整 baseline 数值缓存到 baseline_result.action_specific["baseline_cache"]。
     """
     neutral_dir = exam_output_dir / "NeutralFace"
     indicators_path = neutral_dir / "indicators.json"
@@ -799,32 +796,70 @@ def load_existing_baseline(exam_output_dir: Path) -> Tuple[Optional[ActionResult
         return None, None
 
     try:
-        with open(indicators_path, 'r', encoding='utf-8') as f:
+        with open(indicators_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         # 重建 ActionResult
+        img_size = data.get("image_size", {}) or {}
+        w = int(img_size.get("width", 0) or 0)
+        h = int(img_size.get("height", 0) or 0)
+
         result = ActionResult(
             action_name="NeutralFace",
             action_name_cn="静息面",
-            video_path=data.get("video_path", ""),
-            total_frames=data.get("total_frames", 0),
-            peak_frame_idx=data.get("peak_frame_idx", 0),
-            image_size=tuple(data.get("image_size", (0, 0))),
-            fps=data.get("fps", 30.0)
+            video_path=str(data.get("video_path", "") or ""),
+            total_frames=int(data.get("total_frames", 0) or 0),
+            peak_frame_idx=int(data.get("peak_frame_idx", 0) or 0),
+            image_size=(w, h),
+            fps=float(data.get("fps", 30.0) or 30.0),
         )
 
-        # 恢复关键属性
-        for key in ["left_ear", "right_ear", "left_eye_area", "right_eye_area",
-                    "mouth_width", "mouth_height", "left_brow_height", "right_brow_height",
-                    "left_nlf_length", "right_nlf_length", "brow_height_ratio",
-                    "eye_area_ratio", "nlf_ratio", "voluntary_movement_score"]:
-            if key in data:
-                setattr(result, key, data[key])
+        # icd
+        if "icd" in data:
+            result.icd = float(data["icd"] or 0.0)
 
-        print(f"    [OK] 复用已有基线: {indicators_path}")
+        # eye / brow / mouth / nlf
+        eye = data.get("eye", {}) or {}
+        brow = data.get("brow", {}) or {}
+        mouth = data.get("mouth", {}) or {}
+        nlf = data.get("nlf", {}) or {}
 
-        # 注意：baseline_landmarks 无法从 JSON 恢复
-        # 如果需要 baseline_landmarks，必须重新处理 NeutralFace
+        result.left_eye_area = float(eye.get("left_area", 0.0) or 0.0)
+        result.right_eye_area = float(eye.get("right_area", 0.0) or 0.0)
+        result.eye_area_ratio = float(eye.get("area_ratio", 1.0) or 1.0)
+        result.left_ear = float(eye.get("left_ear", 0.0) or 0.0)
+        result.right_ear = float(eye.get("right_ear", 0.0) or 0.0)
+        result.left_palpebral_height = float(eye.get("left_palpebral_height", 0.0) or 0.0)
+        result.right_palpebral_height = float(eye.get("right_palpebral_height", 0.0) or 0.0)
+        result.palpebral_height_ratio = float(eye.get("palpebral_height_ratio", 1.0) or 1.0)
+        result.left_palpebral_width = float(eye.get("left_palpebral_width", 0.0) or 0.0)
+        result.right_palpebral_width = float(eye.get("right_palpebral_width", 0.0) or 0.0)
+
+        result.left_brow_height = float(brow.get("left_height", 0.0) or 0.0)
+        result.right_brow_height = float(brow.get("right_height", 0.0) or 0.0)
+        result.brow_height_ratio = float(brow.get("height_ratio", 1.0) or 1.0)
+        result.left_brow_position = brow.get("left_position", None)
+        result.right_brow_position = brow.get("right_position", None)
+
+        # brow eye distance（如果有）
+        result.left_brow_eye_distance = float(brow.get("left_brow_eye_distance", 0.0) or 0.0)
+        result.right_brow_eye_distance = float(brow.get("right_brow_eye_distance", 0.0) or 0.0)
+        result.brow_eye_distance_ratio = float(brow.get("brow_eye_distance_ratio", 1.0) or 1.0)
+        result.left_brow_eye_distance_change = float(brow.get("left_brow_eye_distance_change", 0.0) or 0.0)
+        result.right_brow_eye_distance_change = float(brow.get("right_brow_eye_distance_change", 0.0) or 0.0)
+        result.brow_eye_distance_change_ratio = float(brow.get("brow_eye_distance_change_ratio", 1.0) or 1.0)
+
+        result.mouth_width = float(mouth.get("width", 0.0) or 0.0)
+        result.mouth_height = float(mouth.get("height", 0.0) or 0.0)
+
+        result.left_nlf_length = float(nlf.get("left_length", 0.0) or 0.0)
+        result.right_nlf_length = float(nlf.get("right_length", 0.0) or 0.0)
+        result.nlf_ratio = float(nlf.get("ratio", 1.0) or 1.0)
+
+        # 把完整 baseline JSON 缓存起来，供后续动作（无 baseline_landmarks 时）使用
+        result.action_specific["baseline_cache"] = data
+
+        print(f"    [OK] 复用已有基线(JSON): {indicators_path}")
         return result, None
 
     except Exception as e:
@@ -918,7 +953,7 @@ def process_examination(examination: Dict[str, Any], db_path: str,
     elif reuse_baseline:
         # 尝试复用已有基线
         print(f"\n  尝试复用已有基线...")
-        baseline_result, baseline_landmarks = load_existing_baseline(exam_output_dir)
+        baseline_result, baseline_landmarks = load_baseline_from_existing_json(exam_output_dir)
         if baseline_result:
             action_results["NeutralFace"] = baseline_result
         else:

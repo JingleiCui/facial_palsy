@@ -3337,11 +3337,10 @@ def compute_ala_canthus_change(landmarks, w: int, h: int,
 def compute_eye_closure_sequence(landmarks_seq: List, w: int, h: int,
                                  baseline_landmarks=None) -> Dict[str, Any]:
     """
-    计算整个视频序列的眼睛闭合度
+    计算整个视频序列的眼睛闭合度和睁眼度
 
-    闭合度定义: closure_ratio = 1 - (current_area / baseline_area)
-    - 0 = 完全睁开（面积等于基线）
-    - 1 = 完全闭合（面积为0）
+    openness = current_area / baseline_area  (0=闭合, 1=睁开)
+    closure = 1 - openness                   (0=睁开, 1=闭合)
 
     Args:
         landmarks_seq: 关键点序列
@@ -3352,6 +3351,8 @@ def compute_eye_closure_sequence(landmarks_seq: List, w: int, h: int,
         {
             "left_closure": [闭合度序列],
             "right_closure": [闭合度序列],
+            "left_openness": [睁眼度序列],
+            "right_openness": [睁眼度序列],
             "left_area": [面积序列],
             "right_area": [面积序列],
             "baseline_left_area": 基线左眼面积,
@@ -3365,6 +3366,8 @@ def compute_eye_closure_sequence(landmarks_seq: List, w: int, h: int,
     right_area_seq = []
     left_closure_seq = []
     right_closure_seq = []
+    left_openness_seq = []
+    right_openness_seq = []
 
     # 获取基线面积
     baseline_source = "neutral"
@@ -3399,12 +3402,11 @@ def compute_eye_closure_sequence(landmarks_seq: List, w: int, h: int,
             right_area_seq.append(np.nan)
             left_closure_seq.append(np.nan)
             right_closure_seq.append(np.nan)
+            left_openness_seq.append(np.nan)
+            right_openness_seq.append(np.nan)
         else:
             # 计算尺度因子（补偿距离变化）
-            if baseline_landmarks is not None:
-                scale = compute_scale_to_baseline(lm, baseline_landmarks, w, h)
-            else:
-                scale = 1.0
+            scale = compute_scale_to_baseline(lm, baseline_landmarks, w, h) if baseline_landmarks else 1.0
 
             l_area, _ = compute_eye_area(lm, w, h, True)
             r_area, _ = compute_eye_area(lm, w, h, False)
@@ -3416,17 +3418,20 @@ def compute_eye_closure_sequence(landmarks_seq: List, w: int, h: int,
             left_area_seq.append(float(scaled_l))
             right_area_seq.append(float(scaled_r))
 
-            # 闭合度 = 1 - (当前面积/基线面积)
-            l_closure = 1.0 - (scaled_l / baseline_left_area)
-            r_closure = 1.0 - (scaled_r / baseline_right_area)
+            # 直接计算睁眼度
+            l_openness = scaled_l / baseline_left_area
+            r_openness = scaled_r / baseline_right_area
 
-            # 限制在 0-1 范围
-            left_closure_seq.append(float(max(0, min(1, l_closure))))
-            right_closure_seq.append(float(max(0, min(1, r_closure))))
+            left_openness_seq.append(float(max(0, min(2, l_openness))))
+            right_openness_seq.append(float(max(0, min(2, r_openness))))
+            left_closure_seq.append(float(max(0, min(1, 1.0 - l_openness))))
+            right_closure_seq.append(float(max(0, min(1, 1.0 - r_openness))))
 
     return {
         "left_closure": left_closure_seq,
         "right_closure": right_closure_seq,
+        "left_openness": left_openness_seq,
+        "right_openness": right_openness_seq,
         "left_area": left_area_seq,
         "right_area": right_area_seq,
         "baseline_left_area": float(baseline_left_area),
@@ -3747,4 +3752,3 @@ def compute_voluntary_score_from_excursion(excursion_metrics: Dict[str, Any]) ->
         return 2, "轻微启动"
     else:
         return 1, "无法启动"
-

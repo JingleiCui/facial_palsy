@@ -320,57 +320,6 @@ def plot_raise_eyebrow_peak_selection(
     plt.close()
 
 
-def save_brow_curve_plot(peak_debug: Dict[str, Any], save_path: Path):
-    """
-    画“眉眼距/眉眼距变化量”的时序曲线，并标注关键帧点（peak_idx）
-    输出：brow_curve.png
-    """
-    if not peak_debug:
-        return
-
-    x = list(range(len(peak_debug.get("mean_curve", []))))
-    left = peak_debug.get("left_curve", [])
-    right = peak_debug.get("right_curve", [])
-    mean = peak_debug.get("mean_curve", [])
-    peak_idx = int(peak_debug.get("peak_idx", 0))
-    metric = peak_debug.get("metric", "BED")
-
-    def _to_xy(arr):
-        xs, ys = [], []
-        for i, v in enumerate(arr):
-            if v is None:
-                continue
-            xs.append(i)
-            ys.append(v)
-        return xs, ys
-
-    xl, yl = _to_xy(left)
-    xr, yr = _to_xy(right)
-    xm, ym = _to_xy(mean)
-
-    plt.figure(figsize=(10, 6))
-    if xl:
-        plt.plot(xl, yl, label="Left (BED)")
-    if xr:
-        plt.plot(xr, yr, label="Right (BED)")
-    if xm:
-        plt.plot(xm, ym, label="Mean (BED)")
-
-    # 标注关键帧：竖线 + 点
-    if 0 <= peak_idx < len(mean) and mean[peak_idx] is not None:
-        plt.axvline(peak_idx, linestyle="--")
-        plt.scatter([peak_idx], [mean[peak_idx]], zorder=5)
-        plt.text(peak_idx, mean[peak_idx], f" peak={peak_idx}", fontsize=10)
-
-    plt.title(f"RaiseEyebrow curve ({metric})")
-    plt.xlabel("Frame")
-    plt.ylabel("Value (px)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(str(save_path))
-    plt.close()
-
-
 def compute_raise_eyebrow_metrics(landmarks, w: int, h: int,
                                   baseline_landmarks=None) -> Dict[str, Any]:
     """计算抬眉特有指标"""
@@ -849,7 +798,6 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     action_dir = output_dir / ACTION_NAME
     action_dir.mkdir(parents=True, exist_ok=True)
 
-    save_brow_curve_plot(peak_debug, action_dir / "brow_curve.png")
     # 保存原始帧
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 

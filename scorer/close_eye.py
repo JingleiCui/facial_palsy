@@ -23,11 +23,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from clinical_base import (
-    LM, pt2d, pts2d, dist, compute_ear, compute_eye_area,
-    compute_palpebral_height, compute_mouth_metrics,
-    compute_icd, extract_common_indicators,
+    LM, compute_ear, compute_eye_area,
+    compute_palpebral_height, compute_mouth_metrics, extract_common_indicators,
     ActionResult, draw_polygon, compute_scale_to_baseline,
-    draw_palsy_side_label, compute_eye_closure_by_area,
     compute_eye_closure_sequence, compute_eye_synchrony,
     compute_eye_symmetry_at_peak, draw_palsy_annotation_header,
 )
@@ -474,41 +472,37 @@ def plot_eye_curve(eye_seq: Dict, fps: float, peak_idx: int,
         ax1.text(0.02, 0.98, info_text, transform=ax1.transAxes, fontsize=10,
                  verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
-    # ========== 下图: 眼睛闭合度 ==========
+    # ========== 下图: 眼睛睁眼度 ==========
     ax2 = axes[1]
 
     if closure_data is not None:
-        left_closure = closure_data.get("left_closure", [])
-        right_closure = closure_data.get("right_closure", [])
+        left_openness = closure_data.get("left_openness", [])
+        right_openness = closure_data.get("right_openness", [])
 
-        if len(left_closure) > 0 and len(right_closure) > 0:
+        if len(left_openness) > 0 and len(right_openness) > 0:
             if valid_mask is not None:
                 add_valid_region_shading(ax2, valid_mask, time_sec)
 
-            ax2.plot(time_sec, left_closure, 'b-', label='Left Eye Closure', linewidth=2)
-            ax2.plot(time_sec, right_closure, 'r-', label='Right Eye Closure', linewidth=2)
+            ax2.plot(time_sec, left_openness, 'b-', label='Left Eye Openness', linewidth=2)
+            ax2.plot(time_sec, right_openness, 'r-', label='Right Eye Openness', linewidth=2)
 
-            # 平均闭合度
-            avg_closure = [(l + r) / 2 if (np.isfinite(l) and np.isfinite(r)) else np.nan
-                           for l, r in zip(left_closure, right_closure)]
-            ax2.plot(time_sec, avg_closure, 'g--', label='Average Closure', linewidth=1.5, alpha=0.7)
+            avg_openness = [(l + r) / 2 if (np.isfinite(l) and np.isfinite(r)) else np.nan
+                           for l, r in zip(left_openness, right_openness)]
+            ax2.plot(time_sec, avg_openness, 'g--', label='Average', linewidth=1.5, alpha=0.7)
 
-            ax2.axvline(x=peak_time, color='k', linestyle='--', alpha=0.5, label=f'Peak Frame ({peak_idx})')
+            ax2.axvline(x=peak_time, color='k', linestyle='--', alpha=0.5, label=f'Peak ({peak_idx})')
+            ax2.axhline(y=0.15, color='red', linestyle=':', alpha=0.5, label='Closed (<15%)')
+            ax2.axhline(y=0.80, color='green', linestyle=':', alpha=0.5, label='Open (>80%)')
 
-            # 阈值线
-            ax2.axhline(y=0.85, color='green', linestyle=':', alpha=0.5, label='Complete (85%)')
-            ax2.axhline(y=0.20, color='orange', linestyle=':', alpha=0.5, label='Threshold (20%)')
+            ax2.set_ylim(-0.05, 1.2)
+            ax2.set_ylabel('Openness (0=closed, 1=open)', fontsize=11)
 
-            ax2.set_ylim(0, 1.1)
-            ax2.set_ylabel('Closure Ratio (1=fully closed)', fontsize=11)
-
-            # 峰值帧闭合度信息
-            if 0 <= peak_idx < len(left_closure):
-                left_peak = left_closure[peak_idx] if np.isfinite(left_closure[peak_idx]) else 0
-                right_peak = right_closure[peak_idx] if np.isfinite(right_closure[peak_idx]) else 0
-                info_text = f"Peak: L={left_peak:.1%}, R={right_peak:.1%}"
-                ax2.text(0.02, 0.98, info_text, transform=ax2.transAxes, fontsize=10,
-                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            if 0 <= peak_idx < len(left_openness):
+                lp = left_openness[peak_idx] if np.isfinite(left_openness[peak_idx]) else 0
+                rp = right_openness[peak_idx] if np.isfinite(right_openness[peak_idx]) else 0
+                ax2.text(0.02, 0.98, f"Peak: L={lp:.1%}, R={rp:.1%}", transform=ax2.transAxes,
+                         fontsize=10, verticalalignment='top',
+                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
     else:
         # 没有闭合度数据，显示EAR（参考）
         ax2.plot(time_sec, eye_seq["ear"]["left"], 'b-', label='Left EAR (ref)', linewidth=1.5, alpha=0.7)
@@ -516,7 +510,7 @@ def plot_eye_curve(eye_seq: Dict, fps: float, peak_idx: int,
         ax2.axvline(x=peak_time, color='k', linestyle='--', alpha=0.5)
         ax2.set_ylabel('EAR (reference)', fontsize=11)
 
-    ax2.set_title(f'{action_name} - Eye Closure Over Time', fontsize=13)
+    ax2.set_title(f'{action_name} - Eye Openness Over Time', fontsize=13)
     ax2.set_xlabel(x_label, fontsize=11)
     ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
@@ -713,6 +707,10 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
             "left": [float(v) if np.isfinite(v) else None for v in closure_data["left_closure"]],
             "right": [float(v) if np.isfinite(v) else None for v in closure_data["right_closure"]],
         },
+        "openness_sequence": {
+            "left": [float(v) if np.isfinite(v) else None for v in closure_data["left_openness"]],
+            "right": [float(v) if np.isfinite(v) else None for v in closure_data["right_openness"]],
+        },
         "baseline": {
             "left_area": float(closure_data["baseline_left_area"]),
             "right_area": float(closure_data["baseline_right_area"]),
@@ -721,6 +719,8 @@ def _process_close_eye(landmarks_seq: List, frames_seq: List, w: int, h: int,
             "idx": int(peak_idx),
             "left_closure": float(left_closure_at_peak),
             "right_closure": float(right_closure_at_peak),
+            "left_openness": float(closure_data["left_openness"][peak_idx]),
+            "right_openness": float(closure_data["right_openness"][peak_idx]),
             "left_area": float(closure_data["left_area"][peak_idx]),
             "right_area": float(closure_data["right_area"][peak_idx]),
         },

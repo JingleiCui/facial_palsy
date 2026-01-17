@@ -45,14 +45,14 @@ ACTION_WEIGHTS = {
     "NeutralFace": 0.0,  # 静息只作参考
     "SpontaneousEyeBlink": 1,
     "VoluntaryEyeBlink": 1,
-    "CloseEyeSoftly": 1.2,
+    "CloseEyeSoftly": 1,
     "CloseEyeHardly": 0.8,
     "RaiseEyebrow": 1,
     "Smile": 1,
     "ShrugNose": 1.0,
     "ShowTeeth": 1.3,
-    "BlowCheek": 0.3,
-    "LipPucker": 0.2,
+    "BlowCheek": 0.8,
+    "LipPucker": 0.7,
 }
 
 # 动作对应的面部区域
