@@ -1039,10 +1039,9 @@ def process_examination(examination: Dict[str, Any], db_path: str,
             action_results[action_name] = result
 
     # 计算Sunnybrook评分
-    sunnybrook = calculate_sunnybrook_from_results(action_results)
-
-    # 计算完整Session诊断（替换原来的 infer_palsy_and_side）
-    diagnosis = compute_full_diagnosis(action_results, sunnybrook)
+    diagnosis = compute_session_diagnosis(action_results)
+    palsy_side = diagnosis.palsy_side if diagnosis else 0
+    sunnybrook = calculate_sunnybrook_from_results(action_results, palsy_side=palsy_side)
 
     # summary 更新
     summary = {

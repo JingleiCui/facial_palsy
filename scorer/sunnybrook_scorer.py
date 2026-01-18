@@ -344,9 +344,16 @@ def compute_voluntary_score_from_ratio(ratio: float,
 
 def compute_voluntary_score_from_excursion(excursion_ratio: float) -> Tuple[int, str]:
     """
-    根据运动幅度比计算评分
+    根据运动幅度比计算Sunnybrook Voluntary Movement评分
 
     excursion_ratio = 患侧运动幅度 / 健侧运动幅度
+
+    Sunnybrook原始定义:
+    - Score 5: ≥95% (Complete)
+    - Score 4: 75-94% (Almost complete)
+    - Score 3: 50-74% (Mild asymmetry)
+    - Score 2: 25-49% (Slight movement)
+    - Score 1: <25% (Unable to initiate)
     """
     if excursion_ratio >= 0.95:
         return 5, "Movement complete (运动完整)"

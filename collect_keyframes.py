@@ -21,6 +21,10 @@ from datetime import datetime
 from collections import defaultdict, Counter
 from typing import Dict, List, Any, Optional, Tuple
 import shutil
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # =============================================================================
 # 配置
@@ -100,6 +104,7 @@ def load_session_diagnosis(exam_dir: Path) -> Dict[str, Any]:
             summary = json.load(f)
 
         diagnosis = summary.get("diagnosis", {})
+        sunnybrook_detail = summary.get("sunnybrook", None)
         if not diagnosis:
             return {}
 
@@ -113,6 +118,12 @@ def load_session_diagnosis(exam_dir: Path) -> Dict[str, Any]:
             "resting_score": diagnosis.get("resting_score", None),
             "voluntary_score": diagnosis.get("voluntary_score", None),
             "synkinesis_score": diagnosis.get("synkinesis_score", None),
+            "hb_evidence": diagnosis.get("hb_evidence", None),
+            "votes": diagnosis.get("votes", None),
+            "top_evidence": diagnosis.get("top_evidence", None),
+            "consistency_checks": diagnosis.get("consistency_checks", None),
+            "adjustments_made": diagnosis.get("adjustments_made", None),
+            "sunnybrook_detail": sunnybrook_detail,
         }
     except Exception as e:
         print(f"[WARN] Failed to load diagnosis from summary.json: {exam_dir} - {e}")
@@ -160,10 +171,24 @@ def load_action_palsy_prediction(action_dir: Path) -> Dict[str, Any]:
         result["severity_score"] = severity_score
         result["severity_desc"] = severity_desc
 
-        # 展平evidence字段
-        evidence = palsy_detection.get("evidence", {})
-        detailed_metrics = flatten_evidence(evidence)
-        result["detailed_metrics"] = detailed_metrics
+        # 优先使用 evidence_used（真正用于判侧别的关键指标）
+        evidence_used = palsy_detection.get("evidence_used", None)
+        evidence_dump = palsy_detection.get("evidence_dump", None)
+
+        if evidence_used is not None:
+            detailed_metrics = flatten_evidence(evidence_used)
+            result["detailed_metrics"] = detailed_metrics
+            result["metrics_source"] = "evidence_used"
+        else:
+            # 兼容旧版：没有 evidence_used 时退回到 evidence
+            evidence = palsy_detection.get("evidence", {})
+            detailed_metrics = flatten_evidence(evidence)
+            result["detailed_metrics"] = detailed_metrics
+            result["metrics_source"] = "evidence"
+
+        # 可选：保留 dump（用于你想深挖时），但后续 error_analysis 不会用它
+        if evidence_dump is not None:
+            result["debug_dump"] = evidence_dump
 
         return result
     except Exception as e:
@@ -221,7 +246,6 @@ def format_metrics_summary(action: str, metrics: Dict[str, Any]) -> str:
         return f"变化: L={lc:+.1f}px R={rc:+.1f}px asym={asym:.2f} ratio={bed_ratio:.3f}"
 
     elif action in ["Smile", "ShowTeeth", "BlowCheek", "LipPucker"]:
-        # ShowTeeth和LipPucker使用嘴唇偏移
         if action in ["ShowTeeth", "LipPucker"]:
             offset = metrics.get("current_offset", 0)
             offset_norm = metrics.get("offset_norm", 0)
@@ -378,7 +402,26 @@ def collect_one_exam(exam_dir: Path) -> Tuple[int, int, List[Dict[str, Any]], Op
             "pred_resting_score": session_pred.get("resting_score"),
             "pred_voluntary_score": session_pred.get("voluntary_score"),
             "pred_synkinesis_score": session_pred.get("synkinesis_score"),
+            # add evidence
+            "pred_hb_evidence": session_pred.get("hb_evidence"),
+            "pred_votes": session_pred.get("votes"),
+            "pred_top_evidence": session_pred.get("top_evidence"),
+            "pred_consistency_checks": session_pred.get("consistency_checks"),
+            "pred_adjustments_made": session_pred.get("adjustments_made"),
+            "pred_sunnybrook_detail": session_pred.get("sunnybrook_detail"),
         }
+
+    # === 按 GT HB 分组打包复制 11 动作图片（便于肉眼检查）===
+    pred_hb = session_pred.get("hb_grade") if session_pred else None
+    copy_exam_pack_by_gt_hb(
+        exam_dir=exam_dir,
+        gt_hb=gt_hb,
+        pred_hb=pred_hb,
+        dst_root=DST_ROOT,
+        copy_indicators=True,
+        copy_selection_curve=True,  # 如果你只想要11张图，把这里改 False
+        copy_peak_raw=False
+    )
 
     return copied, skipped, palsy_records, session_record
 
@@ -550,51 +593,284 @@ def compute_session_diagnosis_statistics(session_records: List[Dict[str, Any]]) 
     return stats
 
 
-def print_session_diagnosis_statistics(stats: Dict[str, Any]):
-    """打印Session级诊断统计结果"""
-    if not stats:
-        print("\n[WARN] No session diagnosis statistics available")
+# =============================================================================
+# HB分级详细统计
+# =============================================================================
+
+def compute_hb_confusion_matrix(session_records: List[Dict[str, Any]]) -> np.ndarray:
+    """计算HB分级的6x6混淆矩阵"""
+    confusion = np.zeros((6, 6), dtype=int)
+
+    for r in session_records:
+        gt = r.get("gt_hb_grade")
+        pred = r.get("pred_hb_grade")
+
+        if gt is not None and pred is not None:
+            gt, pred = int(gt), int(pred)
+            if 1 <= gt <= 6 and 1 <= pred <= 6:
+                confusion[gt - 1, pred - 1] += 1
+
+    return confusion
+
+
+def print_hb_detailed_statistics(session_records: List[Dict[str, Any]]):
+    """打印HB分级详细统计"""
+    confusion = compute_hb_confusion_matrix(session_records)
+    total = confusion.sum()
+
+    if total == 0:
+        print("  无有效HB分级数据")
+        return
+
+    print(f"\n{'=' * 65}")
+    print("HB分级详细统计")
+    print(f"{'=' * 65}")
+
+    # 混淆矩阵
+    print("\n混淆矩阵 (行=GT, 列=Pred):")
+    header = "GT\\Pred"
+    for i in range(1, 7):
+        header += f"  HB{i}"
+    header += "  Total Recall"
+    print(header)
+    print("-" * 60)
+
+    for i in range(6):
+        row = f"HB{i + 1}   "
+        for j in range(6):
+            val = confusion[i, j]
+            row += f"  {val:3d}" if val > 0 else "    -"
+
+        row_total = confusion[i].sum()
+        recall = confusion[i, i] / row_total if row_total > 0 else 0
+        row += f"   {row_total:3d} {recall:5.1%}"
+        print(row)
+
+    print("-" * 60)
+
+    # 总计行和精确率
+    total_row = "Total "
+    prec_row = "Prec  "
+    for j in range(6):
+        col_sum = confusion[:, j].sum()
+        total_row += f"  {col_sum:3d}"
+        prec = confusion[j, j] / col_sum if col_sum > 0 else 0
+        prec_row += f" {prec:4.0%}"
+    total_row += f"   {total:3d}"
+    print(total_row)
+    print(prec_row)
+
+    # 每级详情
+    print(f"\n{'Grade':<6}{'GT#':>5}{'Pred#':>6}{'Correct':>8}{'Precision':>10}{'Recall':>8}{'F1':>6}")
+    print("-" * 50)
+
+    for i in range(6):
+        grade = i + 1
+        gt_count = confusion[i, :].sum()
+        pred_count = confusion[:, i].sum()
+        correct = confusion[i, i]
+
+        precision = correct / pred_count if pred_count > 0 else 0
+        recall = correct / gt_count if gt_count > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+        print(f"HB{grade:<4}{gt_count:>5}{pred_count:>6}{correct:>8}"
+              f"{precision:>9.1%}{recall:>7.1%}{f1:>6.2f}")
+
+    # 总体指标
+    exact = int(np.trace(confusion))
+    within_1 = sum(confusion[i, j] for i in range(6) for j in range(6) if abs(i - j) <= 1)
+
+    # MAE
+    mae_sum = 0
+    count = 0
+    for i in range(6):
+        for j in range(6):
+            mae_sum += confusion[i, j] * abs(i - j)
+            count += confusion[i, j]
+    mae = mae_sum / count if count > 0 else 0
+
+    print(f"\n总体指标:")
+    print(f"  精确匹配: {exact}/{total} = {exact / total:.1%}")
+    print(f"  ±1级匹配: {within_1}/{total} = {within_1 / total:.1%}")
+    print(f"  MAE: {mae:.2f} 级")
+
+    # 主要误差来源
+    errors = []
+    for i in range(6):
+        for j in range(6):
+            if i != j and confusion[i, j] > 0:
+                errors.append(((i + 1, j + 1), confusion[i, j]))
+    errors.sort(key=lambda x: -x[1])
+
+    if errors:
+        print(f"\n主要误差来源 (GT→Pred: 次数):")
+        for (gt, pred), count in errors[:8]:
+            diff = pred - gt
+            direction = "高估" if diff > 0 else "低估"
+            print(f"  HB{gt}→HB{pred}: {count}次 ({direction}{abs(diff)}级)")
+
+
+# =============================================================================
+# Sunnybrook评分详细统计
+# =============================================================================
+
+def compute_sunnybrook_confusion_matrix(session_records: List[Dict[str, Any]]) -> np.ndarray:
+    """计算Sunnybrook评分的5x5分段混淆矩阵"""
+    bins = [(0, 20), (21, 40), (41, 60), (61, 80), (81, 100)]
+
+    def get_bin(score):
+        if score is None:
+            return -1
+        score = float(score)
+        for i, (low, high) in enumerate(bins):
+            if low <= score <= high:
+                return i
+        return 4 if score > 100 else 0
+
+    confusion = np.zeros((5, 5), dtype=int)
+
+    for r in session_records:
+        gt = r.get("gt_sunnybrook")
+        pred = r.get("pred_sunnybrook")
+
+        if gt is not None and pred is not None:
+            gt_bin = get_bin(gt)
+            pred_bin = get_bin(pred)
+            if gt_bin >= 0 and pred_bin >= 0:
+                confusion[gt_bin, pred_bin] += 1
+
+    return confusion
+
+
+def print_sunnybrook_detailed_statistics(session_records: List[Dict[str, Any]]):
+    """打印Sunnybrook评分详细统计"""
+    labels = ["0-20", "21-40", "41-60", "61-80", "81-100"]
+    names = ["重度", "中重", "中度", "轻度", "正常"]
+
+    confusion = compute_sunnybrook_confusion_matrix(session_records)
+    total = confusion.sum()
+
+    if total == 0:
+        print("  无有效Sunnybrook数据")
+        return
+
+    print(f"\n{'=' * 65}")
+    print("Sunnybrook评分详细统计")
+    print(f"{'=' * 65}")
+
+    # 混淆矩阵
+    print("\n分段混淆矩阵 (行=GT, 列=Pred):")
+    header = f"{'GT\\Pred':<10}"
+    for label in labels:
+        header += f"{label:>7}"
+    header += f"{'Total':>7}{'Acc':>6}"
+    print(header)
+    print("-" * 58)
+
+    for i, (label, name) in enumerate(zip(labels, names)):
+        row = f"{label:<6}{name:<4}"
+        for j in range(5):
+            val = confusion[i, j]
+            row += f"{val:>7}" if val > 0 else f"{'':>6}-"
+
+        row_total = confusion[i].sum()
+        acc = confusion[i, i] / row_total if row_total > 0 else 0
+        row += f"{row_total:>7}{acc:>5.0%}"
+        print(row)
+
+    print("-" * 58)
+    total_row = f"{'Total':<10}"
+    for j in range(5):
+        total_row += f"{confusion[:, j].sum():>7}"
+    total_row += f"{total:>7}"
+    print(total_row)
+
+    # 计算MAE、RMSE、相关性
+    gt_list = []
+    pred_list = []
+    for r in session_records:
+        gt = r.get("gt_sunnybrook")
+        pred = r.get("pred_sunnybrook")
+        if gt is not None and pred is not None:
+            gt_list.append(float(gt))
+            pred_list.append(float(pred))
+
+    if gt_list:
+        gt_arr = np.array(gt_list)
+        pred_arr = np.array(pred_list)
+        errors = pred_arr - gt_arr
+
+        mae = float(np.mean(np.abs(errors)))
+        rmse = float(np.sqrt(np.mean(errors ** 2)))
+        corr = float(np.corrcoef(gt_arr, pred_arr)[0, 1]) if len(gt_list) > 1 else 0
+        mean_err = float(np.mean(errors))
+
+        # 每段MAE
+        print("\n每段MAE:")
+        bins = [(0, 20), (21, 40), (41, 60), (61, 80), (81, 100)]
+        for i, ((low, high), name) in enumerate(zip(bins, names)):
+            mask = (gt_arr >= low) & (gt_arr <= high)
+            if mask.sum() > 0:
+                seg_mae = float(np.mean(np.abs(errors[mask])))
+                print(f"  {labels[i]} ({name}): MAE={seg_mae:.1f}分 (n={mask.sum()})")
+
+        print(f"\n总体指标:")
+        print(f"  样本数: {len(gt_list)}")
+        print(f"  MAE: {mae:.1f} 分")
+        print(f"  RMSE: {rmse:.1f} 分")
+        print(f"  Pearson相关: {corr:.3f}")
+        print(f"  平均误差: {mean_err:+.1f} 分 (正=高估, 负=低估)")
+
+
+def print_session_diagnosis_statistics(session_records: List[Dict[str, Any]]):
+    """
+    增强版Session诊断统计输出
+    """
+    total = len(session_records)
+    if total == 0:
+        print("无Session记录")
         return
 
     print("\n" + "=" * 70)
-    print("Session级诊断预测准确率统计")
+    print("Session级诊断预测准确率统计 (增强版)")
     print("=" * 70)
-    print(f"总检查数: {stats['total']}")
+    print(f"总检查数: {total}")
 
     # 1. 是否面瘫
-    hp = stats["has_palsy"]
-    if hp["total"] > 0:
-        print(f"\n1. 是否面瘫 (has_palsy):")
-        print(f"   准确率: {hp['accuracy']:.1%} ({hp['correct']}/{hp['total']})")
+    has_palsy_correct = sum(1 for r in session_records
+                            if r.get("gt_has_palsy") == r.get("pred_has_palsy"))
+    print(f"\n1. 是否面瘫 (has_palsy):")
+    print(f"   准确率: {has_palsy_correct / total:.1%} ({has_palsy_correct}/{total})")
 
     # 2. 面瘫侧别
-    ps = stats["palsy_side"]
-    if ps["total_palsy"] > 0:
+    side_ok = side_wrong = side_fn = side_fp = 0
+    for r in session_records:
+        gt = r.get("gt_palsy_side", 0)
+        pred = r.get("pred_palsy_side", 0)
+        if gt != 0:
+            if pred == gt:
+                side_ok += 1
+            elif pred == 0:
+                side_fn += 1
+            else:
+                side_wrong += 1
+        else:
+            if pred != 0:
+                side_fp += 1
+
+    side_total = side_ok + side_wrong + side_fn
+    if side_total > 0:
         print(f"\n2. 面瘫侧别 (palsy_side):")
-        print(f"   严格准确率: {ps['strict_acc']:.1%} ({ps['correct']}/{ps['total_palsy']})")
-        print(f"   宽松准确率: {ps['relaxed_acc']:.1%} (含FN)")
-        print(f"   详情: 正确={ps['correct']}, 错侧={ps['wrong_side']}, FN={ps['fn']}, FP={ps['fp']}")
+        print(f"   严格准确率: {side_ok / side_total:.1%} ({side_ok}/{side_total})")
+        print(f"   宽松准确率: {(side_ok + side_fn) / side_total:.1%} (含FN)")
+        print(f"   详情: 正确={side_ok}, 错侧={side_wrong}, FN={side_fn}, FP={side_fp}")
 
-    # 3. HB Grade
-    hb = stats["hb_grade"]
-    if hb["total"] > 0:
-        print(f"\n3. HB分级 (hb_grade):")
-        print(f"   精确匹配: {hb['exact_acc']:.1%} ({hb['exact_match']}/{hb['total']})")
-        print(f"   ±1级准确: {hb['within_1_acc']:.1%} ({hb['within_1']}/{hb['total']})")
-        print(f"   MAE: {hb['mae']:.2f} 级")
+    # 3. HB详细统计
+    print_hb_detailed_statistics(session_records)
 
-    # 4. Sunnybrook
-    sb = stats["sunnybrook"]
-    if sb["total"] > 0:
-        print(f"\n4. Sunnybrook评分:")
-        print(f"   样本数: {sb['total']}")
-        print(f"   MAE: {sb['mae']:.1f} 分")
-        print(f"   RMSE: {sb['rmse']:.1f} 分")
-        if sb["correlation"] is not None:
-            print(f"   Pearson相关系数: {sb['correlation']:.3f}")
-
-    print("=" * 70)
-
+    # 4. Sunnybrook详细统计
+    print_sunnybrook_detailed_statistics(session_records)
 
 def save_session_diagnosis_csv(session_records: List[Dict[str, Any]], output_path: Path):
     """保存Session级诊断记录到CSV"""
@@ -655,6 +931,176 @@ def save_session_diagnosis_csv(session_records: List[Dict[str, Any]], output_pat
         writer.writerows(rows)
 
     print(f"[OK] Session diagnosis CSV saved: {output_path}")
+
+
+def save_hb_trace_csv(session_records: List[Dict[str, Any]], output_path: Path):
+    """
+    输出 HB 决策链路审计 CSV：一行一个 session
+    重点字段：输入指标 / 阈值 / 命中分支 / 与真值差异
+    """
+    if not session_records:
+        return
+
+    def _get(d, *keys):
+        cur = d
+        for k in keys:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(k)
+        return cur
+
+    fieldnames = [
+        "exam_id",
+        "gt_hb_grade", "pred_hb_grade", "hb_diff",
+        "gt_has_palsy", "pred_has_palsy",
+        "gt_palsy_side", "pred_palsy_side",
+
+        # HB 输入指标
+        "eye_closure",
+        "forehead_aff", "forehead_healthy", "forehead_ratio",
+        "mouth_aff", "mouth_healthy", "mouth_ratio",
+        "avg_asymmetry",
+        "mouth_source_action",
+
+        # HB 阈值
+        "thr_eye_complete", "thr_forehead_min", "thr_mouth_min",
+        "thr_forehead_ratio_grade3", "thr_asym_grade1",
+
+        # 决策路径
+        "decision_path",
+
+        # Sunnybrook（便于你对照）
+        "gt_sunnybrook", "pred_sunnybrook", "sunnybrook_error",
+        "pred_resting_score", "pred_voluntary_score", "pred_synkinesis_score",
+    ]
+
+    rows = []
+    for r in session_records:
+        ev = r.get("pred_hb_evidence") or {}
+        thr = ev.get("thresholds") or {}
+        dp = ev.get("decision_path") or []
+        if isinstance(dp, list):
+            dp_str = " ; ".join([str(x) for x in dp])
+        else:
+            dp_str = str(dp)
+
+        gt_hb = r.get("gt_hb_grade")
+        pred_hb = r.get("pred_hb_grade")
+        gt_sb = r.get("gt_sunnybrook")
+        pred_sb = r.get("pred_sunnybrook")
+
+        rows.append({
+            "exam_id": r.get("exam_id"),
+            "gt_hb_grade": gt_hb,
+            "pred_hb_grade": pred_hb,
+            "hb_diff": abs(gt_hb - pred_hb) if gt_hb is not None and pred_hb is not None else None,
+            "gt_has_palsy": r.get("gt_has_palsy"),
+            "pred_has_palsy": r.get("pred_has_palsy"),
+            "gt_palsy_side": r.get("gt_palsy_side"),
+            "pred_palsy_side": r.get("pred_palsy_side"),
+
+            "eye_closure": ev.get("eye_closure"),
+
+            "forehead_aff": _get(ev, "forehead_movement", "affected"),
+            "forehead_healthy": _get(ev, "forehead_movement", "healthy"),
+            "forehead_ratio": ev.get("forehead_ratio"),
+
+            "mouth_aff": _get(ev, "mouth_movement", "affected"),
+            "mouth_healthy": _get(ev, "mouth_movement", "healthy"),
+            "mouth_ratio": ev.get("mouth_ratio"),
+
+            "avg_asymmetry": ev.get("avg_asymmetry", ev.get("overall_asymmetry")),
+            "mouth_source_action": ev.get("mouth_source_action"),
+
+            "thr_eye_complete": thr.get("EYE_CLOSURE_COMPLETE"),
+            "thr_forehead_min": thr.get("FOREHEAD_MINIMAL"),
+            "thr_mouth_min": thr.get("MOUTH_MINIMAL"),
+            "thr_forehead_ratio_grade3": thr.get("FOREHEAD_RATIO_GRADE_III_MAX"),
+            "thr_asym_grade1": thr.get("ASYM_GRADE_I_MAX"),
+
+            "decision_path": dp_str,
+
+            "gt_sunnybrook": gt_sb,
+            "pred_sunnybrook": pred_sb,
+            "sunnybrook_error": (pred_sb - gt_sb) if gt_sb is not None and pred_sb is not None else None,
+            "pred_resting_score": r.get("pred_resting_score"),
+            "pred_voluntary_score": r.get("pred_voluntary_score"),
+            "pred_synkinesis_score": r.get("pred_synkinesis_score"),
+        })
+
+    rows.sort(key=lambda x: x["exam_id"])
+
+    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[OK] HB trace CSV saved: {output_path}")
+
+
+def save_hb_trace_error_json(session_records: List[Dict[str, Any]], output_path: Path):
+    """
+    输出“错误样本”JSON：便于逐条打开看完整链路
+    规则：HB不对 or has_palsy错 or palsy_side错 or Sunnybrook误差很大
+    """
+    if not session_records:
+        return
+
+    error_cases = []
+
+    for r in session_records:
+        gt_hb = r.get("gt_hb_grade")
+        pred_hb = r.get("pred_hb_grade")
+        gt_hp = r.get("gt_has_palsy")
+        pred_hp = r.get("pred_has_palsy")
+        gt_side = r.get("gt_palsy_side")
+        pred_side = r.get("pred_palsy_side")
+        gt_sb = r.get("gt_sunnybrook")
+        pred_sb = r.get("pred_sunnybrook")
+
+        hb_bad = (gt_hb is not None and pred_hb is not None and gt_hb != pred_hb)
+        hp_bad = (gt_hp is not None and pred_hp is not None and bool(gt_hp) != bool(pred_hp))
+        side_bad = (gt_side is not None and pred_side is not None and gt_side != pred_side and not (gt_side == 0 and pred_side == 0))
+
+        sb_bad = False
+        sb_err = None
+        if gt_sb is not None and pred_sb is not None:
+            sb_err = float(pred_sb - gt_sb)
+            sb_bad = abs(sb_err) >= 20.0  # 你可改 10/15/20
+
+        if hb_bad or hp_bad or side_bad or sb_bad:
+            error_cases.append({
+                "exam_id": r.get("exam_id"),
+                "gt": {
+                    "has_palsy": gt_hp,
+                    "palsy_side": gt_side,
+                    "hb_grade": gt_hb,
+                    "sunnybrook": gt_sb,
+                },
+                "pred": {
+                    "has_palsy": pred_hp,
+                    "palsy_side": pred_side,
+                    "hb_grade": pred_hb,
+                    "sunnybrook": pred_sb,
+                    "confidence": r.get("pred_confidence"),
+                    "palsy_side_confidence": r.get("pred_palsy_side_confidence"),
+                },
+                "diff": {
+                    "hb_diff": abs(gt_hb - pred_hb) if gt_hb is not None and pred_hb is not None else None,
+                    "sunnybrook_error": sb_err,
+                },
+                "hb_evidence": r.get("pred_hb_evidence"),
+                "votes": r.get("pred_votes"),
+                "top_evidence": r.get("pred_top_evidence"),
+                "consistency_checks": r.get("pred_consistency_checks"),
+                "adjustments_made": r.get("pred_adjustments_made"),
+                "sunnybrook_detail": r.get("pred_sunnybrook_detail"),
+            })
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(error_cases, f, indent=2, ensure_ascii=False)
+
+    print(f"[OK] HB trace error JSON saved: {output_path} (n={len(error_cases)})")
 
 
 def save_session_diagnosis_summary(stats: Dict[str, Any], output_path: Path):
@@ -858,6 +1304,374 @@ def save_confusion_matrix(records: List[Dict[str, Any]], output_path: Path):
     print(f"[OK] Confusion matrix saved: {output_path}")
 
 
+def analyze_thresholds_and_plot(records: List[Dict[str, Any]], output_dir: Path) -> None:
+    """
+    从 collect_keyframes 的 records 里提取“指标值 vs 阈值”，并按 GT(真实侧别) / 结果类型画分布图。
+    输出:
+      - output_dir/threshold_analysis/threshold_metrics.csv
+      - output_dir/threshold_analysis/*.png
+    """
+    out_dir = output_dir / "threshold_analysis"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 你现在 error_cases.json 里能稳定看到的阈值字段组合（先做这几个最确定的）
+    SPECS = [
+        # action, value_key, thr_key, plot_name
+        ("LipPucker", "offset_norm", "thr_offset_norm", "LipPucker_offset_norm"),
+        ("LipPucker", "midline_angle_deg", "thr_angle_deg", "LipPucker_midline_angle_deg"),
+        ("ShowTeeth", "offset_norm", "thr_offset_norm", "ShowTeeth_offset_norm"),
+        ("BlowCheek", "lip_offset_normalized_value", "lip_offset_threshold", "BlowCheek_lip_offset_norm"),
+        ("BlowCheek", "lip_shape_asymmetry_ratio", "lip_shape_threshold", "BlowCheek_lip_shape_asym"),
+        # CloseEye 的 frame_area_diff_threshold 是“逐帧差异阈值”，不是这里这种 value-vs-thr 结构，
+        # 所以先不画“value对thr”，后面你补充帧级统计再做。
+    ]
+
+    rows = []
+    for r in records:
+        act = r.get("action")
+        dm = r.get("detailed_metrics") or {}
+        for (a, vkey, tkey, plot_name) in SPECS:
+            if act != a:
+                continue
+            if vkey not in dm or tkey not in dm:
+                continue
+            try:
+                v = float(dm[vkey])
+                t = float(dm[tkey])
+            except Exception:
+                continue
+            rows.append({
+                "exam_id": r.get("exam_id"),
+                "action": act,
+                "metric": vkey,
+                "value": v,
+                "threshold": t,
+                "gt_text": r.get("gt_text"),
+                "pred_text": r.get("pred_text"),
+                "result": r.get("result"),
+                "conf": r.get("conf"),
+                "hb": r.get("hb"),
+                "near_20pct_of_thr": (abs(v - t) <= max(1e-12, 0.2 * abs(t))),
+                "plot_name": plot_name,
+            })
+
+    # 没数据就直接返回
+    if not rows:
+        print("[WARN] threshold_analysis: no rows found (metrics/thr keys not present).")
+        return
+
+    # 1) CSV 落盘，便于你用 Excel / pandas 再分析
+    csv_path = out_dir / "threshold_metrics.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[OK] threshold_analysis csv saved: {csv_path}")
+
+    # 2) 画图：每个 plot_name 一张图
+    # 图1：按 GT(L/R/Sym) 分布 + 画阈值线
+    grouped = {}
+    for x in rows:
+        grouped.setdefault((x["plot_name"], x["metric"]), []).append(x)
+
+    for (plot_name, metric), items in grouped.items():
+        # 收集 GT 分类
+        gts = ["Sym", "L", "R"]
+        data_by_gt = {g: [] for g in gts}
+        thr_vals = []
+        for it in items:
+            gt = it.get("gt_text")
+            if gt in data_by_gt:
+                data_by_gt[gt].append(it["value"])
+            thr_vals.append(it["threshold"])
+
+        # 阈值通常是固定值；如果不同样本有微小差异，用中位数画线
+        thr = float(np.median(thr_vals)) if thr_vals else None
+
+        plt.figure(figsize=(10, 6))
+        # 用 step hist 叠加，方便对比
+        for gt in gts:
+            vals = [v for v in data_by_gt[gt] if np.isfinite(v)]
+            if not vals:
+                continue
+            plt.hist(vals, bins=30, histtype="step", linewidth=2, label=f"GT={gt} (n={len(vals)})")
+
+        if thr is not None and np.isfinite(thr):
+            plt.axvline(thr, linestyle="--", linewidth=2, label=f"threshold={thr:.4g}")
+
+        plt.title(f"{plot_name} | {metric} distribution by GT")
+        plt.xlabel(metric)
+        plt.ylabel("count")
+        plt.legend()
+        plt.tight_layout()
+        fig_path = out_dir / f"{plot_name}__{metric}__byGT.png"
+        plt.savefig(fig_path, dpi=150)
+        plt.close()
+
+        # 图2：按 result(OK/WRONG/FN/FP) 分布（帮助你看阈值对错误类型的影响）
+        res_types = ["OK", "WRONG", "FN", "FP"]
+        data_by_res = {k: [] for k in res_types}
+        for it in items:
+            rt = it.get("result")
+            if rt in data_by_res:
+                data_by_res[rt].append(it["value"])
+
+        plt.figure(figsize=(10, 6))
+        for rt in res_types:
+            vals = [v for v in data_by_res[rt] if np.isfinite(v)]
+            if not vals:
+                continue
+            plt.hist(vals, bins=30, histtype="step", linewidth=2, label=f"{rt} (n={len(vals)})")
+
+        if thr is not None and np.isfinite(thr):
+            plt.axvline(thr, linestyle="--", linewidth=2, label=f"threshold={thr:.4g}")
+
+        plt.title(f"{plot_name} | {metric} distribution by result")
+        plt.xlabel(metric)
+        plt.ylabel("count")
+        plt.legend()
+        plt.tight_layout()
+        fig_path = out_dir / f"{plot_name}__{metric}__byResult.png"
+        plt.savefig(fig_path, dpi=150)
+        plt.close()
+
+    print(f"[OK] threshold_analysis plots saved under: {out_dir}")
+
+
+def plot_all_actions_threshold_analysis(records: List[Dict[str, Any]], output_dir: Path) -> None:
+    """
+    为所有11个动作绘制阈值统计分析图
+
+    每个动作区分：
+    - 决定性Evidence: 实际用于判断的指标
+    - 冗余Evidence: 仅供参考的指标
+
+    输出:
+    - output_dir/threshold_analysis/{action}/*.png
+    - output_dir/threshold_analysis/summary.csv
+    """
+    out_dir = output_dir / "threshold_analysis"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 每个动作的决定性Evidence配置
+    # 格式: (action, evidence_key, threshold_value, plot_title, is_decisive)
+    ACTION_EVIDENCE_CONFIG = {
+        # ========== 眼部动作 ==========
+        "SpontaneousEyeBlink": [
+            ("left_worse_ratio", 0.30, "左眼表现差帧比例", True),
+            ("right_worse_ratio", 0.30, "右眼表现差帧比例", True),
+            ("left_closure_at_peak", None, "左眼峰值闭合度", False),
+            ("right_closure_at_peak", None, "右眼峰值闭合度", False),
+        ],
+        "VoluntaryEyeBlink": [
+            ("left_worse_ratio", 0.30, "左眼表现差帧比例", True),
+            ("right_worse_ratio", 0.30, "右眼表现差帧比例", True),
+        ],
+        "CloseEyeSoftly": [
+            ("left_worse_ratio", 0.30, "左眼表现差帧比例", True),
+            ("right_worse_ratio", 0.30, "右眼表现差帧比例", True),
+        ],
+        "CloseEyeHardly": [
+            ("left_worse_ratio", 0.30, "左眼表现差帧比例", True),
+            ("right_worse_ratio", 0.30, "右眼表现差帧比例", True),
+        ],
+
+        # ========== RaiseEyebrow ==========
+        "RaiseEyebrow": [
+            ("asymmetry_ratio", 0.10, "眉眼距变化不对称比", True),
+            ("left_change", None, "左侧眉眼距变化(px)", True),
+            ("right_change", None, "右侧眉眼距变化(px)", True),
+        ],
+
+        # ========== Smile ==========
+        "Smile": [
+            ("reduction_asymmetry", 0.08, "嘴角上提不对称比", True),
+            ("left_reduction", None, "左嘴角上提量(px)", True),
+            ("right_reduction", None, "右嘴角上提量(px)", True),
+        ],
+
+        # ========== ShrugNose ==========
+        "ShrugNose": [
+            ("reduction_asymmetry", 0.08, "鼻翼收缩不对称比", True),
+            ("left_reduction", None, "左鼻翼收缩(px)", True),
+            ("right_reduction", None, "右鼻翼收缩(px)", True),
+        ],
+
+        # ========== ShowTeeth ==========
+        "ShowTeeth": [
+            ("offset_norm", 0.025, "嘴唇中心偏移(ICD归一化)", True),
+            ("current_offset_px", None, "嘴唇中心偏移(px)", True),
+            ("midline_angle_deg", 1.5, "嘴唇中线角度(°)", False),
+        ],
+
+        # ========== BlowCheek ==========
+        "BlowCheek": [
+            ("lip_offset_normalized_value", 0.020, "嘴唇偏移(ICD归一化)", True),
+            ("cheek_bulge_asymmetry_ratio", 0.10, "脸颊膨胀不对称比", True),
+            ("lip_shape_asymmetry_ratio", 0.10, "嘴唇形状不对称比", True),
+        ],
+
+        # ========== LipPucker ==========
+        "LipPucker": [
+            ("offset_norm", 0.01, "嘴唇中心偏移(ICD归一化)", True),
+            ("midline_angle_deg", 0.3, "嘴唇中线角度(°)", True),
+            ("corner_contraction_asymmetry", 0.06, "嘴角收缩不对称比", False),
+        ],
+    }
+
+    all_rows = []
+
+    for action, evidence_list in ACTION_EVIDENCE_CONFIG.items():
+        action_dir = out_dir / action
+        action_dir.mkdir(parents=True, exist_ok=True)
+
+        # 筛选该动作的记录
+        action_records = [r for r in records if r.get("action") == action]
+        if not action_records:
+            continue
+
+        for evidence_key, threshold, title, is_decisive in evidence_list:
+            # 提取数据
+            data_by_gt = {"Sym": [], "L": [], "R": []}
+            data_by_result = {"OK": [], "WRONG": [], "FN": [], "FP": []}
+
+            for r in action_records:
+                dm = r.get("detailed_metrics") or {}
+                value = dm.get(evidence_key)
+                if value is None:
+                    continue
+                try:
+                    value = float(value)
+                except:
+                    continue
+
+                gt = r.get("gt_text", "")
+                result = r.get("result", "")
+
+                if gt in data_by_gt:
+                    data_by_gt[gt].append(value)
+                if result in data_by_result:
+                    data_by_result[result].append(value)
+
+                # 记录到汇总
+                all_rows.append({
+                    "action": action,
+                    "evidence_key": evidence_key,
+                    "is_decisive": is_decisive,
+                    "threshold": threshold,
+                    "value": value,
+                    "gt": gt,
+                    "result": result,
+                    "exam_id": r.get("exam_id"),
+                })
+
+            # ========== 图1: 按GT分布 ==========
+            plt.figure(figsize=(12, 6))
+            colors = {"Sym": "green", "L": "blue", "R": "red"}
+
+            for gt in ["Sym", "L", "R"]:
+                vals = [v for v in data_by_gt[gt] if np.isfinite(v)]
+                if vals:
+                    plt.hist(vals, bins=30, histtype="step", linewidth=2,
+                             color=colors[gt], label=f"GT={gt} (n={len(vals)})")
+
+            if threshold is not None:
+                plt.axvline(threshold, linestyle="--", color="black", linewidth=2,
+                            label=f"阈值={threshold}")
+
+            decisive_mark = "★决定性" if is_decisive else "○辅助"
+            plt.title(f"{action} | {title} ({decisive_mark})\n按真实侧别分布", fontsize=12)
+            plt.xlabel(evidence_key)
+            plt.ylabel("样本数")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(action_dir / f"{evidence_key}__byGT.png", dpi=150)
+            plt.close()
+
+            # ========== 图2: 按结果分布 ==========
+            plt.figure(figsize=(12, 6))
+            colors = {"OK": "green", "WRONG": "red", "FN": "orange", "FP": "purple"}
+
+            for res in ["OK", "WRONG", "FN", "FP"]:
+                vals = [v for v in data_by_result[res] if np.isfinite(v)]
+                if vals:
+                    plt.hist(vals, bins=30, histtype="step", linewidth=2,
+                             color=colors[res], label=f"{res} (n={len(vals)})")
+
+            if threshold is not None:
+                plt.axvline(threshold, linestyle="--", color="black", linewidth=2,
+                            label=f"阈值={threshold}")
+
+            plt.title(f"{action} | {title} ({decisive_mark})\n按判断结果分布", fontsize=12)
+            plt.xlabel(evidence_key)
+            plt.ylabel("样本数")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(action_dir / f"{evidence_key}__byResult.png", dpi=150)
+            plt.close()
+
+            # ========== 图3: 左右对比散点图(如果是paired数据) ==========
+            if evidence_key.startswith("left_") or evidence_key.startswith("right_"):
+                # 找到配对的key
+                if evidence_key.startswith("left_"):
+                    pair_key = "right_" + evidence_key[5:]
+                else:
+                    pair_key = "left_" + evidence_key[6:]
+
+                left_vals = []
+                right_vals = []
+                gt_labels = []
+
+                for r in action_records:
+                    dm = r.get("detailed_metrics") or {}
+                    l = dm.get("left_" + evidence_key[5:] if evidence_key.startswith("left_") else evidence_key)
+                    r_val = dm.get("right_" + evidence_key[5:] if evidence_key.startswith("left_") else pair_key)
+
+                    if l is not None and r_val is not None:
+                        try:
+                            left_vals.append(float(l) if evidence_key.startswith("left_") else float(r_val))
+                            right_vals.append(float(r_val) if evidence_key.startswith("left_") else float(l))
+                            gt_labels.append(r.get("gt_text", ""))
+                        except:
+                            continue
+
+                if left_vals and right_vals:
+                    plt.figure(figsize=(10, 10))
+                    colors_scatter = {"Sym": "green", "L": "blue", "R": "red", "": "gray"}
+
+                    for gt in ["Sym", "L", "R"]:
+                        indices = [i for i, g in enumerate(gt_labels) if g == gt]
+                        if indices:
+                            x = [left_vals[i] for i in indices]
+                            y = [right_vals[i] for i in indices]
+                            plt.scatter(x, y, c=colors_scatter.get(gt, "gray"),
+                                        label=f"GT={gt} (n={len(indices)})", alpha=0.6)
+
+                    # 对角线
+                    all_vals = left_vals + right_vals
+                    min_v, max_v = min(all_vals), max(all_vals)
+                    plt.plot([min_v, max_v], [min_v, max_v], 'k--', alpha=0.5, label="y=x")
+
+                    plt.xlabel("Left")
+                    plt.ylabel("Right")
+                    plt.title(f"{action} | 左右对比散点图")
+                    plt.legend()
+                    plt.axis('equal')
+                    plt.tight_layout()
+                    plt.savefig(action_dir / f"LR_scatter.png", dpi=150)
+                    plt.close()
+
+    # 保存汇总CSV
+    if all_rows:
+        csv_path = out_dir / "all_evidence_summary.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_rows)
+        print(f"[OK] 阈值分析汇总已保存: {csv_path}")
+
+    print(f"[OK] 所有动作阈值分析图已保存: {out_dir}")
+
 def save_error_analysis(records: List[Dict[str, Any]], output_dir: Path):
     """保存错误案例分析"""
     error_cases = {"WRONG": [], "FN": [], "FP": []}
@@ -902,6 +1716,8 @@ def save_error_analysis(records: List[Dict[str, Any]], output_dir: Path):
 
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
+
+    analyze_thresholds_and_plot(records, output_dir)
 
     print(f"[OK] Error analysis saved to: {output_dir}")
 
@@ -1298,6 +2114,81 @@ def copy_classified_images(records: List[Dict[str, Any]], output_dir: Path):
                   f"{stats.get('FN', 0):>4} {stats.get('FP', 0):>4} {stats.get('both_sym', 0):>8}")
 
 
+def copy_exam_pack_by_gt_hb(exam_dir: Path,
+                            gt_hb: Optional[int],
+                            pred_hb: Optional[int],
+                            dst_root: Path,
+                            copy_indicators: bool = True,
+                            copy_selection_curve: bool = True,
+                            copy_peak_raw: bool = False):
+    """
+    按 GT HB 分组，把一个 exam 的 11 个动作图片打包复制到一个目录，方便肉眼检查。
+
+    目录建议：
+      dst_root/gt_hb_groups/HB{gt}/PredHB{pred}_Diff{diff}/{exam_id}/
+        NeutralFace_peak_indicators.jpg
+        NeutralFace_peak_selection_curve.png
+        ...
+    """
+    if gt_hb is None:
+        return
+
+    exam_id = exam_dir.name
+    diff = None
+    if gt_hb is not None and pred_hb is not None:
+        diff = abs(gt_hb - pred_hb)
+
+    group_dir = dst_root / "gt_hb_groups" / f"HB{gt_hb}"
+    if pred_hb is None:
+        sub_dir = group_dir / "PredHB_None"
+    else:
+        sub_dir = group_dir / f"PredHB{pred_hb}_Diff{diff}"
+
+    dst_exam_dir = sub_dir / exam_id
+    dst_exam_dir.mkdir(parents=True, exist_ok=True)
+
+    exts = ["jpg", "jpeg", "png", "webp"]
+
+    for action in ACTIONS:
+        action_dir = exam_dir / action
+        if not action_dir.exists():
+            continue
+
+        # 1) peak_indicators
+        if copy_indicators:
+            src = None
+            for ext in exts:
+                p = action_dir / f"peak_indicators.{ext}"
+                if p.exists():
+                    src = p
+                    break
+            if src:
+                dst = dst_exam_dir / f"{action}_peak_indicators{src.suffix.lower()}"
+                shutil.copy2(src, dst)
+
+        # 2) peak_selection_curve（如果你命名不固定，就找 *_curve.png）
+        if copy_selection_curve:
+            src_curve = action_dir / "peak_selection_curve.png"
+            if not src_curve.exists():
+                curves = sorted(action_dir.glob("*_curve.png"))
+                src_curve = curves[0] if curves else None
+            if src_curve and src_curve.exists():
+                dst = dst_exam_dir / f"{action}_peak_selection_curve.png"
+                shutil.copy2(src_curve, dst)
+
+        # 3) peak_raw（可选）
+        if copy_peak_raw:
+            src = None
+            for ext in exts:
+                p = action_dir / f"peak_raw.{ext}"
+                if p.exists():
+                    src = p
+                    break
+            if src:
+                dst = dst_exam_dir / f"{action}_peak_raw{src.suffix.lower()}"
+                shutil.copy2(src, dst)
+
+
 def load_indicators_json(exam_dir: Path, action: str) -> Optional[Dict[str, Any]]:
     """
     加载指定动作的indicators.json
@@ -1641,10 +2532,6 @@ def save_action_error_analysis(src_root: Path,
             print(f"[INFO] 阈值敏感性分析已保存: {sensitivity_path}")
 
 
-# =============================================================================
-# 主函数升级（添加到 collect_keyframes.py 的 main 函数中）
-# =============================================================================
-
 def enhanced_error_analysis(src_root: Path, dst_root: Path, action_results: Dict[str, List]) -> None:
     """
     增强版错误分析 - 添加到主流程末尾
@@ -1770,10 +2657,50 @@ def save_debug_csv_with_evidence(results: List[Dict[str, Any]],
 
     print(f"[INFO] 调试CSV已保存: {output_path}")
 
+
+def setup_matplotlib_chinese_font():
+    """
+    让 matplotlib 支持中文，避免：
+    Glyph xxxx missing from font(s) DejaVu Sans
+    """
+    import matplotlib
+    # 重要：先设 backend，再 import pyplot（如果你在其他地方已经 import pyplot，就把这一行去掉）
+    try:
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+
+    from matplotlib import font_manager
+
+    # Mac / Windows / Linux 常见中文字体候选
+    preferred = [
+        "PingFang SC",        # macOS
+        "Heiti SC",           # macOS
+        "STHeiti",            # macOS
+        "Microsoft YaHei",    # Windows
+        "SimHei",             # Windows
+        "Noto Sans CJK SC",   # Linux 常用
+        "Source Han Sans SC", # 思源黑体
+        "Arial Unicode MS",   # 兼容性字体(不一定有)
+    ]
+
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    for name in preferred:
+        if name in available:
+            matplotlib.rcParams["font.sans-serif"] = [name]
+            matplotlib.rcParams["axes.unicode_minus"] = False
+            return name
+
+    # 找不到就退回默认（仍会有警告，但不中断）
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return None
+
 # =============================================================================
 # 主函数
 # =============================================================================
 def main():
+    font_used = setup_matplotlib_chinese_font()
+    print(f"[INFO] Matplotlib font: {font_used}")
     if not SRC_ROOT.exists():
         raise FileNotFoundError(f"SRC_ROOT 不存在: {SRC_ROOT}")
 
@@ -1851,11 +2778,13 @@ def main():
     # ========== Session级诊断统计（新增）==========
     if all_session_records:
         session_stats = compute_session_diagnosis_statistics(all_session_records)
-        print_session_diagnosis_statistics(session_stats)
+        print_session_diagnosis_statistics(all_session_records)
 
         # 保存Session诊断结果
         save_session_diagnosis_csv(all_session_records, DST_ROOT / "session_diagnosis.csv")
         save_session_diagnosis_summary(session_stats, DST_ROOT / "session_diagnosis_summary.txt")
+        save_hb_trace_csv(all_session_records, DST_ROOT / "hb_trace.csv")
+        save_hb_trace_error_json(all_session_records, DST_ROOT / "hb_trace_error_cases.json")
 
     # 保存动作级文件
     save_by_action_csv(all_palsy_records, DST_ROOT)
@@ -1875,6 +2804,10 @@ def main():
     copy_classified_images(all_palsy_records, classified_dir)
 
     enhanced_error_analysis(SRC_ROOT, DST_ROOT, action_results)
+
+    # ========== 阈值分析图 ==========
+    print("\n生成阈值分析图...")
+    plot_all_actions_threshold_analysis(all_palsy_records, DST_ROOT)
 
     print("\n" + "=" * 60)
     print("完成!")

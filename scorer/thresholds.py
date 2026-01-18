@@ -36,7 +36,7 @@ class Thresholds:
     # =========================================================================
 
     # 闭合度阈值（1 - current_area/baseline_area）
-    EYE_CLOSURE_RATIO_CLOSED: float = 0.70  # 闭合度 > 认为眼睛闭合
+    EYE_CLOSURE_RATIO_CLOSED: float = 0.80  # 闭合度 > 认为眼睛闭合
     EYE_CLOSURE_RATIO_PARTIAL: float = 0.50  # 闭合度 > 认为部分闭合
     EYE_CLOSURE_RATIO_MINIMAL: float = 0.20  # 闭合度 > 认为有闭眼动作
 
@@ -86,6 +86,8 @@ class Thresholds:
 
     # 嘴部高度归一化阈值 (mouth_height / ICD)
     MOUTH_HEIGHT: float = 0.06
+
+    MOUTH_HEIGHT_CHANGE_MIN: float = 0.1
 
     # 嘴唇内圈面积增幅阈值
     MOUTH_INNER_AREA_INC: float = 3.5
@@ -205,7 +207,8 @@ class Thresholds:
     # RaiseEyebrow 抬眉动作阈值
     # =========================================================================
 
-    RAISE_EYEBROW_CHANGE_MIN: float = 5.0  # 最小变化量(像素)
+    RAISE_EYEBROW_CHANGE_MIN: float = 0.05  # 几乎无变化, 5%
+    RAISE_EYEBROW_CHANGE_WEAK: float = 0.1 # 微弱变化量, 10%
     RAISE_EYEBROW_SYMMETRY: float = 0.20
     RAISE_EYEBROW_SMOOTH_WIN: int = 5
 

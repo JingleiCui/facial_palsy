@@ -16,6 +16,7 @@ Session级诊断模块 - Session Diagnosis Module
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 import json
+import thresholds as THR
 
 # =============================================================================
 # 常量定义
@@ -230,246 +231,199 @@ def sunnybrook_to_hb(composite_score: int) -> int:
 # =============================================================================
 # 临床定义的 HB 分级（决策树）
 # =============================================================================
-
 def compute_hb_grade_clinical(
         action_results: Dict,
         palsy_side: int,
         sunnybrook_composite: int = None
 ) -> Tuple[int, str, Dict[str, Any]]:
     """
-    基于临床定义的 House-Brackmann 分级（决策树方法）
+    HB分级决策树
 
-    HB 量表核心区分逻辑：
-    - Grade I: 所有功能正常
-    - Grade II: 轻微不对称，眼闭合，额部有运动
-    - Grade III: 眼睑能完全闭合，但额部无/微动
-    - Grade IV: 眼睑无法完全闭合（分水岭！）
-    - Grade V: 仅有微量运动
-    - Grade VI: 完全无运动
-
-    Args:
-        action_results: {action_name: ActionResult}
-        palsy_side: 患侧 (0=无, 1=左, 2=右)
-        sunnybrook_composite: Sunnybrook综合分（用于辅助判断）
-
-    Returns:
-        (hb_grade, description, evidence_dict)
+    核心改进:
+    1. 同时使用CloseEyeSoftly和CloseEyeHardly
+    2. 使用归一化阈值而非像素值
     """
     evidence = {
-        "method": "clinical_decision_tree",
+        "method": "clinical_decision_tree_v2",
         "palsy_side": palsy_side,
-        "eye_closure": None,
+        "soft_eye_closure": None,
+        "hard_eye_closure": None,
         "forehead_movement": None,
         "mouth_movement": None,
         "decision_path": []
     }
 
-    # === 如果没有面瘫，直接返回 Grade I ===
     if palsy_side == 0:
         evidence["decision_path"].append("No palsy detected → Grade I")
         return 1, "Normal (正常)", evidence
 
-    # === Step 1: 获取关键指标 ===
+    # === Step 1: 获取两种闭眼方式的闭合度 ===
 
-    # 1.1 眼睑闭合度 (CloseEyeHardly)
-    eye_closure_affected = None
-    close_eye_result = action_results.get("CloseEyeHardly")
-    if close_eye_result is not None:
-        action_spec = getattr(close_eye_result, 'action_specific', {})
-
-        # 优先从 closure_metrics 获取
+    def get_eye_closure(action_name: str) -> Optional[float]:
+        """获取患侧眼睛闭合度"""
+        result = action_results.get(action_name)
+        if result is None:
+            return None
+        action_spec = getattr(result, 'action_specific', {})
         closure_metrics = action_spec.get("closure_metrics", {})
-        if closure_metrics:
-            if palsy_side == 1:  # 左侧面瘫
-                eye_closure_affected = closure_metrics.get("left_closure_ratio", None)
-            else:  # 右侧面瘫
-                eye_closure_affected = closure_metrics.get("right_closure_ratio", None)
 
-        # 备选：从 peak_frame 获取
-        if eye_closure_affected is None:
-            peak_frame = action_spec.get("peak_frame", {})
-            if palsy_side == 1:
-                eye_closure_affected = peak_frame.get("left_closure", None)
-            else:
-                eye_closure_affected = peak_frame.get("right_closure", None)
+        if palsy_side == 1:
+            return closure_metrics.get("left_closure_ratio")
+        else:
+            return closure_metrics.get("right_closure_ratio")
 
-    evidence["eye_closure"] = eye_closure_affected
+    soft_closure = get_eye_closure("CloseEyeSoftly")
+    hard_closure = get_eye_closure("CloseEyeHardly")
 
-    # 1.2 额部运动 (RaiseEyebrow)
-    forehead_movement_affected = None
-    forehead_movement_healthy = None
-    raise_eyebrow_result = action_results.get("RaiseEyebrow")
-    if raise_eyebrow_result is not None:
-        action_spec = getattr(raise_eyebrow_result, 'action_specific', {})
+    evidence["soft_eye_closure"] = soft_closure
+    evidence["hard_eye_closure"] = hard_closure
+
+    # === Step 2: 获取额部运动比例 ===
+    forehead_ratio = None
+    raise_eyebrow = action_results.get("RaiseEyebrow")
+    if raise_eyebrow:
+        action_spec = getattr(raise_eyebrow, 'action_specific', {})
         brow_metrics = action_spec.get("brow_eye_metrics", {})
 
-        left_change = brow_metrics.get("left_change", 0)
-        right_change = brow_metrics.get("right_change", 0)
+        left_change = abs(brow_metrics.get("left_change", 0) or 0)
+        right_change = abs(brow_metrics.get("right_change", 0) or 0)
 
-        if palsy_side == 1:  # 左侧面瘫
-            forehead_movement_affected = abs(left_change)
-            forehead_movement_healthy = abs(right_change)
-        else:  # 右侧面瘫
-            forehead_movement_affected = abs(right_change)
-            forehead_movement_healthy = abs(left_change)
+        if palsy_side == 1:
+            affected, healthy = left_change, right_change
+        else:
+            affected, healthy = right_change, left_change
 
-    evidence["forehead_movement"] = {
-        "affected": forehead_movement_affected,
-        "healthy": forehead_movement_healthy
-    }
+        forehead_ratio = affected / healthy if healthy > 1e-6 else (1.0 if affected < 1e-6 else 0.0)
 
-    # 1.3 嘴角运动 (Smile 或 ShowTeeth)
-    mouth_movement_affected = None
-    mouth_movement_healthy = None
+    evidence["forehead_ratio"] = forehead_ratio
 
-    for action_name in ["Smile", "ShowTeeth"]:
-        action_result = action_results.get(action_name)
-        if action_result is not None:
-            action_spec = getattr(action_result, 'action_specific', {})
-
-            # 从 eye_line_excursion 获取嘴角运动
+    # === Step 3: 获取口部运动比例 ===
+    mouth_ratio = None
+    for action_name in ["ShowTeeth", "Smile"]:
+        result = action_results.get(action_name)
+        if result:
+            action_spec = getattr(result, 'action_specific', {})
             if "eye_line_excursion" in action_spec:
                 exc = action_spec["eye_line_excursion"]
-                left_reduction = exc.get("left_reduction", 0)
-                right_reduction = exc.get("right_reduction", 0)
-            elif "excursion" in action_spec:
-                exc = action_spec.get("excursion", {})
-                left_reduction = exc.get("left_total", 0)
-                right_reduction = exc.get("right_total", 0)
-            else:
-                continue
+                left_red = abs(exc.get("left_reduction", 0) or 0)
+                right_red = abs(exc.get("right_reduction", 0) or 0)
 
-            if palsy_side == 1:
-                mouth_movement_affected = abs(left_reduction) if left_reduction else 0
-                mouth_movement_healthy = abs(right_reduction) if right_reduction else 0
-            else:
-                mouth_movement_affected = abs(right_reduction) if right_reduction else 0
-                mouth_movement_healthy = abs(left_reduction) if left_reduction else 0
+                if palsy_side == 1:
+                    affected, healthy = left_red, right_red
+                else:
+                    affected, healthy = right_red, left_red
 
-            if mouth_movement_affected is not None:
-                break  # 找到一个有效的就行
+                mouth_ratio = affected / healthy if healthy > 1e-6 else (1.0 if affected < 1e-6 else 0.0)
+                evidence["mouth_source_action"] = action_name
+                break
 
-    evidence["mouth_movement"] = {
-        "affected": mouth_movement_affected,
-        "healthy": mouth_movement_healthy
+    evidence["mouth_ratio"] = mouth_ratio
+
+    # === Step 4: 决策树判断 ===
+
+    # 阈值定义（全部使用比例/归一化值）
+    EYE_CLOSURE_COMPLETE = THR.EYE_CLOSURE_RATIO_CLOSED  # 闭合度视为完全闭合
+    EYE_CLOSURE_PARTIAL = THR.EYE_CLOSURE_RATIO_PARTIAL  # 闭合度视为部分闭合
+    FOREHEAD_RATIO_MINIMAL = THR.RAISE_EYEBROW_CHANGE_MIN  # 额部运动比视为无运动
+    FOREHEAD_RATIO_WEAK = THR.RAISE_EYEBROW_CHANGE_WEAK # 额部运动比视为微弱
+    MOUTH_RATIO_MINIMAL = THR.OUTH_HEIGHT_CHANGE_MIN  # 口部运动比<20%视为微量
+
+    evidence["thresholds"] = {
+        "EYE_CLOSURE_COMPLETE": EYE_CLOSURE_COMPLETE,
+        "FOREHEAD_MINIMAL": FOREHEAD_RATIO_MINIMAL,
+        "FOREHEAD_WEAK": FOREHEAD_RATIO_WEAK,
+        "MOUTH_MINIMAL": MOUTH_RATIO_MINIMAL,
+        "FOREHEAD_RATIO_GRADE_III_MAX": 0.25,
+        "ASYM_GRADE_I_MAX": 0.10,
     }
 
-    # === Step 2: 决策树判断 ===
-
-    # 阈值定义（可调整）
-    EYE_CLOSURE_COMPLETE = 0.85  # 闭合度 >= 85% 视为完全闭合
-    FOREHEAD_MINIMAL = 3.0  # 额部变化 < 3px 视为无运动
-    FOREHEAD_WEAK = 8.0  # 额部变化 < 8px 视为微弱
-    MOUTH_MINIMAL = 5.0  # 嘴角运动 < 5px 视为微量
-
-    # === 检查是否全瘫 (Grade VI) ===
-    total_movement = 0
+    # --- 检查是否全瘫 (Grade VI) ---
     movement_count = 0
+    total_ratio = 0
 
-    if forehead_movement_affected is not None:
-        total_movement += forehead_movement_affected
+    if hard_closure is not None:
+        total_ratio += hard_closure
         movement_count += 1
-    if mouth_movement_affected is not None:
-        total_movement += mouth_movement_affected
+    if forehead_ratio is not None:
+        total_ratio += forehead_ratio
         movement_count += 1
-    if eye_closure_affected is not None:
-        # 闭合度转换为"运动量"：完全不闭合=0运动
-        eye_movement = eye_closure_affected * 50  # 缩放到可比较范围
-        total_movement += eye_movement
+    if mouth_ratio is not None:
+        total_ratio += mouth_ratio
         movement_count += 1
 
-    avg_movement = total_movement / movement_count if movement_count > 0 else 0
+    avg_movement = total_ratio / movement_count if movement_count > 0 else 0
 
-    if movement_count >= 2 and avg_movement < 2.0:
-        evidence["decision_path"].append(f"Total movement very low ({avg_movement:.1f}) → Grade VI")
+    evidence["avg_movement"] = avg_movement
+    evidence["movement_count"] = movement_count
+
+    if movement_count >= 2 and avg_movement < 0.05:
+        evidence["decision_path"].append(f"Total movement very low ({avg_movement:.1%}) → Grade VI")
         return 6, "Total paralysis (完全麻痹)", evidence
 
-    # === 检查眼睑闭合 (Grade IV 的分水岭) ===
-    if eye_closure_affected is not None:
-        if eye_closure_affected < EYE_CLOSURE_COMPLETE:
-            # 眼睛无法完全闭合 → 进入 Grade IV-V 范围
-            evidence["decision_path"].append(
-                f"Eye closure incomplete ({eye_closure_affected:.1%} < {EYE_CLOSURE_COMPLETE:.0%})"
-            )
+    # --- 检查用力闭眼 (Grade IV-V 分水岭) ---
+    if hard_closure is not None and hard_closure < EYE_CLOSURE_COMPLETE:
+        evidence["decision_path"].append(
+            f"Hard eye closure incomplete ({hard_closure:.1%} < {EYE_CLOSURE_COMPLETE:.0%})"
+        )
 
-            # 区分 IV vs V：看嘴角是否有一定运动
-            if mouth_movement_affected is not None and mouth_movement_affected > MOUTH_MINIMAL:
-                evidence["decision_path"].append(
-                    f"Mouth movement present ({mouth_movement_affected:.1f}px) → Grade IV"
-                )
-                return 4, "Moderately severe dysfunction (中重度功能障碍)", evidence
-            else:
-                # 嘴角也几乎不动
-                evidence["decision_path"].append(
-                    f"Mouth movement minimal ({mouth_movement_affected}px) → Grade V"
-                )
-                return 5, "Severe dysfunction (重度功能障碍)", evidence
-        else:
-            evidence["decision_path"].append(
-                f"Eye closure complete ({eye_closure_affected:.1%} >= {EYE_CLOSURE_COMPLETE:.0%})"
-            )
-    else:
-        # 没有闭眼数据，使用 Sunnybrook 辅助判断
-        evidence["decision_path"].append("No eye closure data, using Sunnybrook fallback")
-        if sunnybrook_composite is not None and sunnybrook_composite < 40:
+        # 区分IV vs V: 看口部是否有一定运动
+        if mouth_ratio is not None and mouth_ratio > MOUTH_RATIO_MINIMAL:
+            evidence["decision_path"].append(f"Mouth movement present (ratio={mouth_ratio:.1%}) → Grade IV")
             return 4, "Moderately severe dysfunction (中重度功能障碍)", evidence
-
-    # === 眼睛能闭合 → 检查额部运动 (Grade III 的分水岭) ===
-    if forehead_movement_affected is not None:
-        # 计算患侧相对健侧的运动比例
-        if forehead_movement_healthy and forehead_movement_healthy > FOREHEAD_MINIMAL:
-            forehead_ratio = forehead_movement_affected / forehead_movement_healthy
         else:
-            forehead_ratio = 1.0 if forehead_movement_affected > FOREHEAD_MINIMAL else 0.0
+            evidence["decision_path"].append(f"Mouth movement minimal → Grade V")
+            return 5, "Severe dysfunction (重度功能障碍)", evidence
 
-        if forehead_movement_affected < FOREHEAD_MINIMAL or forehead_ratio < 0.25:
+    # --- 检查轻闭眼 vs 用力闭眼 (Grade II vs III 关键区分！) ---
+    if soft_closure is not None and hard_closure is not None:
+        if soft_closure < EYE_CLOSURE_COMPLETE and hard_closure >= EYE_CLOSURE_COMPLETE:
+            # 轻闭眼不完全，但用力可以闭合 → Grade III
             evidence["decision_path"].append(
-                f"Forehead movement minimal (affected={forehead_movement_affected:.1f}px, "
-                f"ratio={forehead_ratio:.1%}) → Grade III"
+                f"Soft closure incomplete ({soft_closure:.1%}), "
+                f"but hard closure complete ({hard_closure:.1%}) → Grade III"
             )
             return 3, "Moderate dysfunction (中度功能障碍)", evidence
-        elif forehead_ratio < 0.60:
+
+        elif soft_closure >= EYE_CLOSURE_COMPLETE:
+            # 轻闭眼就能完全闭合
             evidence["decision_path"].append(
-                f"Forehead movement weak (ratio={forehead_ratio:.1%}) → between II-III"
+                f"Soft closure complete ({soft_closure:.1%}) → checking forehead"
             )
-            # 边界情况，检查嘴角对称性
-            if mouth_movement_affected is not None and mouth_movement_healthy is not None:
-                if mouth_movement_healthy > MOUTH_MINIMAL:
-                    mouth_ratio = mouth_movement_affected / mouth_movement_healthy
-                    if mouth_ratio < 0.5:
-                        return 3, "Moderate dysfunction (中度功能障碍)", evidence
+
+    # --- 检查额部运动 (Grade II vs III 辅助区分) ---
+    if forehead_ratio is not None:
+        if forehead_ratio < FOREHEAD_RATIO_MINIMAL:
+            evidence["decision_path"].append(
+                f"Forehead movement minimal ({forehead_ratio:.1%}) → Grade III"
+            )
+            return 3, "Moderate dysfunction (中度功能障碍)", evidence
+        elif forehead_ratio < FOREHEAD_RATIO_WEAK:
+            evidence["decision_path"].append(
+                f"Forehead movement weak ({forehead_ratio:.1%}) → Grade III"
+            )
             return 3, "Moderate dysfunction (中度功能障碍)", evidence
         else:
             evidence["decision_path"].append(
-                f"Forehead movement present (ratio={forehead_ratio:.1%})"
+                f"Forehead movement present ({forehead_ratio:.1%})"
             )
-    else:
-        evidence["decision_path"].append("No forehead data")
 
-    # === 眼睛能闭合，额部有运动 → Grade I 或 II ===
-    # 通过整体对称性区分
-
+    # --- 区分 Grade I vs II ---
     asymmetry_indicators = []
-
-    if forehead_movement_affected is not None and forehead_movement_healthy is not None:
-        if forehead_movement_healthy > FOREHEAD_MINIMAL:
-            forehead_asym = 1.0 - (forehead_movement_affected / forehead_movement_healthy)
-            asymmetry_indicators.append(max(0, forehead_asym))
-
-    if mouth_movement_affected is not None and mouth_movement_healthy is not None:
-        if mouth_movement_healthy > MOUTH_MINIMAL:
-            mouth_asym = 1.0 - (mouth_movement_affected / mouth_movement_healthy)
-            asymmetry_indicators.append(max(0, mouth_asym))
+    if forehead_ratio is not None:
+        asymmetry_indicators.append(1.0 - forehead_ratio)
+    if mouth_ratio is not None:
+        asymmetry_indicators.append(1.0 - mouth_ratio)
 
     if asymmetry_indicators:
         avg_asymmetry = sum(asymmetry_indicators) / len(asymmetry_indicators)
-        evidence["overall_asymmetry"] = avg_asymmetry
+        evidence["avg_asymmetry"] = avg_asymmetry
+        evidence["asymmetry_indicators"] = asymmetry_indicators
 
         if avg_asymmetry < 0.10:
             evidence["decision_path"].append(f"Minimal asymmetry ({avg_asymmetry:.1%}) → Grade I")
             return 1, "Normal (正常)", evidence
         else:
-            evidence["decision_path"].append(f"Mild asymmetry ({avg_asymmetry:.1%}) → Grade II")
+            evidence["decision_path"].append(f"Slight asymmetry ({avg_asymmetry:.1%}) → Grade II")
             return 2, "Slight dysfunction (轻度功能障碍)", evidence
 
     # 默认
