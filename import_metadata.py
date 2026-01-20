@@ -476,6 +476,6 @@ if __name__ == '__main__':
         db_path='facialPalsy.db',
         videos_base_path='/Users/cuijinglei/Documents/facialPalsy/videos',
         update_mode='smart',
-        start_patient_id='XW000181',  # 指定开始
-        end_patient_id='XW000181'  # 指定结束
+        start_patient_id='XW000427',  # 指定开始
+        end_patient_id='XW000437'  # 指定结束
     )

@@ -16,7 +16,14 @@ Session级诊断模块 - Session Diagnosis Module
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 import json
-import thresholds as THR
+from thresholds import THR
+
+# 导入HB分级模块
+from hb_grading import (
+    compute_hb_grade,
+    HBGradingResult,
+    print_hb_result
+)
 
 # =============================================================================
 # 常量定义
@@ -121,13 +128,13 @@ class SessionDiagnosis:
     palsy_side_confidence: float
 
     # === Sunnybrook详情 ===
-    resting_score: int  # 0-20
-    voluntary_score: int  # 20-100
-    synkinesis_score: int  # 0-15
+    resting_score: int = 0  # 0-20
+    voluntary_score: int = 0  # 20-100
+    synkinesis_score: int = 0  # 0-15
 
     # === 投票与证据 ===
-    left_score: float  # 左侧累计证据
-    right_score: float  # 右侧累计证据
+    left_score: float = 0.0  # 左侧累计证据
+    right_score: float = 0.0  # 右侧累计证据
     votes: List[VoteRecord] = field(default_factory=list)
     top_evidence: List[VoteRecord] = field(default_factory=list)
 
@@ -137,6 +144,11 @@ class SessionDiagnosis:
 
     # === HB 分级证据 ===
     hb_evidence: Dict[str, Any] = field(default_factory=dict)
+
+    # === HB 组件分级 ===
+    hb_component_grades: Dict[str, Any] = field(default_factory=dict)
+    hb_worst_component: str = ""
+    hb_decision_path: List[str] = field(default_factory=list)
 
     # === 可解释性 ===
     interpretation: str = ""
@@ -182,6 +194,9 @@ class SessionDiagnosis:
                 for v in self.top_evidence
             ],
             "hb_evidence": self.hb_evidence,
+            "hb_component_grades": self.hb_component_grades,
+            "hb_worst_component": self.hb_worst_component,
+            "hb_decision_path": self.hb_decision_path,
             "consistency_checks": [
                 {
                     "rule_id": c.rule_id,
@@ -195,6 +210,160 @@ class SessionDiagnosis:
             "adjustments_made": self.adjustments_made,
             "interpretation": self.interpretation,
         }
+
+
+# =============================================================================
+# Sunnybrook 相关计算
+# =============================================================================
+
+def calculate_sunnybrook_from_results(action_results: Dict, palsy_side: int):
+    """
+    从动作结果计算Sunnybrook评分
+
+    这是一个简化版本，返回一个带有必要属性的对象
+
+    Args:
+        action_results: 动作结果字典
+        palsy_side: 面瘫侧别 (0=无, 1=左, 2=右)
+
+    Returns:
+        SunnybrookScore对象（简化版）
+    """
+
+    @dataclass
+    class RestingSymmetry:
+        total_score: int = 0
+
+    @dataclass
+    class VoluntaryMovement:
+        total_score: int = 0
+
+    @dataclass
+    class Synkinesis:
+        total_score: int = 0
+
+    @dataclass
+    class SunnybrookScore:
+        resting_symmetry: RestingSymmetry = field(default_factory=RestingSymmetry)
+        voluntary_movement: VoluntaryMovement = field(default_factory=VoluntaryMovement)
+        synkinesis: Synkinesis = field(default_factory=Synkinesis)
+        composite_score: int = 100
+
+    if palsy_side == 0:
+        # 无面瘫，返回满分
+        return SunnybrookScore(
+            resting_symmetry=RestingSymmetry(total_score=0),
+            voluntary_movement=VoluntaryMovement(total_score=100),
+            synkinesis=Synkinesis(total_score=0),
+            composite_score=100
+        )
+
+    # === 计算 Resting Symmetry (0-20, 越高越差) ===
+    resting_score = 0
+    neutral = action_results.get("NeutralFace")
+    if neutral:
+        # 检查静息状态不对称
+        palp_ratio = getattr(neutral, 'palpebral_height_ratio', 1.0) or 1.0
+        nlf_ratio = getattr(neutral, 'nlf_ratio', 1.0) or 1.0
+        oral_angle = getattr(neutral, 'oral_angle', None)
+
+        palp_dev = abs(palp_ratio - 1.0)
+        nlf_dev = abs(nlf_ratio - 1.0)
+        oral_diff = oral_angle.angle_diff if oral_angle else 0
+
+        # 眼睑裂不对称 (0-4)
+        if palp_dev > 0.25:
+            resting_score += 4
+        elif palp_dev > 0.15:
+            resting_score += 2
+        elif palp_dev > 0.08:
+            resting_score += 1
+
+        # 鼻唇沟不对称 (0-8)
+        if nlf_dev > 0.30:
+            resting_score += 8
+        elif nlf_dev > 0.20:
+            resting_score += 4
+        elif nlf_dev > 0.10:
+            resting_score += 2
+
+        # 口角不对称 (0-8)
+        if oral_diff > 15:
+            resting_score += 8
+        elif oral_diff > 10:
+            resting_score += 4
+        elif oral_diff > 5:
+            resting_score += 2
+
+    # === 计算 Voluntary Movement (20-100, 越高越好) ===
+    voluntary_score = 0
+    voluntary_items = 0
+
+    # Brow (RaiseEyebrow) - 最高20分
+    raise_eyebrow = action_results.get("RaiseEyebrow")
+    if raise_eyebrow:
+        vol_score = getattr(raise_eyebrow, 'voluntary_movement_score', 3) or 3
+        voluntary_score += vol_score * 4  # 1-5 → 4-20
+        voluntary_items += 1
+
+    # Eye closure (CloseEyeSoftly) - 最高20分
+    close_eye = action_results.get("CloseEyeSoftly") or action_results.get("CloseEyeHardly")
+    if close_eye:
+        vol_score = getattr(close_eye, 'voluntary_movement_score', 3) or 3
+        voluntary_score += vol_score * 4
+        voluntary_items += 1
+
+    # Smile/ShowTeeth - 最高20分
+    smile = action_results.get("ShowTeeth") or action_results.get("Smile")
+    if smile:
+        vol_score = getattr(smile, 'voluntary_movement_score', 3) or 3
+        voluntary_score += vol_score * 4
+        voluntary_items += 1
+
+    # Snarl (ShrugNose) - 最高20分
+    snarl = action_results.get("ShrugNose")
+    if snarl:
+        vol_score = getattr(snarl, 'voluntary_movement_score', 3) or 3
+        voluntary_score += vol_score * 4
+        voluntary_items += 1
+
+    # LipPucker - 最高20分
+    pucker = action_results.get("LipPucker")
+    if pucker:
+        vol_score = getattr(pucker, 'voluntary_movement_score', 3) or 3
+        voluntary_score += vol_score * 4
+        voluntary_items += 1
+
+    # 归一化到20-100范围
+    if voluntary_items > 0:
+        voluntary_score = int(20 + (voluntary_score / voluntary_items) * 16)
+    else:
+        voluntary_score = 60  # 默认中等
+
+    voluntary_score = min(100, max(20, voluntary_score))
+
+    # === 计算 Synkinesis (0-15, 越高越差) ===
+    synkinesis_score = 0
+    for action_name, result in action_results.items():
+        if result is None:
+            continue
+        syn_scores = getattr(result, 'synkinesis_scores', {}) or {}
+        eye_syn = syn_scores.get('eye_synkinesis', 0) or 0
+        mouth_syn = syn_scores.get('mouth_synkinesis', 0) or 0
+        synkinesis_score += max(eye_syn, mouth_syn)
+
+    synkinesis_score = min(15, synkinesis_score)
+
+    # === Composite Score ===
+    composite = voluntary_score - resting_score - synkinesis_score
+    composite = max(0, min(100, composite))
+
+    return SunnybrookScore(
+        resting_symmetry=RestingSymmetry(total_score=resting_score),
+        voluntary_movement=VoluntaryMovement(total_score=voluntary_score),
+        synkinesis=Synkinesis(total_score=synkinesis_score),
+        composite_score=composite
+    )
 
 
 # =============================================================================
@@ -226,209 +395,6 @@ def sunnybrook_to_hb(composite_score: int) -> int:
         return 5
     else:
         return 6
-
-
-# =============================================================================
-# 临床定义的 HB 分级（决策树）
-# =============================================================================
-def compute_hb_grade_clinical(
-        action_results: Dict,
-        palsy_side: int,
-        sunnybrook_composite: int = None
-) -> Tuple[int, str, Dict[str, Any]]:
-    """
-    HB分级决策树
-
-    核心改进:
-    1. 同时使用CloseEyeSoftly和CloseEyeHardly
-    2. 使用归一化阈值而非像素值
-    """
-    evidence = {
-        "method": "clinical_decision_tree_v2",
-        "palsy_side": palsy_side,
-        "soft_eye_closure": None,
-        "hard_eye_closure": None,
-        "forehead_movement": None,
-        "mouth_movement": None,
-        "decision_path": []
-    }
-
-    if palsy_side == 0:
-        evidence["decision_path"].append("No palsy detected → Grade I")
-        return 1, "Normal (正常)", evidence
-
-    # === Step 1: 获取两种闭眼方式的闭合度 ===
-
-    def get_eye_closure(action_name: str) -> Optional[float]:
-        """获取患侧眼睛闭合度"""
-        result = action_results.get(action_name)
-        if result is None:
-            return None
-        action_spec = getattr(result, 'action_specific', {})
-        closure_metrics = action_spec.get("closure_metrics", {})
-
-        if palsy_side == 1:
-            return closure_metrics.get("left_closure_ratio")
-        else:
-            return closure_metrics.get("right_closure_ratio")
-
-    soft_closure = get_eye_closure("CloseEyeSoftly")
-    hard_closure = get_eye_closure("CloseEyeHardly")
-
-    evidence["soft_eye_closure"] = soft_closure
-    evidence["hard_eye_closure"] = hard_closure
-
-    # === Step 2: 获取额部运动比例 ===
-    forehead_ratio = None
-    raise_eyebrow = action_results.get("RaiseEyebrow")
-    if raise_eyebrow:
-        action_spec = getattr(raise_eyebrow, 'action_specific', {})
-        brow_metrics = action_spec.get("brow_eye_metrics", {})
-
-        left_change = abs(brow_metrics.get("left_change", 0) or 0)
-        right_change = abs(brow_metrics.get("right_change", 0) or 0)
-
-        if palsy_side == 1:
-            affected, healthy = left_change, right_change
-        else:
-            affected, healthy = right_change, left_change
-
-        forehead_ratio = affected / healthy if healthy > 1e-6 else (1.0 if affected < 1e-6 else 0.0)
-
-    evidence["forehead_ratio"] = forehead_ratio
-
-    # === Step 3: 获取口部运动比例 ===
-    mouth_ratio = None
-    for action_name in ["ShowTeeth", "Smile"]:
-        result = action_results.get(action_name)
-        if result:
-            action_spec = getattr(result, 'action_specific', {})
-            if "eye_line_excursion" in action_spec:
-                exc = action_spec["eye_line_excursion"]
-                left_red = abs(exc.get("left_reduction", 0) or 0)
-                right_red = abs(exc.get("right_reduction", 0) or 0)
-
-                if palsy_side == 1:
-                    affected, healthy = left_red, right_red
-                else:
-                    affected, healthy = right_red, left_red
-
-                mouth_ratio = affected / healthy if healthy > 1e-6 else (1.0 if affected < 1e-6 else 0.0)
-                evidence["mouth_source_action"] = action_name
-                break
-
-    evidence["mouth_ratio"] = mouth_ratio
-
-    # === Step 4: 决策树判断 ===
-
-    # 阈值定义（全部使用比例/归一化值）
-    EYE_CLOSURE_COMPLETE = THR.EYE_CLOSURE_RATIO_CLOSED  # 闭合度视为完全闭合
-    EYE_CLOSURE_PARTIAL = THR.EYE_CLOSURE_RATIO_PARTIAL  # 闭合度视为部分闭合
-    FOREHEAD_RATIO_MINIMAL = THR.RAISE_EYEBROW_CHANGE_MIN  # 额部运动比视为无运动
-    FOREHEAD_RATIO_WEAK = THR.RAISE_EYEBROW_CHANGE_WEAK # 额部运动比视为微弱
-    MOUTH_RATIO_MINIMAL = THR.OUTH_HEIGHT_CHANGE_MIN  # 口部运动比<20%视为微量
-
-    evidence["thresholds"] = {
-        "EYE_CLOSURE_COMPLETE": EYE_CLOSURE_COMPLETE,
-        "FOREHEAD_MINIMAL": FOREHEAD_RATIO_MINIMAL,
-        "FOREHEAD_WEAK": FOREHEAD_RATIO_WEAK,
-        "MOUTH_MINIMAL": MOUTH_RATIO_MINIMAL,
-        "FOREHEAD_RATIO_GRADE_III_MAX": 0.25,
-        "ASYM_GRADE_I_MAX": 0.10,
-    }
-
-    # --- 检查是否全瘫 (Grade VI) ---
-    movement_count = 0
-    total_ratio = 0
-
-    if hard_closure is not None:
-        total_ratio += hard_closure
-        movement_count += 1
-    if forehead_ratio is not None:
-        total_ratio += forehead_ratio
-        movement_count += 1
-    if mouth_ratio is not None:
-        total_ratio += mouth_ratio
-        movement_count += 1
-
-    avg_movement = total_ratio / movement_count if movement_count > 0 else 0
-
-    evidence["avg_movement"] = avg_movement
-    evidence["movement_count"] = movement_count
-
-    if movement_count >= 2 and avg_movement < 0.05:
-        evidence["decision_path"].append(f"Total movement very low ({avg_movement:.1%}) → Grade VI")
-        return 6, "Total paralysis (完全麻痹)", evidence
-
-    # --- 检查用力闭眼 (Grade IV-V 分水岭) ---
-    if hard_closure is not None and hard_closure < EYE_CLOSURE_COMPLETE:
-        evidence["decision_path"].append(
-            f"Hard eye closure incomplete ({hard_closure:.1%} < {EYE_CLOSURE_COMPLETE:.0%})"
-        )
-
-        # 区分IV vs V: 看口部是否有一定运动
-        if mouth_ratio is not None and mouth_ratio > MOUTH_RATIO_MINIMAL:
-            evidence["decision_path"].append(f"Mouth movement present (ratio={mouth_ratio:.1%}) → Grade IV")
-            return 4, "Moderately severe dysfunction (中重度功能障碍)", evidence
-        else:
-            evidence["decision_path"].append(f"Mouth movement minimal → Grade V")
-            return 5, "Severe dysfunction (重度功能障碍)", evidence
-
-    # --- 检查轻闭眼 vs 用力闭眼 (Grade II vs III 关键区分！) ---
-    if soft_closure is not None and hard_closure is not None:
-        if soft_closure < EYE_CLOSURE_COMPLETE and hard_closure >= EYE_CLOSURE_COMPLETE:
-            # 轻闭眼不完全，但用力可以闭合 → Grade III
-            evidence["decision_path"].append(
-                f"Soft closure incomplete ({soft_closure:.1%}), "
-                f"but hard closure complete ({hard_closure:.1%}) → Grade III"
-            )
-            return 3, "Moderate dysfunction (中度功能障碍)", evidence
-
-        elif soft_closure >= EYE_CLOSURE_COMPLETE:
-            # 轻闭眼就能完全闭合
-            evidence["decision_path"].append(
-                f"Soft closure complete ({soft_closure:.1%}) → checking forehead"
-            )
-
-    # --- 检查额部运动 (Grade II vs III 辅助区分) ---
-    if forehead_ratio is not None:
-        if forehead_ratio < FOREHEAD_RATIO_MINIMAL:
-            evidence["decision_path"].append(
-                f"Forehead movement minimal ({forehead_ratio:.1%}) → Grade III"
-            )
-            return 3, "Moderate dysfunction (中度功能障碍)", evidence
-        elif forehead_ratio < FOREHEAD_RATIO_WEAK:
-            evidence["decision_path"].append(
-                f"Forehead movement weak ({forehead_ratio:.1%}) → Grade III"
-            )
-            return 3, "Moderate dysfunction (中度功能障碍)", evidence
-        else:
-            evidence["decision_path"].append(
-                f"Forehead movement present ({forehead_ratio:.1%})"
-            )
-
-    # --- 区分 Grade I vs II ---
-    asymmetry_indicators = []
-    if forehead_ratio is not None:
-        asymmetry_indicators.append(1.0 - forehead_ratio)
-    if mouth_ratio is not None:
-        asymmetry_indicators.append(1.0 - mouth_ratio)
-
-    if asymmetry_indicators:
-        avg_asymmetry = sum(asymmetry_indicators) / len(asymmetry_indicators)
-        evidence["avg_asymmetry"] = avg_asymmetry
-        evidence["asymmetry_indicators"] = asymmetry_indicators
-
-        if avg_asymmetry < 0.10:
-            evidence["decision_path"].append(f"Minimal asymmetry ({avg_asymmetry:.1%}) → Grade I")
-            return 1, "Normal (正常)", evidence
-        else:
-            evidence["decision_path"].append(f"Slight asymmetry ({avg_asymmetry:.1%}) → Grade II")
-            return 2, "Slight dysfunction (轻度功能障碍)", evidence
-
-    # 默认
-    evidence["decision_path"].append("Insufficient data → default Grade II")
-    return 2, "Slight dysfunction (轻度功能障碍)", evidence
 
 
 def hb_to_sunnybrook_range(hb_grade: int) -> Tuple[int, int]:
@@ -662,7 +628,6 @@ def check_consistency(
         ))
 
         # R3: HB-Sunnybrook合理性检查
-        # 注意：HB 由临床决策树计算，可能与 Sunnybrook 映射有差异，这是正常的
         expected_hb = sunnybrook_to_hb(sunnybrook_score)
         hb_diff = abs(hb_grade - expected_hb)
 
@@ -673,8 +638,7 @@ def check_consistency(
                 passed=True,
                 message=f"临床HB={hb_grade} 与 Sunnybrook映射={expected_hb} 完全一致 ✓"
             ))
-        elif (hb_diff == 1 or hb_diff == 2 or hb_diff == 3):
-            # 差1级是可接受的（临床决策树更精细）
+        elif hb_diff <= 2:
             checks.append(ConsistencyCheck(
                 rule_id="R3",
                 rule_name="HB-Sunnybrook兼容",
@@ -683,7 +647,6 @@ def check_consistency(
                 severity="info"
             ))
         else:
-            # 差4级以上需要关注
             checks.append(ConsistencyCheck(
                 rule_id="R3",
                 rule_name="HB-Sunnybrook兼容",
@@ -698,9 +661,8 @@ def check_consistency(
         right_votes = sum(1 for v in votes if v.side == 2)
 
         if left_votes > 0 and right_votes > 0:
-            # 存在冲突投票
             ratio = min(left_votes, right_votes) / max(left_votes, right_votes)
-            if ratio > 0.5:  # 冲突严重
+            if ratio > 0.5:
                 checks.append(ConsistencyCheck(
                     rule_id="R4",
                     rule_name="投票方向一致",
@@ -744,113 +706,110 @@ def compute_session_diagnosis(
     Returns:
         SessionDiagnosis 对象
     """
-    # === Step 1: 获取Sunnybrook评分 ===
-    if sunnybrook_score_obj is not None:
-        resting_score = sunnybrook_score_obj.resting_score
-        voluntary_score = sunnybrook_score_obj.voluntary_score
-        synkinesis_score = sunnybrook_score_obj.synkinesis_score
-        composite_score = sunnybrook_score_obj.composite_score
-    else:
-        # 如果没有传入，使用默认值（健康人）
-        resting_score = 0
-        voluntary_score = 100
-        synkinesis_score = 0
-        composite_score = 100
+    # ========== 1. 使用新的HB分级计算 ==========
+    hb_result = compute_hb_grade(action_results)
 
-    # === Step 3: 收集投票并确定患侧 ===
-    votes = collect_votes(action_results)
-    left_score, right_score, voted_side, side_confidence = aggregate_votes(votes)
+    # 提取核心结果
+    palsy_side = hb_result.palsy_side
+    palsy_side_confidence = hb_result.confidence
+    hb_grade = hb_result.final_grade
+    hb_description = hb_result.final_description
 
-    # === Step 4: 确定是否面瘫 ===
-    # 主要依据: Sunnybrook < 90 或 HB > 1
-    # 辅助依据: 投票总分 > 阈值
-    total_vote_score = left_score + right_score
+    # 判断是否有面瘫
+    has_palsy = (palsy_side != 0)
 
-    if composite_score >= 90 and total_vote_score < 0.5:
-        has_palsy = False
-    elif composite_score < 70 or total_vote_score > 1.5:
-        has_palsy = True
-    else:
-        # 边界情况：综合判断
-        has_palsy = (composite_score < 85) or (total_vote_score > 0.8)
-
-    # === Step 5: 确定最终患侧 ===
-    if not has_palsy:
-        palsy_side = 0
-    else:
-        palsy_side = voted_side
-        # 如果投票不确定，尝试从Resting Symmetry获取
-        if palsy_side == 0 and sunnybrook_score_obj is not None:
-            resting = sunnybrook_score_obj.resting_symmetry
-            if hasattr(resting, 'affected_side'):
-                affected = resting.affected_side
-                if "Left" in affected:
-                    palsy_side = 1
-                elif "Right" in affected:
-                    palsy_side = 2
-
+    # 面瘫侧别文本
     palsy_side_text = palsy_side_to_text(palsy_side)
 
-    # === Step 5.5: 使用临床决策树计算 HB 分级 ===
-    hb_grade, hb_description, hb_evidence = compute_hb_grade_clinical(
-        action_results=action_results,
-        palsy_side=palsy_side,
-        sunnybrook_composite=composite_score
-    )
+    # ========== 2. 计算 Sunnybrook 评分 ==========
+    sunnybrook = calculate_sunnybrook_from_results(action_results, palsy_side)
+    sunnybrook_composite = sunnybrook.composite_score if sunnybrook else 100
 
-    # === Step 6: 一致性检查与调整 ===
+    # ========== 3. 收集投票 ==========
+    votes = collect_votes(action_results)
+    left_score, right_score, _, _ = aggregate_votes(votes)
+
+    # 获取top证据
+    top_evidence = sorted(votes, key=lambda x: x.weighted_score, reverse=True)[:5]
+
+    # ========== 4. 构建HB组件详情 ==========
+    component_details = {
+        "a1_general": {
+            "grade": hb_result.a1_general.grade,
+            "description": hb_result.a1_general.grade_description,
+        },
+        "a2_at_rest": {
+            "grade": hb_result.a2_at_rest.grade,
+            "description": hb_result.a2_at_rest.grade_description,
+        },
+        "a3_forehead": {
+            "grade": hb_result.a3_forehead.grade,
+            "description": hb_result.a3_forehead.grade_description,
+        },
+        "a4_eyes": {
+            "grade": hb_result.a4_eyes.grade,
+            "description": hb_result.a4_eyes.grade_description,
+        },
+        "a5_mouth": {
+            "grade": hb_result.a5_mouth.grade,
+            "description": hb_result.a5_mouth.grade_description,
+        },
+    }
+
+    # 确定最差的评估项
+    worst_component = max(
+        [("a1", hb_result.a1_general.grade),
+         ("a2", hb_result.a2_at_rest.grade),
+         ("a3", hb_result.a3_forehead.grade),
+         ("a4", hb_result.a4_eyes.grade),
+         ("a5", hb_result.a5_mouth.grade)],
+        key=lambda x: x[1]
+    )[0]
+
+    # ========== 5. 一致性检查 ==========
     checks, adjustments = check_consistency(
-        has_palsy, palsy_side, hb_grade, composite_score, votes
+        has_palsy, palsy_side, hb_grade, sunnybrook_composite, votes
     )
 
-    # 如果没有面瘫，强制 Grade I
-    if not has_palsy:
-        palsy_side = 0
-        palsy_side_text = "无"
-        hb_grade = 1
-        hb_description = HB_DESCRIPTIONS[1]
-
-    # === Step 7: 计算整体置信度 ===
-    if not has_palsy:
-        confidence = max(0.5, 1.0 - total_vote_score)
-    else:
-        # 置信度 = Sunnybrook证据 × 投票一致性
-        sb_confidence = 1.0 - abs(composite_score - 50) / 50  # 越极端越确信
-        sb_confidence = max(0.3, min(1.0, sb_confidence))
-        confidence = (sb_confidence + side_confidence) / 2
-
-    # === Step 8: 生成解释文本 ===
+    # ========== 6. 生成解释 ==========
     interpretation = generate_interpretation(
-        has_palsy, palsy_side, hb_grade, composite_score,
-        resting_score, voluntary_score, synkinesis_score,
+        has_palsy, palsy_side, hb_grade, sunnybrook_composite,
+        sunnybrook.resting_symmetry.total_score,
+        sunnybrook.voluntary_movement.total_score,
+        sunnybrook.synkinesis.total_score,
         votes
     )
 
-    # === Step 9: 排序证据 ===
-    sorted_votes = sorted(votes, key=lambda v: v.weighted_score, reverse=True)
-    top_evidence = sorted_votes[:5]
-
-    return SessionDiagnosis(
+    # ========== 7. 创建 SessionDiagnosis 对象 ==========
+    diagnosis = SessionDiagnosis(
         has_palsy=has_palsy,
         palsy_side=palsy_side,
         palsy_side_text=palsy_side_text,
         hb_grade=hb_grade,
         hb_description=hb_description,
-        hb_evidence=hb_evidence,
-        sunnybrook_score=composite_score,
-        confidence=confidence,
-        palsy_side_confidence=side_confidence,
-        resting_score=resting_score,
-        voluntary_score=voluntary_score,
-        synkinesis_score=synkinesis_score,
+        sunnybrook_score=sunnybrook_composite,
+        confidence=palsy_side_confidence,
+        palsy_side_confidence=palsy_side_confidence,
+        resting_score=sunnybrook.resting_symmetry.total_score,
+        voluntary_score=sunnybrook.voluntary_movement.total_score,
+        synkinesis_score=sunnybrook.synkinesis.total_score,
         left_score=left_score,
         right_score=right_score,
         votes=votes,
         top_evidence=top_evidence,
         consistency_checks=checks,
         adjustments_made=adjustments,
+        hb_evidence={},
+        hb_component_grades=component_details,
+        hb_worst_component=worst_component,
+        hb_decision_path=hb_result.decision_path,
         interpretation=interpretation,
     )
+
+    # ========== 8. 打印调试信息 ==========
+    print_hb_result(hb_result)
+
+    return diagnosis
 
 
 def generate_interpretation(
@@ -984,10 +943,16 @@ def standardize_action_output(
 # =============================================================================
 
 if __name__ == "__main__":
-    # 测试 sunnybrook_to_hb
+    print("Session Diagnosis Module")
+    print("=" * 50)
 
     print("\nSeverity ↔ Voluntary 转换测试:")
     for vol in [1, 2, 3, 4, 5]:
         sev = voluntary_to_severity(vol)
         back = severity_to_voluntary(sev)
         print(f"  Voluntary {vol} → Severity {sev} → Voluntary {back}")
+
+    print("\nSunnybrook → HB 映射测试:")
+    for score in [95, 80, 60, 40, 20, 5]:
+        hb = sunnybrook_to_hb(score)
+        print(f"  Sunnybrook {score} → HB Grade {hb}")

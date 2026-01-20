@@ -70,7 +70,6 @@ TARGET_EXAM_ID = None
 # =============================================================================
 # 1) 只跑指定患者（常用）
 TARGET_PATIENT_IDS = []
-
 # 2) 只跑指定检查ID（优先级更高）
 TARGET_EXAM_IDS = []
 
@@ -1041,7 +1040,7 @@ def process_examination(examination: Dict[str, Any], db_path: str,
     # 计算Sunnybrook评分
     diagnosis = compute_session_diagnosis(action_results)
     palsy_side = diagnosis.palsy_side if diagnosis else 0
-    sunnybrook = calculate_sunnybrook_from_results(action_results, palsy_side=palsy_side)
+    sunnybrook = calculate_sunnybrook_from_results(action_results)
 
     # summary 更新
     summary = {
@@ -1050,7 +1049,7 @@ def process_examination(examination: Dict[str, Any], db_path: str,
         "analysis_time": datetime.now().isoformat(),
         "ground_truth": labels,
         "sunnybrook": sunnybrook.to_dict() if sunnybrook else None,
-        "diagnosis": diagnosis.to_dict() if diagnosis else None,  # 新增
+        "diagnosis": diagnosis.to_dict() if diagnosis else None,
         "actions": {name: result.to_dict() for name, result in action_results.items()},
     }
 
@@ -1060,7 +1059,7 @@ def process_examination(examination: Dict[str, Any], db_path: str,
         action_results,
         sunnybrook,
         labels,
-        diagnosis,  # 传入完整诊断
+        diagnosis,
         exam_output_dir
     )
 

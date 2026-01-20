@@ -563,9 +563,7 @@ def compute_session_diagnosis_statistics(session_records: List[Dict[str, Any]]) 
     if total_palsy > 0:
         stats["palsy_side"]["strict_acc"] = stats["palsy_side"]["correct"] / total_palsy
         # 宽松准确率：FN也算对（预测对称但实际有面瘫）
-        stats["palsy_side"]["relaxed_acc"] = (
-                                                     stats["palsy_side"]["correct"] + stats["palsy_side"]["fn"]
-                                             ) / total_palsy
+        stats["palsy_side"]["relaxed_acc"] = (stats["palsy_side"]["correct"] + stats["palsy_side"]["fn"]) / total_palsy
 
     # HB Grade accuracy
     if stats["hb_grade"]["total"] > 0:
