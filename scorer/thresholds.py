@@ -270,18 +270,38 @@ class Thresholds:
     # ShrugNose 皱鼻动作阈值
     # =========================================================================
 
-    SHRUG_NOSE_CHANGE_MIN: float = 3.0
-    SHRUG_NOSE_SYMMETRY: float = 0.25
+    # 面瘫侧别判断（静态，不需要baseline）
+    SHRUG_NOSE_STATIC_ASYMMETRY: float = 0.004 # %不对称即判定面瘫
+    # 解释：左右鼻翼到眼部水平线距离差异超过5%认为不对称
+    # 真实数据分布：
+    #   - 正常人: 0-3%
+    #   - HB2轻度: 3-8%
+    #   - HB3中度: 8-15%
+    #   - HB4重度: >15%
 
-    # 面瘫检测阈值
-    SHRUG_NOSE_ASYM_NORMAL: float = 0.08  # 不对称 < 8% 正常
+    # 面瘫程度判断（动态，需要baseline）
+    SHRUG_NOSE_MIN_MOVEMENT: float = 2.0  # 最小有效运动幅度(px)
+    # 解释：向上移动<2px认为运动不足，无法判断
 
-    # 严重度分级
-    SHRUG_NOSE_CHANGE_SEVERE: float = 0.18
-    SHRUG_NOSE_CHANGE_MODERATE: float = 0.10
-    SHRUG_NOSE_CHANGE_MILD: float = 0.05
+    # Grade 1 (正常) 阈值
+    SHRUG_NOSE_GRADE1_MOVEMENT_SYMMETRY: float = 0.95  # 运动对称性≥95%
+    SHRUG_NOSE_GRADE1_POSITION_ASYMMETRY: float = 0.05  # 位置不对称<5%
 
-    # 联动检测
+    # Grade 2 (轻度) 阈值
+    SHRUG_NOSE_GRADE2_MOVEMENT_SYMMETRY: float = 0.80  # 运动对称性≥80%
+    SHRUG_NOSE_GRADE2_POSITION_ASYMMETRY: float = 0.10  # 位置不对称<10%
+
+    # Grade 3 (中度) 阈值
+    SHRUG_NOSE_GRADE3_MOVEMENT_SYMMETRY: float = 0.60  # 运动对称性≥60%
+    SHRUG_NOSE_GRADE3_POSITION_ASYMMETRY: float = 0.20  # 位置不对称<20%
+
+    # Grade 4 (重度) 阈值
+    SHRUG_NOSE_GRADE4_MOVEMENT_SYMMETRY: float = 0.30  # 运动对称性≥30%
+    SHRUG_NOSE_GRADE4_POSITION_ASYMMETRY: float = 0.35  # 位置不对称<35%
+
+    # Grade 5 (完全) 如果不满足Grade 4条件
+
+    # 联动检测（保留原有）
     SHRUG_NOSE_SYNKINESIS_SEVERE: float = 0.15
     SHRUG_NOSE_SYNKINESIS_MODERATE: float = 0.08
     SHRUG_NOSE_SYNKINESIS_MILD: float = 0.04

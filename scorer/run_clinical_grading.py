@@ -74,6 +74,8 @@ TARGET_PATIENT_IDS = []
 TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
+"NeutralFace",
+"ShrugNose",
 ]
 
 # ENABLED_ACTIONS = [

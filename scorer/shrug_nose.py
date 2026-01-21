@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ShrugNose 动作处理模块
+ShrugNose 动作处理模块 (V2)
 ================================
 
-分析皱鼻动作:
-1. 鼻翼点到同侧眼角内眦点的距离 (关键帧检测 + 面瘫侧别判断)
-2. 鼻翼位置变化
-3. 联动运动检测
+核心指标：鼻翼到眼部水平线的垂直距离
 
-修复内容:
-- 使用鼻翼到内眦距离替代错误的NLF计算
-- 关键帧检测: 鼻翼-内眦距离最小的帧
-- 面瘫侧别检测: 距离变化小的一侧为患侧
+测量方法：
+1. 眼部水平线：双侧内眦点连线
+2. 扩展眼线：以中点为中心扩展到2倍长度（用于可视化和归一化）
+3. 垂直距离：从鼻翼点向眼线作垂线，取点到线的垂直距离
 
-对应Sunnybrook: Snarl (LLA/LLS)
+面瘫判断：
+- 侧别：距离更长的一侧为患侧（不需要baseline）
+- 程度：看距离变化量 + 左右偏差（需要baseline）
+
+对应Sunnybrook: Snarl (鼻翼上提)
 """
 
 import cv2
@@ -27,10 +28,7 @@ from clinical_base import (
     LM, pt2d, dist, compute_ear,
     compute_mouth_metrics, extract_common_indicators,
     ActionResult, compute_scale_to_baseline,
-    compute_nose_midline_symmetry, compute_ala_canthus_change,
     draw_palsy_annotation_header,
-    compute_face_midline, draw_face_midline,
-    compute_ala_to_canthus_distance,
 )
 
 from thresholds import THR
@@ -41,39 +39,172 @@ ACTION_NAME_CN = "皱鼻"
 # OpenCV字体
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-# 字体大小
-FONT_SCALE_TITLE = 1.4      # 标题
-FONT_SCALE_LARGE = 1.2      # 大号文字
-FONT_SCALE_NORMAL = 0.9     # 正常文字
-FONT_SCALE_SMALL = 0.7      # 小号文字
 
-# 线条粗细
-THICKNESS_TITLE = 3
-THICKNESS_NORMAL = 2
-THICKNESS_THIN = 1
+# =============================================================================
+# 核心几何计算函数
+# =============================================================================
 
-# 行高
-LINE_HEIGHT = 45
-LINE_HEIGHT_SMALL = 30
+def get_inner_canthi(landmarks, w: int, h: int) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """获取左右内眦点坐标"""
+    pL = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    pR = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+    return pL, pR
 
+
+def get_ala_points(landmarks, w: int, h: int) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """获取左右鼻翼点坐标"""
+    left_ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
+    right_ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
+    return left_ala, right_ala
+
+
+def extend_segment_2x(pL: Tuple, pR: Tuple) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """
+    将线段以中点为中心扩展到2倍长度
+
+    原端点 = m ± v/2
+    扩展端点 = m ± v
+    """
+    mx = (pL[0] + pR[0]) / 2.0
+    my = (pL[1] + pR[1]) / 2.0
+    vx = pR[0] - pL[0]
+    vy = pR[1] - pL[1]
+
+    ext_L = (mx - vx, my - vy)
+    ext_R = (mx + vx, my + vy)
+    return ext_L, ext_R
+
+
+def project_point_to_line(p: Tuple, a: Tuple, b: Tuple) -> Tuple[float, float]:
+    """
+    计算点p到直线ab的投影垂足坐标
+
+    Returns:
+        垂足点坐标 (fx, fy)
+    """
+    ax, ay = float(a[0]), float(a[1])
+    bx, by = float(b[0]), float(b[1])
+    px, py = float(p[0]), float(p[1])
+
+    vx, vy = bx - ax, by - ay
+    denom = vx * vx + vy * vy
+
+    if denom < 1e-8:
+        return (ax, ay)
+
+    t = ((px - ax) * vx + (py - ay) * vy) / denom
+    fx = ax + t * vx
+    fy = ay + t * vy
+    return (fx, fy)
+
+
+def perpendicular_distance(p: Tuple, a: Tuple, b: Tuple) -> float:
+    """
+    计算点p到直线ab的垂直距离
+
+    Returns:
+        垂直距离（像素，非负）
+    """
+    fx, fy = project_point_to_line(p, a, b)
+    dx = float(p[0]) - fx
+    dy = float(p[1]) - fy
+    return float(np.sqrt(dx * dx + dy * dy))
+
+
+def compute_eye_line_metrics(landmarks, w: int, h: int) -> Dict[str, Any]:
+    """
+    计算眼部水平线相关的所有指标
+
+    Returns:
+        {
+            "inner_canthi": {"left": (x,y), "right": (x,y)},
+            "eye_line_original": {"start": (x,y), "end": (x,y), "length": float},
+            "eye_line_extended": {"start": (x,y), "end": (x,y), "length": float},
+            "ala_points": {"left": (x,y), "right": (x,y)},
+            "perpendicular": {
+                "left": {"foot": (x,y), "distance_px": float, "distance_norm": float},
+                "right": {"foot": (x,y), "distance_px": float, "distance_norm": float},
+            },
+            "asymmetry": float,
+            "longer_side": str,
+        }
+    """
+    # 1. 获取关键点
+    left_canthus, right_canthus = get_inner_canthi(landmarks, w, h)
+    left_ala, right_ala = get_ala_points(landmarks, w, h)
+
+    # 2. 原始眼线长度
+    original_length = dist(left_canthus, right_canthus)
+
+    # 3. 扩展眼线（2倍长度）
+    ext_L, ext_R = extend_segment_2x(left_canthus, right_canthus)
+    extended_length = original_length * 2
+
+    # 4. 计算垂直距离和垂足
+    left_foot = project_point_to_line(left_ala, ext_L, ext_R)
+    right_foot = project_point_to_line(right_ala, ext_L, ext_R)
+
+    left_dist_px = perpendicular_distance(left_ala, ext_L, ext_R)
+    right_dist_px = perpendicular_distance(right_ala, ext_L, ext_R)
+
+    # 5. 归一化（除以扩展眼线长度）
+    left_dist_norm = left_dist_px / extended_length if extended_length > 0 else 0
+    right_dist_norm = right_dist_px / extended_length if extended_length > 0 else 0
+
+    # 6. 计算不对称度
+    max_dist = max(left_dist_px, right_dist_px)
+    asymmetry = abs(left_dist_px - right_dist_px) / max_dist if max_dist > 1e-6 else 0
+
+    # 7. 判断哪侧更长
+    longer_side = "left" if left_dist_px > right_dist_px else ("right" if right_dist_px > left_dist_px else "equal")
+
+    return {
+        "inner_canthi": {"left": left_canthus, "right": right_canthus},
+        "eye_line_original": {
+            "start": left_canthus,
+            "end": right_canthus,
+            "length": original_length
+        },
+        "eye_line_extended": {
+            "start": ext_L,
+            "end": ext_R,
+            "length": extended_length
+        },
+        "ala_points": {"left": left_ala, "right": right_ala},
+        "perpendicular": {
+            "left": {
+                "foot": left_foot,
+                "distance_px": left_dist_px,
+                "distance_norm": left_dist_norm,
+            },
+            "right": {
+                "foot": right_foot,
+                "distance_px": right_dist_px,
+                "distance_norm": right_dist_norm,
+            },
+        },
+        "asymmetry": asymmetry,
+        "longer_side": longer_side,
+    }
+
+
+# =============================================================================
+# 关键帧检测
+# =============================================================================
 
 def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
                     baseline_landmarks=None) -> Tuple[int, Dict[str, Any]]:
     """
-    找皱鼻峰值帧 - 鼻翼到内眦距离最小
+    找皱鼻峰值帧
 
-    皱鼻时：
-    - 鼻翼向上收缩
-    - 鼻翼-内眦距离减小
-
-    Returns:
-        (peak_idx, peak_debug): 峰值帧索引和调试信息
+    皱鼻时鼻翼向上 → 垂直距离减小
+    选择 (left_dist + right_dist) 最小的帧
     """
     n_frames = len(landmarks_seq)
     if n_frames == 0:
         return 0, {"error": "empty_sequence"}
 
-    # 收集时序数据
+    # 时序数据收集
     left_dist_seq = []
     right_dist_seq = []
     total_dist_seq = []
@@ -88,9 +219,10 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
             total_dist_seq.append(np.nan)
             continue
 
-        # 计算左右鼻翼到内眦的距离
-        left_dist = compute_ala_to_canthus_distance(lm, w, h, left=True)
-        right_dist = compute_ala_to_canthus_distance(lm, w, h, left=False)
+        metrics = compute_eye_line_metrics(lm, w, h)
+
+        left_dist = metrics["perpendicular"]["left"]["distance_px"]
+        right_dist = metrics["perpendicular"]["right"]["distance_px"]
         total_dist = left_dist + right_dist
 
         left_dist_seq.append(left_dist)
@@ -101,68 +233,371 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
             min_total_dist = total_dist
             min_idx = i
 
-    # 构建peak_debug字典
     peak_debug = {
-        "left_ala_canthus": left_dist_seq,
-        "right_ala_canthus": right_dist_seq,
-        "total_dist": total_dist_seq,
+        "left_vertical_dist": left_dist_seq,
+        "right_vertical_dist": right_dist_seq,
+        "total_vertical_dist": total_dist_seq,
         "peak_idx": min_idx,
         "peak_value": float(min_total_dist) if np.isfinite(min_total_dist) else None,
-        "selection_criterion": "min_ala_canthus_distance",
+        "selection_criterion": "min_total_vertical_distance",
     }
 
     return min_idx, peak_debug
 
 
-def extract_shrug_nose_sequences(
-        landmarks_seq: List,
-        w: int, h: int
-) -> Dict[str, List[float]]:
-    """
-    提取皱鼻关键指标的时序序列
+# =============================================================================
+# 面瘫侧别检测（不需要baseline）
+# =============================================================================
 
-    Returns:
-        包含鼻翼-内眦距离的时序数据
+def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    left_dist_seq = []
-    right_dist_seq = []
-    total_dist_seq = []
+    面瘫侧别判断
 
-    for lm in landmarks_seq:
-        if lm is None:
-            left_dist_seq.append(np.nan)
-            right_dist_seq.append(np.nan)
-            total_dist_seq.append(np.nan)
-        else:
-            left_dist = compute_ala_to_canthus_distance(lm, w, h, left=True)
-            right_dist = compute_ala_to_canthus_distance(lm, w, h, left=False)
-            left_dist_seq.append(left_dist)
-            right_dist_seq.append(right_dist)
-            total_dist_seq.append(left_dist + right_dist)
+    原理：
+    - 鼻翼到眼部水平线的垂直距离
+    - 距离长 = 鼻翼位置低 = 患侧（皱鼻时该侧上提能力差）
+    - 不需要baseline
+    """
+    perp = metrics.get("perpendicular", {})
+    left_dist = perp.get("left", {}).get("distance_px", 0)
+    right_dist = perp.get("right", {}).get("distance_px", 0)
+    asymmetry = metrics.get("asymmetry", 0)
+
+    result = {
+        "palsy_side": 0,
+        "confidence": 0.0,
+        "interpretation": "",
+        "method": "perpendicular_distance_to_eye_line",
+        "evidence": {
+            "left_distance_px": float(left_dist),
+            "right_distance_px": float(right_dist),
+            "distance_diff_px": float(abs(left_dist - right_dist)),
+            "asymmetry": float(asymmetry),
+        }
+    }
+
+    # 检查有效性
+    max_dist = max(left_dist, right_dist)
+    if max_dist < 1e-6:
+        result["interpretation"] = "距离数据无效"
+        return result
+
+    # 使用阈值判断
+    threshold = THR.SHRUG_NOSE_STATIC_ASYMMETRY
+
+    result["evidence"]["threshold"] = threshold
+    result["evidence"]["threshold_status"] = "below" if asymmetry < threshold else "above"
+
+    if asymmetry < threshold:
+        result["palsy_side"] = 0
+        result["confidence"] = 1.0 - (asymmetry / threshold)
+        result["interpretation"] = (
+            f"双侧对称: L={left_dist:.1f}px, R={right_dist:.1f}px, "
+            f"不对称度={asymmetry:.2%} < 阈值{threshold:.2%}"
+        )
+    elif left_dist > right_dist:
+        result["palsy_side"] = 1  # 左侧面瘫
+        result["confidence"] = min(1.0, asymmetry / 0.3)  # 30%以上高置信
+        result["interpretation"] = (
+            f"左侧距离更长: L={left_dist:.1f}px > R={right_dist:.1f}px, "
+            f"不对称度={asymmetry:.2%} → 左侧面瘫"
+        )
+    else:
+        result["palsy_side"] = 2  # 右侧面瘫
+        result["confidence"] = min(1.0, asymmetry / 0.3)
+        result["interpretation"] = (
+            f"右侧距离更长: R={right_dist:.1f}px > L={left_dist:.1f}px, "
+            f"不对称度={asymmetry:.2%} → 右侧面瘫"
+        )
+
+    return result
+
+
+# =============================================================================
+# 面瘫程度判断（需要baseline）
+# =============================================================================
+
+def compute_severity_with_baseline(
+        current_metrics: Dict[str, Any],
+        baseline_metrics: Dict[str, Any],
+        scale: float = 1.0
+) -> Dict[str, Any]:
+    """
+    面瘫程度判断 - 需要baseline
+
+    评估维度：
+    1. 运动幅度：左右侧距离减小量（皱鼻时鼻翼上提，距离变小）
+    2. 运动对称性：左右减小量的比值
+    3. 当前位置不对称度
+    """
+    # 当前帧的垂直距离
+    curr_left = current_metrics["perpendicular"]["left"]["distance_px"]
+    curr_right = current_metrics["perpendicular"]["right"]["distance_px"]
+
+    # 基线帧的垂直距离
+    base_left = baseline_metrics["perpendicular"]["left"]["distance_px"]
+    base_right = baseline_metrics["perpendicular"]["right"]["distance_px"]
+
+    # 计算运动量（正值表示向上移动，即距离减小）
+    # 注意要考虑scale（人脸远近变化）
+    left_movement = base_left - (curr_left * scale)
+    right_movement = base_right - (curr_right * scale)
+
+    # 运动对称性
+    max_movement = max(abs(left_movement), abs(right_movement))
+    min_movement = min(abs(left_movement), abs(right_movement))
+
+    movement_symmetry = min_movement / max_movement if max_movement > THR.SHRUG_NOSE_MIN_MOVEMENT else 1.0
+
+    # 当前位置不对称度
+    current_asymmetry = current_metrics["asymmetry"]
+
+    # 综合判断严重等级
+    severity_score = 1
+    severity_desc = ""
+
+    if max_movement < THR.SHRUG_NOSE_MIN_MOVEMENT:
+        severity_score = 1
+        severity_desc = f"运动幅度过小 (max={max_movement:.1f}px < {THR.SHRUG_NOSE_MIN_MOVEMENT}px)"
+
+    elif movement_symmetry >= THR.SHRUG_NOSE_GRADE1_MOVEMENT_SYMMETRY and \
+            current_asymmetry < THR.SHRUG_NOSE_GRADE1_POSITION_ASYMMETRY:
+        severity_score = 1
+        severity_desc = f"正常 (运动对称{movement_symmetry:.1%}, 位置不对称{current_asymmetry:.1%})"
+
+    elif movement_symmetry >= THR.SHRUG_NOSE_GRADE2_MOVEMENT_SYMMETRY and \
+            current_asymmetry < THR.SHRUG_NOSE_GRADE2_POSITION_ASYMMETRY:
+        severity_score = 2
+        severity_desc = f"轻度 (运动对称{movement_symmetry:.1%}, 位置不对称{current_asymmetry:.1%})"
+
+    elif movement_symmetry >= THR.SHRUG_NOSE_GRADE3_MOVEMENT_SYMMETRY or \
+            current_asymmetry < THR.SHRUG_NOSE_GRADE3_POSITION_ASYMMETRY:
+        severity_score = 3
+        severity_desc = f"中度 (运动对称{movement_symmetry:.1%}, 位置不对称{current_asymmetry:.1%})"
+
+    elif movement_symmetry >= THR.SHRUG_NOSE_GRADE4_MOVEMENT_SYMMETRY or \
+            current_asymmetry < THR.SHRUG_NOSE_GRADE4_POSITION_ASYMMETRY:
+        severity_score = 4
+        severity_desc = f"重度 (运动对称{movement_symmetry:.1%}, 位置不对称{current_asymmetry:.1%})"
+
+    else:
+        severity_score = 5
+        severity_desc = f"完全麻痹 (运动对称{movement_symmetry:.1%}, 位置不对称{current_asymmetry:.1%})"
 
     return {
-        "Left Ala-Canthus": left_dist_seq,
-        "Right Ala-Canthus": right_dist_seq,
-        "Total Distance": total_dist_seq,
+        "severity_score": severity_score,
+        "severity_desc": severity_desc,
+        "movement": {
+            "left_px": float(left_movement),
+            "right_px": float(right_movement),
+            "diff_px": float(abs(left_movement - right_movement)),
+            "symmetry": float(movement_symmetry),
+        },
+        "current_asymmetry": float(current_asymmetry),
+        "scale": float(scale),
+        "thresholds_used": {
+            "min_movement": THR.SHRUG_NOSE_MIN_MOVEMENT,
+            "grade1_movement_sym": THR.SHRUG_NOSE_GRADE1_MOVEMENT_SYMMETRY,
+            "grade1_position_asym": THR.SHRUG_NOSE_GRADE1_POSITION_ASYMMETRY,
+        }
     }
 
 
-def plot_shrug_nose_peak_selection(
+# =============================================================================
+# 可视化
+# =============================================================================
+
+def visualize_shrug_nose(
+        img: np.ndarray,
+        landmarks,
+        w: int, h: int,
+        result: ActionResult,
+        metrics: Dict[str, Any],
+        palsy_detection: Dict[str, Any],
+        severity_info: Dict[str, Any] = None
+) -> np.ndarray:
+    """
+    可视化皱鼻指标
+
+    绘制内容：
+    1. 眼部水平线（扩展后的2倍长度）
+    2. 左右鼻翼点
+    3. 垂线（从鼻翼到眼线的垂足）
+    4. 距离标注
+    5. 信息面板
+    """
+    img = img.copy()
+
+    # 获取几何数据
+    eye_line_ext = metrics.get("eye_line_extended", {})
+    eye_start = eye_line_ext.get("start", (0, 0))
+    eye_end = eye_line_ext.get("end", (0, 0))
+
+    ala_points = metrics.get("ala_points", {})
+    left_ala = ala_points.get("left", (0, 0))
+    right_ala = ala_points.get("right", (0, 0))
+
+    perp = metrics.get("perpendicular", {})
+    left_foot = perp.get("left", {}).get("foot", (0, 0))
+    right_foot = perp.get("right", {}).get("foot", (0, 0))
+    left_dist = perp.get("left", {}).get("distance_px", 0)
+    right_dist = perp.get("right", {}).get("distance_px", 0)
+
+    asymmetry = metrics.get("asymmetry", 0)
+
+    # ========== 颜色定义 ==========
+    COLOR_EYE_LINE = (0, 255, 0)  # 绿色 - 眼线
+    COLOR_LEFT_ALA = (255, 100, 100)  # 蓝色 - 左鼻翼
+    COLOR_RIGHT_ALA = (100, 100, 255)  # 红色 - 右鼻翼
+    COLOR_PERP_LINE = (255, 255, 0)  # 青色 - 垂线
+    COLOR_HIGHLIGHT = (0, 0, 255)  # 红色高亮 - 患侧
+
+    # 判断哪侧更长（患侧）
+    left_color = COLOR_HIGHLIGHT if left_dist > right_dist else COLOR_LEFT_ALA
+    right_color = COLOR_HIGHLIGHT if right_dist > left_dist else COLOR_RIGHT_ALA
+
+    # ========== 1. 绘制扩展眼部水平线 ==========
+    cv2.line(img,
+             (int(eye_start[0]), int(eye_start[1])),
+             (int(eye_end[0]), int(eye_end[1])),
+             COLOR_EYE_LINE, 2, cv2.LINE_AA)
+
+    # 标注原始内眦点
+    canthi = metrics.get("inner_canthi", {})
+    left_canthus = canthi.get("left", (0, 0))
+    right_canthus = canthi.get("right", (0, 0))
+    cv2.circle(img, (int(left_canthus[0]), int(left_canthus[1])), 4, COLOR_EYE_LINE, -1)
+    cv2.circle(img, (int(right_canthus[0]), int(right_canthus[1])), 4, COLOR_EYE_LINE, -1)
+
+    # ========== 2. 绘制鼻翼点 ==========
+    cv2.circle(img, (int(left_ala[0]), int(left_ala[1])), 6, left_color, -1)
+    cv2.circle(img, (int(right_ala[0]), int(right_ala[1])), 6, right_color, -1)
+
+    # ========== 3. 绘制垂线 ==========
+    # 左侧垂线
+    cv2.line(img,
+             (int(left_ala[0]), int(left_ala[1])),
+             (int(left_foot[0]), int(left_foot[1])),
+             left_color, 2, cv2.LINE_AA)
+    # 垂足点
+    cv2.circle(img, (int(left_foot[0]), int(left_foot[1])), 4, left_color, -1)
+
+    # 右侧垂线
+    cv2.line(img,
+             (int(right_ala[0]), int(right_ala[1])),
+             (int(right_foot[0]), int(right_foot[1])),
+             right_color, 2, cv2.LINE_AA)
+    # 垂足点
+    cv2.circle(img, (int(right_foot[0]), int(right_foot[1])), 4, right_color, -1)
+
+    # ========== 4. 标注距离值 ==========
+    # 左侧距离
+    mid_left_y = (left_ala[1] + left_foot[1]) / 2
+    cv2.putText(img, f"{left_dist:.1f}px",
+                (int(left_ala[0]) - 70, int(mid_left_y)),
+                FONT, 0.55, left_color, 2)
+
+    # 右侧距离
+    mid_right_y = (right_ala[1] + right_foot[1]) / 2
+    cv2.putText(img, f"{right_dist:.1f}px",
+                (int(right_ala[0]) + 10, int(mid_right_y)),
+                FONT, 0.55, right_color, 2)
+
+    # ========== 5. 患侧标注头部 ==========
+    img, header_end_y = draw_palsy_annotation_header(img, palsy_detection, ACTION_NAME)
+
+    # ========== 6. 信息面板 ==========
+    panel_top = header_end_y + 10
+    panel_height = 280 if severity_info else 200
+    panel_bottom = panel_top + panel_height
+
+    cv2.rectangle(img, (5, panel_top), (380, panel_bottom), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, panel_top), (380, panel_bottom), (255, 255, 255), 1)
+
+    y = panel_top + 25
+    cv2.putText(img, f"{ACTION_NAME_CN} (ShrugNose)", (15, y), FONT, 0.65, (0, 255, 0), 2)
+    y += 30
+
+    # 垂直距离部分
+    cv2.putText(img, "=== Perpendicular Distance ===", (15, y), FONT, 0.5, (0, 255, 255), 1)
+    y += 25
+
+    cv2.putText(img, f"Left:  {left_dist:.1f} px", (15, y), FONT, 0.5, left_color, 1)
+    y += 22
+
+    cv2.putText(img, f"Right: {right_dist:.1f} px", (15, y), FONT, 0.5, right_color, 1)
+    y += 22
+
+    cv2.putText(img, f"Diff:  {abs(left_dist - right_dist):.1f} px ({asymmetry:.1%})",
+                (15, y), FONT, 0.5, (255, 255, 255), 1)
+    y += 30
+
+    # 阈值信息
+    threshold = THR.SHRUG_NOSE_STATIC_ASYMMETRY
+    status = "PASS" if asymmetry < threshold else "FAIL"
+    status_color = (0, 255, 0) if asymmetry < threshold else (0, 0, 255)
+    cv2.putText(img, f"Threshold: {threshold:.1%} | {status}",
+                (15, y), FONT, 0.5, status_color, 1)
+    y += 30
+
+    # 运动信息（如果有baseline）
+    if severity_info:
+        cv2.putText(img, "=== Movement (from baseline) ===", (15, y), FONT, 0.5, (0, 255, 255), 1)
+        y += 25
+
+        movement = severity_info.get("movement", {})
+        cv2.putText(img, f"Left:  {movement.get('left_px', 0):+.1f} px", (15, y), FONT, 0.5, (255, 255, 255), 1)
+        y += 22
+        cv2.putText(img, f"Right: {movement.get('right_px', 0):+.1f} px", (15, y), FONT, 0.5, (255, 255, 255), 1)
+        y += 22
+        cv2.putText(img, f"Symmetry: {movement.get('symmetry', 0):.1%}", (15, y), FONT, 0.5, (255, 255, 255), 1)
+        y += 25
+
+        # 严重度
+        severity_score = severity_info.get("severity_score", 1)
+        cv2.putText(img, f"Severity: {severity_score}/5", (15, y), FONT, 0.55, (0, 255, 255), 2)
+
+    # ========== 7. 图例 ==========
+    legend_y = panel_bottom + 15
+    cv2.line(img, (15, legend_y), (45, legend_y), COLOR_EYE_LINE, 3)
+    cv2.putText(img, "Eye Line (2x)", (50, legend_y + 4), FONT, 0.35, (255, 255, 255), 1)
+
+    cv2.line(img, (160, legend_y), (190, legend_y), COLOR_LEFT_ALA, 3)
+    cv2.putText(img, "Left Ala", (195, legend_y + 4), FONT, 0.35, (255, 255, 255), 1)
+
+    cv2.line(img, (280, legend_y), (310, legend_y), COLOR_RIGHT_ALA, 3)
+    cv2.putText(img, "Right Ala", (315, legend_y + 4), FONT, 0.35, (255, 255, 255), 1)
+
+    return img
+
+
+# =============================================================================
+# 曲线图
+# =============================================================================
+
+def plot_peak_selection_curve(
         peak_debug: Dict[str, Any],
         fps: float,
         output_path,
         baseline_values: Dict[str, float] = None,
-        palsy_detection: Dict[str, Any] = None
+        palsy_detection: Dict[str, Any] = None,
+        threshold_info: Dict[str, Any] = None
 ) -> None:
     """
-    绘制皱鼻关键帧选择的可解释性曲线。
+    绘制关键帧选择曲线
+
+    包含：
+    1. 左右垂直距离时序曲线
+    2. 基线参考（如果有）
+    3. 峰值标记
+    4. 阈值线和判断结果
     """
     import matplotlib.pyplot as plt
     from clinical_base import get_palsy_side_text
 
-    left_dist = peak_debug.get("left_ala_canthus", [])
-    right_dist = peak_debug.get("right_ala_canthus", [])
-    total_dist = peak_debug.get("total_dist", [])
+    left_dist = peak_debug.get("left_vertical_dist", [])
+    right_dist = peak_debug.get("right_vertical_dist", [])
+    total_dist = peak_debug.get("total_vertical_dist", [])
     peak_idx = peak_debug.get("peak_idx", 0)
 
     if not total_dist:
@@ -174,363 +609,89 @@ def plot_shrug_nose_peak_selection(
     x_label = 'Time (seconds)' if fps > 0 else 'Frame'
     peak_time = peak_idx / fps if fps > 0 else peak_idx
 
-    plt.figure(figsize=(12, 6))
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-    # 绘制左右距离
-    plt.plot(time_sec, left_dist, 'b-', label='Left Ala-Canthus Distance', linewidth=2, alpha=0.6)
-    plt.plot(time_sec, right_dist, 'r-', label='Right Ala-Canthus Distance', linewidth=2, alpha=0.6)
-    plt.plot(time_sec, total_dist, 'g-', label='Total Distance (Selection)', linewidth=2.5)
+    # ===== 上图：左右垂直距离 =====
+    ax1 = axes[0]
+    ax1.plot(time_sec, left_dist, 'b-', label='Left Ala → Eye Line', linewidth=2, alpha=0.8)
+    ax1.plot(time_sec, right_dist, 'r-', label='Right Ala → Eye Line', linewidth=2, alpha=0.8)
 
-    # 绘制基线（如果有）
+    # 基线参考
     if baseline_values:
         if "left" in baseline_values:
-            plt.axhline(y=baseline_values["left"], color='blue', linestyle=':', alpha=0.5, label='Left Baseline')
+            ax1.axhline(y=baseline_values["left"], color='blue', linestyle=':', alpha=0.5, label='Baseline Left')
         if "right" in baseline_values:
-            plt.axhline(y=baseline_values["right"], color='red', linestyle=':', alpha=0.5, label='Right Baseline')
+            ax1.axhline(y=baseline_values["right"], color='red', linestyle=':', alpha=0.5, label='Baseline Right')
 
-    # 标记峰值
-    plt.axvline(x=peak_time, color='black', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Peak Frame {peak_idx}')
-    if 0 <= peak_idx < n_frames and np.isfinite(total_dist[peak_idx]):
-        peak_value = total_dist[peak_idx]
-        plt.scatter([peak_time], [peak_value], color='red', s=150, zorder=5,
-                    edgecolors='black', linewidths=1.5, marker='*',
-                    label=f'Selected Peak (Dist: {peak_value:.1f})')
+    # 峰值标记
+    ax1.axvline(x=peak_time, color='green', linestyle='--', linewidth=1.5, alpha=0.7)
+    if 0 <= peak_idx < n_frames:
+        if np.isfinite(left_dist[peak_idx]):
+            ax1.scatter([peak_time], [left_dist[peak_idx]], color='blue', s=100, zorder=5, marker='o',
+                        edgecolors='black')
+        if np.isfinite(right_dist[peak_idx]):
+            ax1.scatter([peak_time], [right_dist[peak_idx]], color='red', s=100, zorder=5, marker='o',
+                        edgecolors='black')
 
-    title = "ShrugNose Peak Selection: Min Ala-Canthus Distance"
+    ax1.set_ylabel('Perpendicular Distance (px)', fontsize=11)
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.4)
+    ax1.set_title('Left/Right Ala to Eye-Line Distance', fontsize=12, fontweight='bold')
+
+    # ===== 下图：不对称度 =====
+    ax2 = axes[1]
+
+    # 计算每帧的不对称度
+    asymmetry_seq = []
+    for l, r in zip(left_dist, right_dist):
+        if np.isnan(l) or np.isnan(r):
+            asymmetry_seq.append(np.nan)
+        else:
+            max_val = max(l, r)
+            asym = abs(l - r) / max_val if max_val > 1e-6 else 0
+            asymmetry_seq.append(asym * 100)  # 转为百分比
+
+    ax2.plot(time_sec, asymmetry_seq, 'purple', linewidth=2, label='Asymmetry')
+
+    # 阈值线
+    threshold = THR.SHRUG_NOSE_STATIC_ASYMMETRY * 100
+    ax2.axhline(y=threshold, color='red', linestyle='--', linewidth=2,
+                label=f'Threshold ({threshold:.1f}%)')
+
+    # 填充超过阈值的区域
+    asymmetry_arr = np.array(asymmetry_seq)
+    ax2.fill_between(time_sec, 0, asymmetry_arr,
+                     where=asymmetry_arr > threshold,
+                     color='red', alpha=0.3, label='Above Threshold')
+
+    # 峰值标记
+    ax2.axvline(x=peak_time, color='green', linestyle='--', linewidth=1.5, alpha=0.7)
+    if 0 <= peak_idx < n_frames and np.isfinite(asymmetry_seq[peak_idx]):
+        ax2.scatter([peak_time], [asymmetry_seq[peak_idx]], color='green', s=150, zorder=5,
+                    marker='*', edgecolors='black', linewidths=1.5)
+
+    ax2.set_xlabel(x_label, fontsize=11)
+    ax2.set_ylabel('Asymmetry (%)', fontsize=11)
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.4)
+
+    # 总标题
+    title = "ShrugNose: Perpendicular Distance Analysis"
     if palsy_detection:
         palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
-        title += f' | Detected: {palsy_text}'
+        confidence = palsy_detection.get("confidence", 0)
+        title += f' | {palsy_text} (conf={confidence:.2f})'
 
-    plt.title(title, fontsize=14, fontweight='bold')
-    plt.xlabel(x_label, fontsize=11)
-    plt.ylabel('Distance (px, lower is better)', fontsize=11)
-    plt.legend()
-    plt.grid(True, alpha=0.4)
+    fig.suptitle(title, fontsize=14, fontweight='bold')
+
     plt.tight_layout()
     plt.savefig(str(output_path), dpi=150)
     plt.close()
 
 
-def compute_shrug_nose_metrics(landmarks, w: int, h: int,
-                               baseline_landmarks=None) -> Dict[str, Any]:
-    """计算皱鼻特有指标  - 使用统一 scale"""
-    # 鼻翼到内眦距离
-    left_ac_dist = compute_ala_to_canthus_distance(landmarks, w, h, left=True)
-    right_ac_dist = compute_ala_to_canthus_distance(landmarks, w, h, left=False)
-
-    # 鼻翼点位置
-    left_ala = pt2d(landmarks[LM.NOSE_ALA_L], w, h)
-    right_ala = pt2d(landmarks[LM.NOSE_ALA_R], w, h)
-
-    # 内眦点位置
-    left_canthus = pt2d(landmarks[LM.EYE_INNER_L], w, h)
-    right_canthus = pt2d(landmarks[LM.EYE_INNER_R], w, h)
-
-    # 鼻翼间距
-    ala_width = dist(left_ala, right_ala)
-
-    metrics = {
-        "left_ala_canthus_dist": left_ac_dist,
-        "right_ala_canthus_dist": right_ac_dist,
-        "ala_canthus_ratio": left_ac_dist / right_ac_dist if right_ac_dist > 1e-9 else 1.0,
-        "ala_width": ala_width,
-        "points": {
-            "left_ala": left_ala,
-            "right_ala": right_ala,
-            "left_canthus": left_canthus,
-            "right_canthus": right_canthus,
-        }
-    }
-
-    # 如果有基线，计算变化
-    if baseline_landmarks is not None:
-        # ========== 计算统一 scale ==========
-        scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
-        metrics["scale"] = scale
-        # ====================================
-
-        baseline_left = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=True)
-        baseline_right = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=False)
-        baseline_left_ala = pt2d(baseline_landmarks[LM.NOSE_ALA_L], w, h)
-        baseline_right_ala = pt2d(baseline_landmarks[LM.NOSE_ALA_R], w, h)
-
-        metrics["baseline"] = {
-            "left_ala_canthus_dist": baseline_left,
-            "right_ala_canthus_dist": baseline_right,
-            "ala_width": dist(baseline_left_ala, baseline_right_ala),
-        }
-
-        # ========== 缩放到 baseline 尺度后计算变化 ==========
-        left_scaled = left_ac_dist * scale
-        right_scaled = right_ac_dist * scale
-
-        # 距离变化 (皱鼻时应为负值)
-        metrics["left_change"] = left_scaled - baseline_left
-        metrics["right_change"] = right_scaled - baseline_right
-        # ===================================================
-
-        # 变化百分比
-        if baseline_left > 1e-9:
-            metrics["left_change_percent"] = metrics["left_change"] / baseline_left * 100
-        else:
-            metrics["left_change_percent"] = 0
-
-        if baseline_right > 1e-9:
-            metrics["right_change_percent"] = metrics["right_change"] / baseline_right * 100
-        else:
-            metrics["right_change_percent"] = 0
-
-        # 鼻翼垂直移动量 (缩放后)
-        metrics["left_ala_vertical_move"] = (left_ala[1] - baseline_left_ala[1]) * scale
-        metrics["right_ala_vertical_move"] = (right_ala[1] - baseline_right_ala[1]) * scale
-
-        # ========== 计算鼻翼-内眦距离的变化量 ==========
-        ala_change_data = compute_ala_canthus_change(landmarks, w, h, baseline_landmarks)
-        metrics["ala_canthus_change"] = ala_change_data
-
-    # ========== 鼻部面中线对称性（用于面瘫侧别判断）==========
-    nose_symmetry = compute_nose_midline_symmetry(landmarks, w, h)
-    metrics["nose_symmetry"] = nose_symmetry
-
-    # ========== 鼻翼到眼部水平线的垂直距离（用于面瘫侧别判断）==========
-    # 眼部水平线：双眼内眦连线
-    # 计算方法：鼻翼点到内眦连线的垂直距离
-    eye_line_y = (left_canthus[1] + right_canthus[1]) / 2  # 眼部水平线的y坐标（近似）
-
-    # 左右鼻翼到眼部水平线的垂直距离
-    # 注意：y坐标向下为正，所以鼻翼y - 眼部y = 正值表示鼻翼在眼睛下方
-    left_ala_to_eye_line = left_ala[1] - eye_line_y
-    right_ala_to_eye_line = right_ala[1] - eye_line_y
-
-    metrics["ala_to_eye_line"] = {
-        "eye_line_y": float(eye_line_y),
-        "left_distance": float(left_ala_to_eye_line),
-        "right_distance": float(right_ala_to_eye_line),
-        "distance_diff": float(left_ala_to_eye_line - right_ala_to_eye_line),
-    }
-
-    # 计算鼻翼连线相对于眼部水平线的倾斜角度
-    # 如果左鼻翼更高（y更小），角度为负；右鼻翼更高，角度为正
-    ala_line_angle = np.degrees(np.arctan2(
-        right_ala[1] - left_ala[1],  # y差值
-        right_ala[0] - left_ala[0]  # x差值
-    ))
-    eye_line_angle = np.degrees(np.arctan2(
-        right_canthus[1] - left_canthus[1],
-        right_canthus[0] - left_canthus[0]
-    ))
-    # 鼻翼连线相对于眼部水平线的偏转角度
-    tilt_angle = ala_line_angle - eye_line_angle
-
-    metrics["ala_to_eye_line"]["ala_line_angle"] = float(ala_line_angle)
-    metrics["ala_to_eye_line"]["eye_line_angle"] = float(eye_line_angle)
-    metrics["ala_to_eye_line"]["tilt_angle"] = float(tilt_angle)
-
-    return metrics
-
-
-def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    从皱鼻动作检测面瘫侧别 - 基于鼻翼-内眦距离变化
-
-    改进:
-    - 主要方法: 比较左右鼻翼-内眦距离的缩短量
-    - 皱鼻时距离应减小，健侧减小更多（肌肉拉力强）
-    - 面瘫侧减小量小（或不减小）
-    """
-    result = {
-        "palsy_side": 0,
-        "confidence": 0.0,
-        "interpretation": "",
-        "method": "",
-        "evidence": {}
-    }
-
-    # 方法1（优先）: 距离变化量（如果有基线）
-    if "ala_canthus_change" in metrics:
-        change_data = metrics["ala_canthus_change"]
-
-        left_reduction = change_data.get("left_reduction", 0)
-        right_reduction = change_data.get("right_reduction", 0)
-
-        result["method"] = "ala_canthus_change"
-        result["evidence"]["left_distance"] = change_data.get("left_distance", 0)
-        result["evidence"]["right_distance"] = change_data.get("right_distance", 0)
-        result["evidence"]["baseline_left_distance"] = change_data.get("baseline_left_distance", 0)
-        result["evidence"]["baseline_right_distance"] = change_data.get("baseline_right_distance", 0)
-        result["evidence"]["left_reduction"] = left_reduction
-        result["evidence"]["right_reduction"] = right_reduction
-
-        max_reduction = max(abs(left_reduction), abs(right_reduction))
-
-        if max_reduction < 3:  # 运动幅度过小（像素）
-            result["evidence"]["status"] = "insufficient_movement"
-            # 继续使用静态方法
-        else:
-            reduction_diff = abs(left_reduction - right_reduction)
-            asymmetry = reduction_diff / max_reduction
-            result["evidence"]["reduction_asymmetry"] = asymmetry
-            result["evidence"]["left_reduction"] = left_reduction
-            result["evidence"]["right_reduction"] = right_reduction
-            result["evidence"]["max_reduction"] = max_reduction
-            result["confidence"] = min(1.0, asymmetry * 2)
-
-            if asymmetry < 0.08:
-                result["palsy_side"] = 0
-                result["interpretation"] = (
-                    f"双侧鼻翼收缩对称 (L缩短{left_reduction:.1f}px, R缩短{right_reduction:.1f}px), "
-                    f"不对称{asymmetry:.4%})"
-                )
-            elif left_reduction < right_reduction:
-                # 左侧缩短量小 = 左侧收缩弱 = 左侧面瘫
-                result["palsy_side"] = 1
-                result["interpretation"] = (
-                    f"左侧鼻翼收缩弱 (L缩短{left_reduction:.1f}px < R缩短{right_reduction:.1f}px), "
-                    f"不对称{asymmetry:.4%}) → 左侧面瘫"
-                )
-            else:
-                result["palsy_side"] = 2
-                result["interpretation"] = (
-                    f"右侧鼻翼收缩弱 (R缩短{right_reduction:.1f}px < L缩短{left_reduction:.1f}px), "
-                    f"不对称{asymmetry:.4%}) → 右侧面瘫"
-                )
-            return result
-
-    # 方法2: 静态距离比较（当前帧）
-    # 皱鼻时距离大的一侧是面瘫侧（收缩弱）
-    left_dist = metrics.get("left_ala_canthus_dist", 0)
-    right_dist = metrics.get("right_ala_canthus_dist", 0)
-
-    result["method"] = "ala_canthus_static"
-    result["evidence"]["left_ala_canthus_dist"] = left_dist
-    result["evidence"]["right_ala_canthus_dist"] = right_dist
-
-    max_dist = max(left_dist, right_dist)
-    if max_dist > 1e-6:
-        dist_diff = abs(left_dist - right_dist)
-        asymmetry = dist_diff / max_dist
-        result["evidence"]["distance_asymmetry"] = asymmetry
-        result["confidence"] = min(1.0, asymmetry * 3)
-
-        if asymmetry < 0.08:
-            result["palsy_side"] = 0
-            result["interpretation"] = f"双侧鼻翼-内眦距离对称 (L={left_dist:.1f}px, R={right_dist:.1f}px)"
-        elif left_dist > right_dist:
-            # 左侧距离大 = 左侧收缩弱 = 左侧面瘫
-            result["palsy_side"] = 1
-            result["interpretation"] = f"左侧距离大 (L={left_dist:.1f}px > R={right_dist:.1f}px) → 左侧面瘫"
-        else:
-            result["palsy_side"] = 2
-            result["interpretation"] = f"右侧距离大 (R={right_dist:.1f}px > L={left_dist:.1f}px) → 右侧面瘫"
-
-    return result
-
-
-def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
-    """
-    计算动作严重度分数(医生标注标准)
-
-    计算依据: 鼻翼 - 内眦距离变化的对称性
-
-    修改: 调整阈值
-    """
-    ala_change = metrics.get("ala_canthus_change", {})
-
-    left_reduction = ala_change.get("left_reduction", 0)
-    right_reduction = ala_change.get("right_reduction", 0)
-
-    abs_left = abs(left_reduction)
-    abs_right = abs(right_reduction)
-    max_reduction = max(abs_left, abs_right)
-    min_reduction = min(abs_left, abs_right)
-
-    # 检查是否有足够的运动
-    if max_reduction < 3.0:
-        return 1, f"运动幅度过小 (L={left_reduction:.1f}px, R={right_reduction:.1f}px)"
-
-    # 计算对称性比值
-    symmetry_ratio = min_reduction / max_reduction if max_reduction > 0 else 1.0
-
-    # 阈值调整
-    if symmetry_ratio >= 0.90:
-        return 1, f"正常 (对称性{symmetry_ratio:.2%})"
-    elif symmetry_ratio >= 0.72:
-        return 2, f"轻度异常 (对称性{symmetry_ratio:.2%})"
-    elif symmetry_ratio >= 0.50:
-        return 3, f"中度异常 (对称性{symmetry_ratio:.2%})"
-    elif symmetry_ratio >= 0.30:
-        return 4, f"重度异常 (对称性{symmetry_ratio:.2%})"
-    else:
-        return 5, f"完全面瘫 (对称性{symmetry_ratio:.2%})"
-
-
-def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
-    """
-    计算Voluntary Movement评分
-
-    基于鼻翼-内眦距离变化的程度和对称性
-
-    评分标准:
-    - 5=完整: 双侧对称且运动充分
-    - 4=几乎完整: 轻度不对称或运动略有不足
-    - 3=启动但不对称: 明显不对称但有运动
-    - 2=轻微启动: 运动幅度很小
-    - 1=无法启动: 几乎没有运动
-    """
-    if baseline_landmarks is not None and "left_change" in metrics:
-        left_change = metrics["left_change"]
-        right_change = metrics["right_change"]
-
-        # 皱鼻时距离应该变小，所以收缩 = -change
-        left_contraction = -left_change
-        right_contraction = -right_change
-
-        # 检查是否有明显运动
-        max_contraction = max(left_contraction, right_contraction)
-        min_contraction = min(left_contraction, right_contraction)
-
-        if max_contraction < 2:  # 几乎没有收缩
-            return 1, "无法启动运动 (鼻翼-内眦距离变化过小)"
-
-        # 检查是否一侧反向运动
-        if min_contraction < -1:  # 一侧反而变远
-            return 2, "轻微启动 (单侧异常运动)"
-
-        # 计算对称性
-        if max_contraction > 1e-9:
-            symmetry_ratio = min_contraction / max_contraction
-        else:
-            symmetry_ratio = 1.0
-
-        if symmetry_ratio >= 0.85:
-            if max_contraction > 8:
-                return 5, "运动完整 (对称且幅度大)"
-            elif max_contraction > 5:
-                return 4, "几乎完整"
-            else:
-                return 3, "启动但幅度不足"
-        elif symmetry_ratio >= 0.60:
-            return 3, "启动但不对称"
-        elif symmetry_ratio >= 0.30:
-            return 2, "轻微启动"
-        else:
-            return 1, "无法启动"
-    else:
-        # 没有基线，使用静态比值
-        ratio = metrics.get("ala_canthus_ratio", 1.0)
-        deviation = abs(ratio - 1.0)
-
-        if deviation <= 0.05:
-            return 5, "运动完整"
-        elif deviation <= 0.10:
-            return 4, "几乎完整"
-        elif deviation <= 0.20:
-            return 3, "启动但不对称"
-        elif deviation <= 0.35:
-            return 2, "轻微启动"
-        else:
-            return 1, "无法启动"
-
+# =============================================================================
+# 联动检测
+# =============================================================================
 
 def detect_synkinesis(baseline_result: Optional[ActionResult],
                       current_landmarks, w: int, h: int) -> Dict[str, int]:
@@ -555,11 +716,11 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
         r_change = abs(r_ear - baseline_r_ear) / baseline_r_ear
         avg_change = (l_change + r_change) / 2
 
-        if avg_change > 0.18:
+        if avg_change > THR.SHRUG_NOSE_SYNKINESIS_SEVERE:
             synkinesis["eye_synkinesis"] = 3
-        elif avg_change > 0.10:
+        elif avg_change > THR.SHRUG_NOSE_SYNKINESIS_MODERATE:
             synkinesis["eye_synkinesis"] = 2
-        elif avg_change > 0.05:
+        elif avg_change > THR.SHRUG_NOSE_SYNKINESIS_MILD:
             synkinesis["eye_synkinesis"] = 1
 
     # 检测嘴部联动
@@ -568,6 +729,7 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
 
     if baseline_mouth_w > 1e-9:
         mouth_change = abs(mouth["width"] - baseline_mouth_w) / baseline_mouth_w
+
         if mouth_change > 0.15:
             synkinesis["mouth_synkinesis"] = 3
         elif mouth_change > 0.08:
@@ -578,181 +740,43 @@ def detect_synkinesis(baseline_result: Optional[ActionResult],
     return synkinesis
 
 
-def visualize_shrug_nose(frame: np.ndarray, landmarks, w: int, h: int,
-                         result: ActionResult,
-                         metrics: Dict[str, Any],
-                         palsy_detection: Dict[str, Any]) -> np.ndarray:
-    """可视化皱鼻指标"""
-    img = frame.copy()
-
-    # ========== 绘制面中线 ==========
-    midline = compute_face_midline(landmarks, w, h)
-    if midline:
-        img = draw_face_midline(img, midline, color=(0, 255, 255), thickness=2, dashed=True)
-
-    # 获取点坐标
-    points = metrics.get("points", {})
-    left_ala = points.get("left_ala", pt2d(landmarks[LM.NOSE_ALA_L], w, h))
-    right_ala = points.get("right_ala", pt2d(landmarks[LM.NOSE_ALA_R], w, h))
-    left_canthus = points.get("left_canthus", pt2d(landmarks[LM.EYE_INNER_L], w, h))
-    right_canthus = points.get("right_canthus", pt2d(landmarks[LM.EYE_INNER_R], w, h))
-
-    # 绘制鼻翼-内眦连线 (关键测量线)
-    cv2.line(img, (int(left_ala[0]), int(left_ala[1])),
-             (int(left_canthus[0]), int(left_canthus[1])), (255, 0, 0), 3)
-    cv2.line(img, (int(right_ala[0]), int(right_ala[1])),
-             (int(right_canthus[0]), int(right_canthus[1])), (0, 165, 255), 3)
-
-    # 绘制鼻翼点
-    cv2.circle(img, (int(left_ala[0]), int(left_ala[1])), 6, (255, 0, 0), -1)
-    cv2.circle(img, (int(right_ala[0]), int(right_ala[1])), 6, (0, 165, 255), -1)
-
-    # 绘制内眦点
-    cv2.circle(img, (int(left_canthus[0]), int(left_canthus[1])), 5, (255, 0, 0), 2)
-    cv2.circle(img, (int(right_canthus[0]), int(right_canthus[1])), 5, (0, 165, 255), 2)
-
-    # 绘制鼻翼连线
-    cv2.line(img, (int(left_ala[0]), int(left_ala[1])),
-             (int(right_ala[0]), int(right_ala[1])), (0, 255, 255), 2)
-
-    # ========== 绘制眼部水平线 ==========
-    cv2.line(img, (int(left_canthus[0]), int(left_canthus[1])),
-             (int(right_canthus[0]), int(right_canthus[1])), (0, 255, 0), 2)
-
-    # ========== 绘制鼻翼到眼部水平线的垂直距离 ==========
-    if "ala_to_eye_line" in metrics:
-        ala_eye = metrics["ala_to_eye_line"]
-        eye_line_y = int(ala_eye["eye_line_y"])
-
-        # 左鼻翼到眼部水平线的垂直线
-        cv2.line(img, (int(left_ala[0]), int(left_ala[1])),
-                 (int(left_ala[0]), eye_line_y), (255, 0, 0), 2, cv2.LINE_AA)
-        # 右鼻翼到眼部水平线的垂直线
-        cv2.line(img, (int(right_ala[0]), int(right_ala[1])),
-                 (int(right_ala[0]), eye_line_y), (0, 165, 255), 2, cv2.LINE_AA)
-
-        # 标注距离值
-        left_dist = ala_eye["left_distance"]
-        right_dist = ala_eye["right_distance"]
-        cv2.putText(img, f"{left_dist:.0f}",
-                    (int(left_ala[0]) - 30, int((left_ala[1] + eye_line_y) / 2)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-        cv2.putText(img, f"{right_dist:.0f}",
-                    (int(right_ala[0]) + 5, int((right_ala[1] + eye_line_y) / 2)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
-
-    # ========== 第一行绘制患侧标注 ==========
-    img, header_end_y = draw_palsy_annotation_header(img, palsy_detection, ACTION_NAME)
-
-    # 信息面板 - 顶部下移，避免覆盖标注
-    panel_top = header_end_y + 10
-    panel_h = panel_top + 300
-    cv2.rectangle(img, (5, panel_top), (420, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, panel_top), (420, panel_h), (255, 255, 255), 1)
-
-    y = panel_top + 25
-    cv2.putText(img, f"{ACTION_NAME} (ShrugNose)", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    y += 28
-
-    # ========== 显示鼻翼到眼部水平线距离 ==========
-    if "ala_to_eye_line" in metrics:
-        ala_eye = metrics["ala_to_eye_line"]
-        cv2.putText(img, "=== Ala to Eye-Line Distance ===", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-        y += 20
-
-        left_dist = ala_eye["left_distance"]
-        right_dist = ala_eye["right_distance"]
-        tilt = ala_eye.get("tilt_angle", 0)
-
-        # 距离长的用红色标记（患侧）
-        left_color = (0, 0, 255) if left_dist > right_dist else (0, 255, 0)
-        right_color = (0, 0, 255) if right_dist > left_dist else (0, 255, 0)
-
-        cv2.putText(img, f"Left to Eye-Line: {left_dist:.1f}px", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, left_color, 1)
-        y += 18
-        cv2.putText(img, f"Right to Eye-Line: {right_dist:.1f}px", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, right_color, 1)
-        y += 18
-        cv2.putText(img, f"Tilt Angle: {tilt:+.1f} deg", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 22
-
-    cv2.putText(img, "=== Ala-Canthus Distance ===", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    y += 20
-
-    cv2.putText(img, f"Left: {metrics['left_ala_canthus_dist']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
-    y += 18
-
-    cv2.putText(img, f"Right: {metrics['right_ala_canthus_dist']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1)
-    y += 18
-
-    ratio = metrics['ala_canthus_ratio']
-    ratio_color = (0, 255, 0) if 0.9 <= ratio <= 1.1 else (0, 0, 255)
-    cv2.putText(img, f"Ratio (L/R): {ratio:.3f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, ratio_color, 1)
-    y += 22
-
-    if "left_change" in metrics:
-        cv2.putText(img, "=== Changes from Baseline ===", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-        y += 20
-
-        cv2.putText(img,
-                    f"Left: {metrics['left_change']:+.1f}px ({metrics.get('left_change_percent', 0):+.1f}%)",
-                    (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 18
-
-        cv2.putText(img,
-                    f"Right: {metrics['right_change']:+.1f}px ({metrics.get('right_change_percent', 0):+.1f}%)",
-                    (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        y += 22
-
-    cv2.putText(img, f"Ala Width: {metrics['ala_width']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    y += 25
-
-    # Voluntary Score
-    cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-    # 图例
-    legend_y = panel_h + 15
-    cv2.line(img, (15, legend_y), (45, legend_y), (255, 0, 0), 3)
-    cv2.putText(img, "Left Ala-Canthus", (50, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-    cv2.line(img, (200, legend_y), (230, legend_y), (0, 165, 255), 3)
-    cv2.putText(img, "Right Ala-Canthus", (235, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-
-    return img
-
+# =============================================================================
+# 主处理函数
+# =============================================================================
 
 def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
             video_info: Dict[str, Any], output_dir: Path,
             baseline_result: Optional[ActionResult] = None,
             baseline_landmarks=None) -> Optional[ActionResult]:
     """处理ShrugNose动作"""
+
     if not landmarks_seq or not frames_seq:
         return None
 
-    # 找峰值帧 (鼻翼-内眦距离最小)
+    # 1. 找峰值帧
     peak_idx, peak_debug = find_peak_frame(landmarks_seq, frames_seq, w, h, baseline_landmarks)
     peak_landmarks = landmarks_seq[peak_idx]
     peak_frame = frames_seq[peak_idx]
 
-    # 提取时序序列用于可视化
-    sequences = extract_shrug_nose_sequences(landmarks_seq, w, h)
-
     if peak_landmarks is None:
         return None
 
-    # 创建结果对象
+    # 2. 计算核心指标
+    metrics = compute_eye_line_metrics(peak_landmarks, w, h)
+
+    # 3. 面瘫侧别检测（不需要baseline）
+    palsy_detection = detect_palsy_side(metrics)
+
+    # 4. 面瘫程度判断（需要baseline）
+    severity_info = None
+    baseline_metrics = None
+
+    if baseline_landmarks is not None:
+        baseline_metrics = compute_eye_line_metrics(baseline_landmarks, w, h)
+        scale = compute_scale_to_baseline(peak_landmarks, baseline_landmarks, w, h)
+        severity_info = compute_severity_with_baseline(metrics, baseline_metrics, scale)
+
+    # 5. 创建结果对象
     result = ActionResult(
         action_name=ACTION_NAME,
         action_name_cn=ACTION_NAME_CN,
@@ -763,87 +787,87 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         fps=video_info.get("fps", 30.0)
     )
 
-    # 提取通用指标
+    # 6. 提取通用指标
     extract_common_indicators(peak_landmarks, w, h, result, baseline_landmarks)
 
-    # 计算皱鼻特有指标
-    metrics = compute_shrug_nose_metrics(peak_landmarks, w, h, baseline_landmarks)
-
-    # 检测面瘫侧别
-    palsy_detection = detect_palsy_side(metrics)
-
-    # 计算Voluntary Movement评分
-    score, interpretation = compute_voluntary_score(metrics, baseline_landmarks)
-    result.voluntary_movement_score = score
-
-    # 检测联动
+    # 7. 检测联动
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
-    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
-    severity_score, severity_desc = compute_severity_score(metrics)
-
-    # 存储动作特有指标
+    # 8. 存储动作特有指标
+    perp = metrics["perpendicular"]
     result.action_specific = {
-        "ala_canthus_metrics": {
-            "left_distance": metrics["left_ala_canthus_dist"],
-            "right_distance": metrics["right_ala_canthus_dist"],
-            "ratio": metrics["ala_canthus_ratio"],
-            "ala_width": metrics["ala_width"],
+        "measurement_method": "perpendicular_distance_to_extended_eye_line",
+        "perpendicular_distance": {
+            "left_px": perp["left"]["distance_px"],
+            "right_px": perp["right"]["distance_px"],
+            "left_norm": perp["left"]["distance_norm"],
+            "right_norm": perp["right"]["distance_norm"],
+            "diff_px": abs(perp["left"]["distance_px"] - perp["right"]["distance_px"]),
+            "asymmetry": metrics["asymmetry"],
+        },
+        "eye_line": {
+            "original_length": metrics["eye_line_original"]["length"],
+            "extended_length": metrics["eye_line_extended"]["length"],
         },
         "palsy_detection": palsy_detection,
-        "voluntary_interpretation": interpretation,
-        "synkinesis": synkinesis,
-        "severity_score": severity_score,
-        "severity_desc": severity_desc,
         "peak_debug": peak_debug,
     }
 
-    if "baseline" in metrics:
-        result.action_specific["baseline"] = metrics["baseline"]
-        result.action_specific["changes"] = {
-            "left_change": metrics.get("left_change", 0),
-            "right_change": metrics.get("right_change", 0),
-            "left_change_percent": metrics.get("left_change_percent", 0),
-            "right_change_percent": metrics.get("right_change_percent", 0),
+    if severity_info:
+        result.action_specific["severity"] = severity_info
+        result.action_specific["baseline"] = {
+            "left_px": baseline_metrics["perpendicular"]["left"]["distance_px"],
+            "right_px": baseline_metrics["perpendicular"]["right"]["distance_px"],
         }
+        result.voluntary_movement_score = severity_info["severity_score"]
+    else:
+        result.voluntary_movement_score = 1  # 无baseline时无法评估
 
-    # 创建输出目录
+    # 9. 创建输出目录
     action_dir = output_dir / ACTION_NAME
     action_dir.mkdir(parents=True, exist_ok=True)
 
-    # 保存原始帧
+    # 10. 保存原始帧
     cv2.imwrite(str(action_dir / "peak_raw.jpg"), peak_frame)
 
-    # 保存可视化
-    vis = visualize_shrug_nose(peak_frame, peak_landmarks, w, h, result, metrics, palsy_detection)
+    # 11. 保存可视化
+    vis = visualize_shrug_nose(peak_frame, peak_landmarks, w, h, result,
+                               metrics, palsy_detection, severity_info)
     cv2.imwrite(str(action_dir / "peak_indicators.jpg"), vis)
 
-    # 准备基线值
+    # 12. 准备基线值用于曲线图
     baseline_values = None
-    if baseline_landmarks is not None:
-        baseline_left = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=True)
-        baseline_right = compute_ala_to_canthus_distance(baseline_landmarks, w, h, left=False)
-        baseline_values = {"left": baseline_left, "right": baseline_right}
+    if baseline_metrics:
+        baseline_values = {
+            "left": baseline_metrics["perpendicular"]["left"]["distance_px"],
+            "right": baseline_metrics["perpendicular"]["right"]["distance_px"],
+        }
 
-    # 绘制关键帧选择曲线
-    plot_shrug_nose_peak_selection(
+    # 13. 绘制曲线图
+    plot_peak_selection_curve(
         peak_debug,
         video_info.get("fps", 30.0),
         action_dir / "peak_selection_curve.png",
         baseline_values,
-        palsy_detection
+        palsy_detection,
     )
 
-    # 保存JSON
+    # 14. 保存JSON
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
-    print(
-        f"    [OK] {ACTION_NAME}: Ala-Canthus L={metrics['left_ala_canthus_dist']:.1f} R={metrics['right_ala_canthus_dist']:.1f}")
-    if "left_change" in metrics:
-        print(f"         Change L={metrics['left_change']:+.1f}px R={metrics['right_change']:+.1f}px")
-    print(f"         Palsy Side: {palsy_detection.get('interpretation', 'N/A')}")
-    print(f"         Voluntary Score: {result.voluntary_movement_score}/5 ({interpretation})")
+    # 15. 打印结果
+    left_px = perp["left"]["distance_px"]
+    right_px = perp["right"]["distance_px"]
+    asym = metrics["asymmetry"]
+
+    print(f"    [OK] {ACTION_NAME}: L={left_px:.1f}px R={right_px:.1f}px Asym={asym:.1%}")
+    print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
+
+    if severity_info:
+        print(f"         Movement: L={severity_info['movement']['left_px']:+.1f}px "
+              f"R={severity_info['movement']['right_px']:+.1f}px")
+        print(f"         Severity: {severity_info['severity_score']}/5 - {severity_info['severity_desc']}")
 
     return result
