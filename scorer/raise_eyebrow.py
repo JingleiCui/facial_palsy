@@ -4,6 +4,17 @@
 RaiseEyebrow 动作处理模块
 =========================
 
+核心改进:
+=========
+1. 面瘫侧别判断：不需要基线
+   - 直接比较当前帧的左右眉眼距
+   - 眉眼距小的那侧 = 患侧（抬不起来）
+   - 使用归一化不对称度阈值
+
+2. 严重程度判断：需要基线
+   - 比较患侧眉毛抬起的幅度
+   - 幅度越小 = 越严重
+
 分析抬眉/皱额动作:
 1. 眉眼距
 2. 眉眼距变化度
@@ -245,113 +256,138 @@ def plot_raise_eyebrow_peak_selection(
         if valid_mask is not None:
             add_valid_region_shading(ax1, valid_mask, time_sec)
 
-        ax1.plot(time_sec, sequences["Left Change"], 'b-', label='Left BED Change', linewidth=2)
-        ax1.plot(time_sec, sequences["Right Change"], 'r-', label='Right BED Change', linewidth=2)
+        left_change = np.array(sequences["Left Change"])
+        right_change = np.array(sequences["Right Change"])
 
-        # 计算平均变化
-        avg_change = [(l + r) / 2 if not (np.isnan(l) or np.isnan(r)) else np.nan
-                      for l, r in zip(sequences["Left Change"], sequences["Right Change"])]
-        ax1.plot(time_sec, avg_change, 'g--', label='Average Change', linewidth=2, alpha=0.7)
+        ax1.plot(time_sec, left_change, 'b-', label='Left BED Change', linewidth=2)
+        ax1.plot(time_sec, right_change, 'r-', label='Right BED Change', linewidth=2)
+        ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        ax1.axvline(x=peak_time, color='green', linestyle='--', linewidth=2, alpha=0.7)
 
-        ax1.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
-        change_at_peak = avg_change[peak_idx] if peak_idx < len(avg_change) else 0
-        if not np.isnan(change_at_peak):
-            ax1.scatter([peak_time], [change_at_peak], color='red', s=150, zorder=5,
-                        edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
+        if 0 <= peak_idx < n_frames:
+            ax1.scatter([peak_time], [left_change[peak_idx]], color='blue', s=150, zorder=5,
+                        edgecolors='black', linewidths=1.5, marker='*')
+            ax1.scatter([peak_time], [right_change[peak_idx]], color='red', s=150, zorder=5,
+                        edgecolors='black', linewidths=1.5, marker='*')
 
-        ax1.set_xlabel(x_label, fontsize=11)
-        ax1.set_ylabel('BED Change (pixels)', fontsize=11)
-
-        title = 'RaiseEyebrow Peak Selection: Maximum BED Change'
+        title = "RaiseEyebrow: Brow-Eye Distance Change (Selection Criterion)"
         if palsy_detection:
             palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
             title += f' | Detected: {palsy_text}'
-        ax1.set_title(title, fontsize=13, fontweight='bold')
-        ax1.legend(loc='best')
-        ax1.grid(True, alpha=0.3)
+
+        ax1.set_title(title, fontsize=14, fontweight='bold')
+        ax1.set_xlabel(x_label, fontsize=11)
+        ax1.set_ylabel('BED Change (pixels)', fontsize=11)
+        ax1.legend(loc='upper right')
+        ax1.grid(True, alpha=0.4)
 
         # 下图: 眉眼距绝对值
         ax2 = axes[1]
+        left_bed = np.array(sequences["Left BED"])
+        right_bed = np.array(sequences["Right BED"])
 
-        if valid_mask is not None:
-            add_valid_region_shading(ax2, valid_mask, time_sec)
+        ax2.plot(time_sec, left_bed, 'b--', label='Left BED (absolute)', linewidth=1.5, alpha=0.7)
+        ax2.plot(time_sec, right_bed, 'r--', label='Right BED (absolute)', linewidth=1.5, alpha=0.7)
+        ax2.axvline(x=peak_time, color='green', linestyle='--', linewidth=2, alpha=0.7)
 
-        ax2.plot(time_sec, sequences["Left BED"], 'b-', label='Left BED', linewidth=2)
-        ax2.plot(time_sec, sequences["Right BED"], 'r-', label='Right BED', linewidth=2)
-        ax2.plot(time_sec, sequences["Average BED"], 'g--', label='Average BED', linewidth=1.5, alpha=0.7)
-        ax2.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
-
+        ax2.set_title('Brow-Eye Distance (Reference)', fontsize=12)
         ax2.set_xlabel(x_label, fontsize=11)
         ax2.set_ylabel('BED (pixels)', fontsize=11)
-        ax2.set_title('Brow-Eye Distance Over Time', fontsize=12)
-        ax2.legend(loc='best')
-        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='upper right')
+        ax2.grid(True, alpha=0.4)
 
     else:
-        # 没有基线时只画一张图
-        fig, ax = plt.subplots(figsize=(16, 5))  # 增加宽度
+        fig, ax = plt.subplots(1, 1, figsize=(14, 6))
 
         if valid_mask is not None:
             add_valid_region_shading(ax, valid_mask, time_sec)
 
-        ax.plot(time_sec, sequences["Left BED"], 'b-', label='Left BED', linewidth=2)
-        ax.plot(time_sec, sequences["Right BED"], 'r-', label='Right BED', linewidth=2)
-        ax.plot(time_sec, sequences["Average BED"], 'g--', label='Average BED', linewidth=2, alpha=0.7)
+        left_bed = np.array(sequences["Left BED"])
+        right_bed = np.array(sequences["Right BED"])
+        avg_bed = np.array(sequences["Average BED"])
 
+        ax.plot(time_sec, left_bed, 'b-', label='Left BED', linewidth=2)
+        ax.plot(time_sec, right_bed, 'r-', label='Right BED', linewidth=2)
+        ax.plot(time_sec, avg_bed, 'g--', label='Average BED (Selection)', linewidth=2.5)
         ax.axvline(x=peak_time, color='black', linestyle='--', linewidth=2, alpha=0.7)
-        bed_at_peak = sequences["Average BED"][peak_idx] if peak_idx < len(sequences["Average BED"]) else 0
-        if not np.isnan(bed_at_peak):
-            ax.scatter([peak_time], [bed_at_peak], color='red', s=150, zorder=5,
+
+        if 0 <= peak_idx < n_frames and np.isfinite(avg_bed[peak_idx]):
+            ax.scatter([peak_time], [avg_bed[peak_idx]], color='red', s=200, zorder=5,
                        edgecolors='black', linewidths=2, marker='*', label=f'Peak Frame {peak_idx}')
 
-        ax.set_xlabel(x_label, fontsize=11)
-        ax.set_ylabel('Brow-Eye Distance (pixels)', fontsize=11)
-
-        title = 'RaiseEyebrow Peak Selection: Maximum BED'
+        title = "RaiseEyebrow: Brow-Eye Distance (Selection: Max Average)"
         if palsy_detection:
             palsy_text = get_palsy_side_text(palsy_detection.get("palsy_side", 0))
             title += f' | Detected: {palsy_text}'
-        ax.set_title(title, fontsize=13, fontweight='bold')
-        ax.legend(loc='best')
-        ax.grid(True, alpha=0.3)
+
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_xlabel(x_label, fontsize=11)
+        ax.set_ylabel('BED (pixels)', fontsize=11)
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.4)
 
     plt.tight_layout()
-    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.savefig(str(output_path), dpi=150)
     plt.close()
 
 
-def compute_raise_eyebrow_metrics(landmarks, w: int, h: int,
-                                  baseline_landmarks=None) -> Dict[str, Any]:
-    """计算抬眉特有指标"""
-    # 当前眉眼距
+def compute_raise_eyebrow_metrics(landmarks, w: int, h: int, baseline_landmarks=None) -> Dict[str, Any]:
+    """
+    计算抬眉动作指标
+
+    包含:
+    - 眉眼距（像素和归一化）
+    - 眉眼距比（左/右）
+    - 眉眼距变化（需要基线）
+    """
+    # 眉眼距比
     bed_result = compute_brow_eye_distance_ratio(landmarks, w, h)
 
+    # 获取眉毛和眼部关键点
+    left_eye_inner = pt2d(landmarks[LM.EYE_INNER_L], w, h)
+    right_eye_inner = pt2d(landmarks[LM.EYE_INNER_R], w, h)
+    left_brow_centroid = compute_brow_centroid(landmarks, w, h, left=True)
+    right_brow_centroid = compute_brow_centroid(landmarks, w, h, left=False)
+
+    # 计算ICD用于归一化
+    icd = compute_icd(landmarks, w, h)
+    icd = max(icd, 1e-6)
+
+    # 归一化眉眼距
+    left_bed_norm = bed_result["left_distance"] / icd
+    right_bed_norm = bed_result["right_distance"] / icd
+
     metrics = {
+        # 原始眉眼距（像素）
         "left_brow_eye_distance": bed_result["left_distance"],
         "right_brow_eye_distance": bed_result["right_distance"],
         "brow_eye_distance_ratio": bed_result["ratio"],
-        "left_eye_inner": bed_result["left_eye_inner"],
-        "right_eye_inner": bed_result["right_eye_inner"],
-        "left_brow_centroid": bed_result["left_brow_centroid"],
-        "right_brow_centroid": bed_result["right_brow_centroid"],
+        # 归一化眉眼距（相对于ICD）
+        "left_bed_norm": float(left_bed_norm),
+        "right_bed_norm": float(right_bed_norm),
+        "icd": float(icd),
+        # 关键点位置
+        "left_eye_inner": left_eye_inner,
+        "right_eye_inner": right_eye_inner,
+        "left_brow_centroid": left_brow_centroid,
+        "right_brow_centroid": right_brow_centroid,
     }
 
-    # 如果有基线，计算变化度
+    # 如果有基线，计算变化
     if baseline_landmarks is not None:
-        # ========== 计算统一 scale ==========
+        baseline_bed = compute_brow_eye_distance_ratio(baseline_landmarks, w, h)
+        baseline_icd = compute_icd(baseline_landmarks, w, h)
+
+        # 尺度校正
         scale = compute_scale_to_baseline(landmarks, baseline_landmarks, w, h)
         metrics["scale"] = scale
-        # ====================================
 
-        baseline_bed = compute_brow_eye_distance_ratio(baseline_landmarks, w, h)
-
-        # ========== 缩放到 baseline 尺度后计算变化 ==========
+        # 使用尺度校正后的值计算变化
         left_scaled = bed_result["left_distance"] * scale
         right_scaled = bed_result["right_distance"] * scale
 
         left_change = left_scaled - baseline_bed["left_distance"]
         right_change = right_scaled - baseline_bed["right_distance"]
-        # ===================================================
 
         metrics["left_change"] = left_change
         metrics["right_change"] = right_change
@@ -381,98 +417,155 @@ def compute_raise_eyebrow_metrics(landmarks, w: int, h: int,
 
 def detect_palsy_side(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
-    从抬眉动作检测面瘫侧别
+    抬眉动作面瘫侧别检测 - 不需要基线
 
-    原理: 面瘫侧眉毛无法上抬，眉眼距变化小
+    核心逻辑:
+    =========
+    抬眉时，患侧眉毛无法正常上抬，导致眉眼距较小。
+    因此：眉眼距小的那侧 = 患侧
+
+    判断方式:
+    - 直接比较当前帧的左右眉眼距（归一化到ICD）
+    - 不需要与静息基线比较
+    - 使用不对称度阈值判断是否异常
+
+    阈值:
+    - RAISE_EYEBROW_ASYM_NORMAL: 不对称度 < % 视为正常
     """
-    result = {"palsy_side": 0, "confidence": 0.0, "interpretation": ""}
-
-    # 优先使用眉眼距变化
-    left_change = metrics.get("left_change", 0)
-    right_change = metrics.get("right_change", 0)
-
-    # 也检查静态眉眼距比
-    bed_ratio = metrics.get("brow_eye_distance_ratio", 1.0)
-
-    max_change = max(abs(left_change), abs(right_change))
-
-    if max_change < 2:  # 运动幅度过小
-        # 检查静态比例
-        asymmetry = abs(bed_ratio - 1.0)
-        if asymmetry < 0.10:
-            result["interpretation"] = "眉眼距对称，运动幅度小"
-        else:
-            if bed_ratio > 1.0:
-                result["palsy_side"] = 2
-                result["interpretation"] = f"右侧眉眼距较小 (比值={bed_ratio:.3f})"
-            else:
-                result["palsy_side"] = 1
-                result["interpretation"] = f"左侧眉眼距较小 (比值={bed_ratio:.3f})"
-            result["confidence"] = min(1.0, asymmetry * 2)
-        return result
-
-    # 使用变化量比较
-    asymmetry = abs(left_change - right_change) / max_change
-    result["confidence"] = min(1.0, asymmetry * 3)
-
-    # 详细输出用于调试
-    result["evidence"] = {
-        "asymmetry_ratio": asymmetry,
-        "left_change": left_change,
-        "right_change": right_change,
-        "max_change": max_change,
-        "change_ratio": min(abs(left_change), abs(right_change)) / max_change if max_change > 0 else 1.0
+    result = {
+        "palsy_side": 0,          # 0=对称, 1=左患侧, 2=右患侧
+        "confidence": 0.0,
+        "interpretation": "",
+        "method": "bed_asymmetry",
+        "evidence": {},
     }
 
-    if asymmetry < 0.10:
+    # 获取归一化眉眼距
+    left_bed_norm = metrics.get("left_bed_norm")
+    right_bed_norm = metrics.get("right_bed_norm")
+
+    # 如果没有归一化值，使用原始值计算
+    if left_bed_norm is None or right_bed_norm is None:
+        left_bed = metrics.get("left_brow_eye_distance", 0)
+        right_bed = metrics.get("right_brow_eye_distance", 0)
+        icd = metrics.get("icd", 1)
+        if icd > 1e-6:
+            left_bed_norm = left_bed / icd
+            right_bed_norm = right_bed / icd
+        else:
+            result["interpretation"] = "无法计算眉眼距"
+            return result
+
+    # 计算不对称度
+    max_bed = max(left_bed_norm, right_bed_norm)
+    min_bed = min(left_bed_norm, right_bed_norm)
+
+    if max_bed < 0.004:
+        result["interpretation"] = "眉眼距过小，无法判断"
+        return result
+
+    # 不对称度 = |左-右| / max
+    asymmetry = abs(left_bed_norm - right_bed_norm) / max_bed
+
+    # 阈值
+    threshold = THR.RAISE_EYEBROW_ASYM_NORMAL
+
+    # 记录证据
+    result["evidence"] = {
+        "left_bed_norm": float(left_bed_norm),
+        "right_bed_norm": float(right_bed_norm),
+        "asymmetry": float(asymmetry),
+        "threshold": float(threshold),
+        "logic": "眉眼距小的一侧 = 患侧（抬不起来）",
+    }
+
+    # 判断
+    is_abnormal = asymmetry > threshold
+
+    if not is_abnormal:
         result["palsy_side"] = 0
-        result[
-            "interpretation"] = f"双侧抬眉对称 (L变化={left_change:.1f}px, R变化={right_change:.1f}px, 不对称{asymmetry:.1%})"
-    elif left_change < right_change:
+        result["confidence"] = 0.0
+        result["interpretation"] = (
+            f"双侧眉眼距对称 (L={left_bed_norm:.3f}, R={right_bed_norm:.3f}, "
+            f"不对称{asymmetry:.4%} ≤ {threshold:.4%})"
+        )
+        return result
+
+    # 计算置信度
+    conf = min(1.0, (asymmetry - threshold) / max(threshold, 1e-6))
+    result["confidence"] = float(conf)
+
+    # 眉眼距小的那侧是患侧
+    if left_bed_norm < right_bed_norm:
         result["palsy_side"] = 1
-        result["interpretation"] = f"左侧抬眉弱 (L={left_change:.1f}px < R={right_change:.1f}px, 不对称{asymmetry:.1%})"
+        result["interpretation"] = (
+            f"左侧面瘫：左眉眼距较小 (L={left_bed_norm:.3f} < R={right_bed_norm:.3f}, "
+            f"不对称{asymmetry:.4%} > {threshold:.4%})"
+        )
     else:
         result["palsy_side"] = 2
-        result["interpretation"] = f"右侧抬眉弱 (R={right_change:.1f}px < L={left_change:.1f}px, 不对称{asymmetry:.1%})"
+        result["interpretation"] = (
+            f"右侧面瘫：右眉眼距较小 (R={right_bed_norm:.3f} < L={left_bed_norm:.3f}, "
+            f"不对称{asymmetry:.4%} > {threshold:.4%})"
+        )
 
     return result
 
 
 def compute_severity_score(metrics: Dict[str, Any]) -> Tuple[int, str]:
     """
-    计算动作严重度分数(医生标注标准)
+    计算严重度分数 - 需要基线
 
-    计算依据: 眉眼距变化的对称性
+    核心逻辑:
+    =========
+    基于患侧眉毛抬起的幅度（变化量）
+    - 幅度越小 = 越严重
 
-    修改: 提高Score = 1
-    的阈值
+    需要有基线才能计算变化量。
+    如果没有基线，则使用静态不对称度作为备选。
     """
-    left_change = metrics.get("left_change", 0)
-    right_change = metrics.get("right_change", 0)
+    # 检查是否有变化量数据（需要基线）
+    left_change = metrics.get("left_change")
+    right_change = metrics.get("right_change")
 
-    abs_left = abs(left_change)
-    abs_right = abs(right_change)
-    max_change = max(abs_left, abs_right)
-    min_change = min(abs_left, abs_right)
+    if left_change is not None and right_change is not None:
+        # 有基线：使用变化量评估严重度
+        abs_left = abs(left_change)
+        abs_right = abs(right_change)
+        max_change = max(abs_left, abs_right)
+        min_change = min(abs_left, abs_right)
 
-    # 检查是否有足够的运动
-    if max_change < 3.0:
-        return 1, f"运动幅度过小 (L={left_change:.1f}px, R={right_change:.1f}px)"
+        # 检查是否有足够的运动
+        if max_change < 3.0:
+            return 5, f"几乎无抬眉动作 (L变化={left_change:.1f}px, R变化={right_change:.1f}px)"
 
-    # 计算对称性比值
-    symmetry_ratio = min_change / max_change if max_change > 0 else 1.0
+        # 计算对称性比值（较小/较大）
+        symmetry_ratio = min_change / max_change if max_change > 0 else 1.0
 
-    # 阈值调整
-    if symmetry_ratio >= 0.90:
-        return 1, f"正常 (对称性{symmetry_ratio:.2%})"
-    elif symmetry_ratio >= 0.72:
-        return 2, f"轻度异常 (对称性{symmetry_ratio:.2%})"
-    elif symmetry_ratio >= 0.50:
-        return 3, f"中度异常 (对称性{symmetry_ratio:.2%})"
-    elif symmetry_ratio >= 0.30:
-        return 4, f"重度异常 (对称性{symmetry_ratio:.2%})"
+        # 根据对称性评估严重度
+        if symmetry_ratio >= 0.90:
+            return 1, f"正常 (对称性{symmetry_ratio:.1%}, L={left_change:+.1f}px, R={right_change:+.1f}px)"
+        elif symmetry_ratio >= 0.72:
+            return 2, f"轻度 (对称性{symmetry_ratio:.1%})"
+        elif symmetry_ratio >= 0.50:
+            return 3, f"中度 (对称性{symmetry_ratio:.1%})"
+        elif symmetry_ratio >= 0.30:
+            return 4, f"重度 (对称性{symmetry_ratio:.1%})"
+        else:
+            return 5, f"完全面瘫 (对称性{symmetry_ratio:.1%})"
+
     else:
-        return 5, f"完全面瘫 (对称性{symmetry_ratio:.2%})"
+        # 无基线：使用静态眉眼距比值作为备选
+        ratio = metrics.get("brow_eye_distance_ratio", 1.0)
+        deviation = abs(ratio - 1.0)
+
+        return (
+            1 if deviation <= 0.05 else
+            2 if deviation <= 0.10 else
+            3 if deviation <= 0.20 else
+            4 if deviation <= 0.35 else 5,
+            f"无基线数据，基于静态比值 (ratio={ratio:.3f}, 偏差={deviation:.1%})"
+        )
 
 
 def compute_voluntary_score(metrics: Dict[str, Any], baseline_landmarks=None) -> Tuple[int, str]:
@@ -604,7 +697,7 @@ def visualize_raise_eyebrow(frame: np.ndarray, landmarks, w: int, h: int,
     cv2.circle(img, (int(left_eye_inner[0]), int(left_eye_inner[1])), 5, (255, 0, 0), -1)
     cv2.circle(img, (int(right_eye_inner[0]), int(right_eye_inner[1])), 5, (255, 0, 0), -1)
 
-    # 画“眼部水平线(内眦连线延长到眉毛极值范围)” + “眉毛质心到该线的垂线”
+    # 画"眼部水平线(内眦连线延长到眉毛极值范围)" + "眉毛质心到该线的垂线"
     bedL = compute_brow_eye_distance(landmarks, w, h, left=True)
     bedR = compute_brow_eye_distance(landmarks, w, h, left=False)
 
@@ -613,7 +706,7 @@ def visualize_raise_eyebrow(frame: np.ndarray, landmarks, w: int, h: int,
     p1 = bedL.get("eye_line_p1", right_eye_inner)
     cv2.line(img, (int(p0[0]), int(p0[1])), (int(p1[0]), int(p1[1])), (0, 255, 0), 2)
 
-    # 画眉毛极值点（可选：你想看“对齐范围”就保留）
+    # 画眉毛极值点（可选：你想看"对齐范围"就保留）
     bl = bedL.get("brow_extreme_left", None)  # index 300
     br = bedL.get("brow_extreme_right", None)  # index 70
     if bl is not None:
@@ -636,69 +729,77 @@ def visualize_raise_eyebrow(frame: np.ndarray, landmarks, w: int, h: int,
         cv2.circle(img, (int(footR[0]), int(footR[1])), 4, (0, 255, 255), -1)
 
     # 信息面板
-    panel_h = 350  # 增加高度
+    panel_h = 380  # 增加高度
     panel_top = 80  # 面板顶部留出空间
-    cv2.rectangle(img, (5, panel_top), (450, panel_h), (0, 0, 0), -1)
-    cv2.rectangle(img, (5, panel_top), (450, panel_h), (255, 255, 255), 1)
+    cv2.rectangle(img, (5, panel_top), (480, panel_h), (0, 0, 0), -1)
+    cv2.rectangle(img, (5, panel_top), (480, panel_h), (255, 255, 255), 1)
 
     y = panel_top + 40
     cv2.putText(img, f"{ACTION_NAME}", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 2)
     y += 50
 
-    cv2.putText(img, "=== Brow-Eye Distance ===", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 1)
-    y += 50
+    # 眉眼距信息（主要指标）
+    cv2.putText(img, "=== Brow-Eye Distance (BED) ===", (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 1)
+    y += 40
 
-    cv2.putText(img, f"Left: {metrics['left_brow_eye_distance']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
+    left_bed = metrics['left_brow_eye_distance']
+    right_bed = metrics['right_brow_eye_distance']
+    left_bed_norm = metrics.get('left_bed_norm', 0)
+    right_bed_norm = metrics.get('right_bed_norm', 0)
+
+    # 颜色编码：较小的眉眼距用红色标记（可能是患侧）
+    left_color = (0, 0, 255) if left_bed < right_bed else (255, 255, 255)
+    right_color = (0, 0, 255) if right_bed < left_bed else (255, 255, 255)
+
+    cv2.putText(img, f"Left: {left_bed:.1f}px ({left_bed_norm:.3f} ICD)", (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, left_color, 1)
     y += 30
 
-    cv2.putText(img, f"Right: {metrics['right_brow_eye_distance']:.1f}px", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
+    cv2.putText(img, f"Right: {right_bed:.1f}px ({right_bed_norm:.3f} ICD)", (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, right_color, 1)
     y += 30
 
-    ratio = metrics['brow_eye_distance_ratio']
-    ratio_color = (0, 255, 0) if 0.9 <= ratio <= 1.1 else (0, 165, 255) if 0.8 <= ratio <= 1.2 else (0, 0, 255)
-    cv2.putText(img, f"Ratio: {ratio:.3f}", (15, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, ratio_color, 1)
-    y += 50
+    # 不对称度
+    evidence = palsy_detection.get("evidence", {}) if palsy_detection else {}
+    asymmetry = evidence.get("asymmetry", 0)
+    threshold = evidence.get("threshold", 0.08)
+    asym_color = (0, 0, 255) if asymmetry > threshold else (0, 255, 0)
+    cv2.putText(img, f"Asymmetry: {asymmetry:.1%} (thr: {threshold:.1%})", (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, asym_color, 1)
+    y += 40
 
+    # 如果有基线，显示变化量
     if "left_change" in metrics:
-        cv2.putText(img, "=== Distance Change ===", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 1)
-        y += 50
+        cv2.putText(img, "=== Change from Baseline ===", (15, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 1)
+        y += 35
 
         left_change = metrics["left_change"]
         right_change = metrics["right_change"]
 
         cv2.putText(img, f"Left: {left_change:+.1f}px ({metrics.get('left_change_percent', 0):+.1f}%)", (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
-        y += 50
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1)
+        y += 28
 
         cv2.putText(img, f"Right: {right_change:+.1f}px ({metrics.get('right_change_percent', 0):+.1f}%)",
                     (15, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
-        y += 50
-
-        change_ratio = metrics.get("change_ratio", 1.0)
-        if not np.isinf(change_ratio):
-            cv2.putText(img, f"Change Ratio: {change_ratio:.3f}", (15, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
-        y += 80
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1)
+        y += 35
 
     # Voluntary Score
     cv2.putText(img, f"Voluntary Score: {result.voluntary_movement_score}/5", (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
 
     # 图例
-    legend_y = panel_h + 50
+    legend_y = panel_h + 30
     cv2.circle(img, (20, legend_y), 5, (0, 0, 255), -1)
-    cv2.putText(img, "Brow Centroid", (35, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
-    cv2.circle(img, (150, legend_y), 5, (255, 0, 0), -1)
-    cv2.putText(img, "Eye Inner", (165, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
-    cv2.line(img, (260, legend_y), (290, legend_y), (0, 255, 255), 2)
-    cv2.putText(img, "BED", (295, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1)
+    cv2.putText(img, "Brow Centroid", (35, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+    cv2.circle(img, (180, legend_y), 5, (255, 0, 0), -1)
+    cv2.putText(img, "Eye Inner", (195, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+    cv2.line(img, (300, legend_y), (330, legend_y), (0, 255, 255), 2)
+    cv2.putText(img, "BED", (335, legend_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
 
     # ========== 最后绘制患侧标注（放在最上方，不被覆盖）==========
     img, _ = draw_palsy_annotation_header(img, palsy_detection, ACTION_NAME)
@@ -756,7 +857,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 计算抬眉特有指标
     metrics = compute_raise_eyebrow_metrics(peak_landmarks, w, h, baseline_landmarks)
 
-    # 检测面瘫侧别
+    # 检测面瘫侧别（不需要基线）
     palsy_detection = detect_palsy_side(metrics)
 
     # 计算Voluntary Movement评分
@@ -767,7 +868,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     synkinesis = detect_synkinesis(baseline_result, peak_landmarks, w, h)
     result.synkinesis_scores = synkinesis
 
-    # 计算严重度分数 (医生标注标准: 1=正常, 5=面瘫)
+    # 计算严重度分数（需要基线）
     severity_score, severity_desc = compute_severity_score(metrics)
 
     # 存储动作特有指标
@@ -776,6 +877,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
             "left_brow_eye_distance": metrics["left_brow_eye_distance"],
             "right_brow_eye_distance": metrics["right_brow_eye_distance"],
             "brow_eye_distance_ratio": metrics["brow_eye_distance_ratio"],
+            "left_bed_norm": metrics.get("left_bed_norm", 0),
+            "right_bed_norm": metrics.get("right_bed_norm", 0),
         },
         "voluntary_interpretation": interpretation,
         "synkinesis": synkinesis,
@@ -807,7 +910,8 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
         video_info.get("fps", 30.0),
         peak_idx,
         action_dir / "peak_selection_curve.png",
-        has_baseline=(baseline_landmarks is not None)
+        has_baseline=(baseline_landmarks is not None),
+        palsy_detection=palsy_detection
     )
 
     # 保存可视化
@@ -823,10 +927,15 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     with open(action_dir / "indicators.json", 'w', encoding='utf-8') as f:
         json.dump(result.to_dict(), f, indent=2, ensure_ascii=False)
 
-    print(
-        f"    [OK] {ACTION_NAME}: BED L={metrics['left_brow_eye_distance']:.1f} R={metrics['right_brow_eye_distance']:.1f}")
+    # 打印信息
+    print(f"    [OK] {ACTION_NAME}: BED L={metrics['left_brow_eye_distance']:.1f}px "
+          f"({metrics.get('left_bed_norm', 0):.3f} ICD) "
+          f"R={metrics['right_brow_eye_distance']:.1f}px "
+          f"({metrics.get('right_bed_norm', 0):.3f} ICD)")
+    print(f"         Palsy: {palsy_detection.get('interpretation', 'N/A')}")
     if "left_change" in metrics:
         print(f"         Change L={metrics['left_change']:+.1f}px R={metrics['right_change']:+.1f}px")
+    print(f"         Severity: {severity_score}/5 ({severity_desc})")
     print(f"         Voluntary Score: {result.voluntary_movement_score}/5 ({interpretation})")
 
     return result

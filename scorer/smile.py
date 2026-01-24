@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微笑动作处理模块
+微笑动作处理模块 (修改版)
 ==========================
 
-分析:
+核心改进:
+1. 面瘫侧别判断: 不需要基线，直接比较左右嘴角到眼线距离，距离大的一侧 = 患侧
+2. 严重程度判断: 需要基线，比较嘴角上提程度(距离减小量)
+
+分析内容:
 1. 嘴角位移和对称性
 2. 口角角度变化
 3. 运动幅度对比
 4. 面瘫侧别检测
 5. 联动运动检测 (眼部联动)
 
-# 1. 关键帧改为嘴角到眼部水平线距离最小的帧
-# 2. 面瘫侧别改为比较左右嘴角上提幅度（距离减小量）
 对应Sunnybrook: Open mouth smile (ZYG/RIS)
 """
-
 import cv2
 import numpy as np
 from pathlib import Path
@@ -85,16 +86,16 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 收集时序数据
     left_dist_seq = []
     right_dist_seq = []
-    total_dist_seq = []
+    mean_dist_seq = []
 
-    min_total_dist = float('inf')
+    min_mean_dist = float('inf')
     min_idx = 0
 
     for i, lm in enumerate(landmarks_seq):
         if lm is None:
             left_dist_seq.append(np.nan)
             right_dist_seq.append(np.nan)
-            total_dist_seq.append(np.nan)
+            mean_dist_seq.append(np.nan)
             continue
 
         # 计算左右嘴角到眼部水平线的距离
@@ -103,23 +104,24 @@ def find_peak_frame(landmarks_seq: List, frames_seq: List, w: int, h: int,
 
         left_dist = left_result["distance"]
         right_dist = right_result["distance"]
-        total_dist = left_dist + right_dist
+        mean_dist = 0.5 * (left_dist + right_dist)
+
 
         left_dist_seq.append(left_dist)
         right_dist_seq.append(right_dist)
-        total_dist_seq.append(total_dist)
+        mean_dist_seq.append(mean_dist)
 
-        if total_dist < min_total_dist:
-            min_total_dist = total_dist
+        if mean_dist < min_mean_dist:
+            min_mean_dist = mean_dist
             min_idx = i
 
     # 构建peak_debug字典
     peak_debug = {
         "left_dist": left_dist_seq,
         "right_dist": right_dist_seq,
-        "total_dist": total_dist_seq,
+        "mean_dist": mean_dist_seq,
         "peak_idx": min_idx,
-        "peak_value": float(min_total_dist) if np.isfinite(min_total_dist) else None,
+        "peak_value": float(min_mean_dist) if np.isfinite(min_mean_dist) else None,
         "selection_criterion": "min_total_eye_line_distance",
     }
 
@@ -189,13 +191,13 @@ def plot_smile_peak_selection(
 
     left_dist = peak_debug.get("left_dist", [])
     right_dist = peak_debug.get("right_dist", [])
-    total_dist = peak_debug.get("total_dist", [])
+    mean_dist = peak_debug.get("mean_dist", [])
     peak_idx = peak_debug.get("peak_idx", 0)
 
-    if not total_dist:
+    if not mean_dist:
         return
 
-    n_frames = len(total_dist)
+    n_frames = len(mean_dist)
     frames = np.arange(n_frames)
     time_sec = frames / fps if fps > 0 else frames
     x_label = 'Time (seconds)' if fps > 0 else 'Frame'
@@ -203,15 +205,14 @@ def plot_smile_peak_selection(
 
     plt.figure(figsize=(12, 6))
 
-    # 绘制左右距离和总距离
     plt.plot(time_sec, left_dist, 'b-', label='Left Eye-Line Distance', linewidth=2, alpha=0.6)
     plt.plot(time_sec, right_dist, 'r-', label='Right Eye-Line Distance', linewidth=2, alpha=0.6)
-    plt.plot(time_sec, total_dist, 'g-', label='Total Distance (Selection)', linewidth=2.5)
+    plt.plot(time_sec, mean_dist, 'g-', label='Mean Distance (Selection)', linewidth=2.5)
 
     # 标记峰值
     plt.axvline(x=peak_time, color='black', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Peak Frame {peak_idx}')
-    if 0 <= peak_idx < n_frames and np.isfinite(total_dist[peak_idx]):
-        peak_value = total_dist[peak_idx]
+    if 0 <= peak_idx < n_frames and np.isfinite(mean_dist[peak_idx]):
+        peak_value = mean_dist[peak_idx]
         plt.scatter([peak_time], [peak_value], color='red', s=150, zorder=5,
                     edgecolors='black', linewidths=1.5, marker='*',
                     label=f'Selected Peak (Dist: {peak_value:.1f})')
@@ -246,6 +247,15 @@ def compute_smile_metrics(landmarks, w: int, h: int,
     left_height_from_center = mouth_center_y - left_corner[1]  # 正值表示左嘴角较高
     right_height_from_center = mouth_center_y - right_corner[1]
 
+    # ========== 计算当前帧的嘴角到眼线距离（不需要基线）==========
+    left_eye_line_result = compute_mouth_corner_to_eye_line_distance(landmarks, w, h, left=True)
+    right_eye_line_result = compute_mouth_corner_to_eye_line_distance(landmarks, w, h, left=False)
+
+    left_dist = left_eye_line_result['distance']
+    right_dist = right_eye_line_result['distance']
+    avg_dist = (left_dist + right_dist) / 2
+    asymmetry = abs(left_dist - right_dist) / avg_dist
+
     metrics = {
         "mouth_width": mouth["width"],
         "mouth_height": mouth["height"],
@@ -259,10 +269,19 @@ def compute_smile_metrics(landmarks, w: int, h: int,
             "BOF": oral.BOF_angle,
             "diff": oral.angle_diff,
             "asymmetry": oral.angle_asymmetry,
+        },
+        # ========== 当前帧的嘴角到眼线距离（面瘫侧别判断用）==========
+        "eye_line_excursion": {
+            "left_distance": left_eye_line_result["distance"],
+            "right_distance": right_eye_line_result["distance"],
+            "eye_line_y": left_eye_line_result.get("eye_line_y"),
+            "left_corner": left_eye_line_result.get("corner"),
+            "right_corner": right_eye_line_result.get("corner"),
+            "asymmetry": asymmetry,
         }
     }
 
-    # 如果有基线，计算运动幅度（统一尺度）
+    # 如果有基线，计算运动幅度（用于严重程度判断）
     if baseline_landmarks is not None:
         # ========== 计算统一 scale（优化：传入预计算的 ICD）==========
         icd_current = compute_icd(landmarks, w, h)
@@ -307,9 +326,15 @@ def compute_smile_metrics(landmarks, w: int, h: int,
             "BOF_change": oral.BOF_angle - baseline_oral.BOF_angle,
         }
 
-        # ========== 计算嘴角到眼部水平线距离的变化 ==========
-        eye_line_excursion = compute_smile_excursion_by_eye_line(landmarks, w, h, baseline_landmarks)
-        metrics["eye_line_excursion"] = eye_line_excursion
+        # ========== 计算嘴角到眼部水平线距离的变化（用于严重程度）==========
+        eye_line_excursion_full = compute_smile_excursion_by_eye_line(landmarks, w, h, baseline_landmarks)
+        # 合并到现有的 eye_line_excursion 中
+        metrics["eye_line_excursion"].update({
+            "left_reduction": eye_line_excursion_full.get("left_reduction"),
+            "right_reduction": eye_line_excursion_full.get("right_reduction"),
+            "baseline_left_distance": eye_line_excursion_full.get("baseline_left_distance"),
+            "baseline_right_distance": eye_line_excursion_full.get("baseline_right_distance"),
+        })
 
     # ========== 嘴唇面中线对称性（用于面瘫侧别判断）==========
     lip_symmetry = compute_lip_midline_symmetry(landmarks, w, h)
@@ -322,16 +347,22 @@ def detect_palsy_side(smile_metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
     从微笑动作检测面瘫侧别 - 基于嘴角到眼线距离
 
-    核心逻辑:
-    - 微笑时嘴角上提，到眼线的距离减小
-    - 距离减小量小的一侧 = 嘴角上提弱 = 面瘫侧
-    - 或者：当前距离大的一侧 = 嘴角位置低 = 面瘫侧
+    核心改进:
+    ===========
+    面瘫侧别判断: 不需要基线！
+    - 直接比较当前帧左右嘴角到眼线的距离
+    - 距离大的一侧 = 嘴角位置低 = 上提弱 = 面瘫侧
+    - 这是因为微笑时健侧嘴角能上提到靠近眼睛，而患侧不能
+
+    严重程度判断: 需要基线（在compute_severity_score中处理）
+    - 比较嘴角上提的幅度（距离减小量）
+    - 减小量越小 = 上提越弱 = 越严重
     """
     result = {
         "palsy_side": 0,
         "confidence": 0.0,
         "interpretation": "",
-        "method": "",
+        "method": "eye_line_distance_direct",  # 标记方法
         "evidence": {}
     }
 
@@ -341,79 +372,49 @@ def detect_palsy_side(smile_metrics: Dict[str, Any]) -> Dict[str, Any]:
 
     exc = smile_metrics["eye_line_excursion"]
 
-    # 优先使用距离减小量（如果有基线）
-    left_reduction = exc.get("left_reduction", None)
-    right_reduction = exc.get("right_reduction", None)
-
-    if left_reduction is not None and right_reduction is not None:
-        effective_left = max(0, left_reduction)
-        effective_right = max(0, right_reduction)
-        max_reduction = max(effective_left, effective_right)
-
-        if max_reduction > 3:  # 有一定的微笑幅度
-            result["method"] = "eye_line_reduction"
-            result["evidence"]["left_reduction"] = left_reduction
-            result["evidence"]["right_reduction"] = right_reduction
-
-            asymmetry = abs(effective_left - effective_right) / max_reduction
-            result["evidence"]["reduction_asymmetry"] = asymmetry
-            result["confidence"] = min(1.0, asymmetry * 2)
-
-            if asymmetry < THR.SMILE_ASYM_SYMMETRIC:
-                result["palsy_side"] = 0
-                result["interpretation"] = (
-                    f"双侧嘴角上提对称 (L减小{left_reduction:.1f}px, R减小{right_reduction:.1f}px)"
-                )
-            elif effective_left < effective_right:
-                # 左侧距离减小量小 = 左嘴角上提弱 = 左侧面瘫
-                result["palsy_side"] = 1
-                result["interpretation"] = (
-                    f"左嘴角上提弱 (L减小{left_reduction:.1f}px < R减小{right_reduction:.1f}px) → 左侧面瘫"
-                )
-            else:
-                result["palsy_side"] = 2
-                result["interpretation"] = (
-                    f"右嘴角上提弱 (R减小{right_reduction:.1f}px < L减小{left_reduction:.1f}px) → 右侧面瘫"
-                )
-            return result
-
-    # 没有基线时，使用当前距离比较
+    # ========== 面瘫侧别判断：直接使用当前帧距离（不需要基线）==========
     left_dist = exc.get("left_distance", 0)
     right_dist = exc.get("right_distance", 0)
 
-    if left_dist > 0 or right_dist > 0:
-        result["method"] = "eye_line_distance"
-        result["evidence"]["left_distance"] = left_dist
-        result["evidence"]["right_distance"] = right_dist
+    if left_dist <= 0 and right_dist <= 0:
+        result["interpretation"] = "无有效距离数据"
+        return result
 
-        avg_dist = (left_dist + right_dist) / 2
-        if avg_dist > 1:
-            asymmetry = abs(left_dist - right_dist) / avg_dist
-            result["evidence"]["distance_asymmetry"] = asymmetry
-            result["confidence"] = min(1.0, asymmetry * 3)
+    result["evidence"]["left_distance"] = left_dist
+    result["evidence"]["right_distance"] = right_dist
 
-            if asymmetry < THR.SMILE_ASYM_SYMMETRIC:
-                result["palsy_side"] = 0
-                result["interpretation"] = (
-                    f"双侧嘴角到眼线距离对称 (L={left_dist:.1f}px, R={right_dist:.1f}px, "
-                    f"不对称{asymmetry:.1%})"
-                )
-            elif left_dist > right_dist:
-                # 左嘴角距离大（位置低，上提少）→ 左侧面瘫
-                result["palsy_side"] = 1
-                result["interpretation"] = (
-                    f"左嘴角距离大 (L={left_dist:.1f}px > R={right_dist:.1f}px, "
-                    f"不对称{asymmetry:.1%}) → 左侧面瘫"
-                )
-            else:
-                result["palsy_side"] = 2
-                result["interpretation"] = (
-                    f"右嘴角距离大 (R={right_dist:.1f}px > L={left_dist:.1f}px, "
-                    f"不对称{asymmetry:.1%}) → 右侧面瘫"
-                )
-            return result
+    # 计算不对称度
+    avg_dist = (left_dist + right_dist) / 2
+    if avg_dist < 1:
+        result["interpretation"] = "距离数据过小"
+        return result
 
-    result["interpretation"] = "无有效数据"
+    asymmetry = abs(left_dist - right_dist) / avg_dist
+    result["evidence"]["distance_asymmetry"] = asymmetry
+    result["confidence"] = min(1.0, asymmetry * 3)
+
+    # 判断面瘫侧别
+    if asymmetry < THR.SMILE_ASYM_SYMMETRIC:
+        result["palsy_side"] = 0
+        result["interpretation"] = (
+            f"双侧嘴角位置对称 (L={left_dist:.1f}px, R={right_dist:.1f}px, "
+            f"不对称{asymmetry:.1%}) → 无面瘫"
+        )
+    elif left_dist > right_dist:
+        # 左嘴角到眼线距离更大 = 左嘴角位置更低 = 左嘴角上提弱 = 左侧面瘫
+        result["palsy_side"] = 1
+        result["interpretation"] = (
+            f"左嘴角位置低 (L={left_dist:.1f}px > R={right_dist:.1f}px, "
+            f"不对称{asymmetry:.1%}) → 左侧面瘫"
+        )
+    else:
+        # 右嘴角到眼线距离更大 = 右嘴角位置更低 = 右侧面瘫
+        result["palsy_side"] = 2
+        result["interpretation"] = (
+            f"右嘴角位置低 (R={right_dist:.1f}px > L={left_dist:.1f}px, "
+            f"不对称{asymmetry:.1%}) → 右侧面瘫"
+        )
+
     return result
 
 
@@ -421,52 +422,62 @@ def compute_severity_score(smile_metrics: Dict[str, Any]) -> Tuple[int, str]:
     """
     计算动作严重度分数(医生标注标准)
 
-    计算依据: 嘴角到眼线距离的不对称度
+    核心逻辑:
+    ===========
+    严重程度需要基线来判断:
+    - 比较嘴角上提的幅度（距离减小量）
+    - 减小量越小 = 上提越弱 = 越严重
+
+    如果没有基线，回退到当前距离的不对称度
     """
-    if "eye_line_excursion" in smile_metrics:
-        exc = smile_metrics["eye_line_excursion"]
+    if "eye_line_excursion" not in smile_metrics:
+        return 1, "无有效数据"
 
-        # 优先使用距离减小量的不对称度
-        left_reduction = exc.get("left_reduction", None)
-        right_reduction = exc.get("right_reduction", None)
+    exc = smile_metrics["eye_line_excursion"]
 
-        if left_reduction is not None and right_reduction is not None:
-            effective_left = max(0, left_reduction)
-            effective_right = max(0, right_reduction)
-            max_reduction = max(effective_left, effective_right)
+    # ========== 优先使用距离减小量（需要基线）==========
+    left_reduction = exc.get("left_reduction", None)
+    right_reduction = exc.get("right_reduction", None)
 
-            if max_reduction > 3:
-                asymmetry = abs(effective_left - effective_right) / max_reduction
+    if left_reduction is not None and right_reduction is not None:
+        # 有效的运动幅度
+        effective_left = max(0, left_reduction)
+        effective_right = max(0, right_reduction)
+        max_reduction = max(effective_left, effective_right)
 
-                if asymmetry < 0.08:
-                    return 1, f"正常 (不对称度{asymmetry:.2%})"
-                elif asymmetry < 0.18:
-                    return 2, f"轻度异常 (不对称度{asymmetry:.2%})"
-                elif asymmetry < 0.30:
-                    return 3, f"中度异常 (不对称度{asymmetry:.2%})"
-                elif asymmetry < 0.45:
-                    return 4, f"重度异常 (不对称度{asymmetry:.2%})"
-                else:
-                    return 5, f"完全面瘫 (不对称度{asymmetry:.2%})"
+        if max_reduction > 3:  # 有一定的微笑幅度
+            asymmetry = abs(effective_left - effective_right) / max_reduction
 
-        # 回退到当前距离
-        left_dist = exc.get("left_distance", 0)
-        right_dist = exc.get("right_distance", 0)
-
-        avg_dist = (left_dist + right_dist) / 2
-        if avg_dist > 1:
-            asymmetry = abs(left_dist - right_dist) / avg_dist
-
-            if asymmetry < 0.03:
-                return 1, f"正常 (不对称度{asymmetry:.1%})"
-            elif asymmetry < 0.08:
-                return 2, f"轻度异常 (不对称度{asymmetry:.1%})"
-            elif asymmetry < 0.15:
-                return 3, f"中度异常 (不对称度{asymmetry:.1%})"
-            elif asymmetry < 0.25:
-                return 4, f"重度异常 (不对称度{asymmetry:.1%})"
+            # 根据不对称度判断严重程度
+            if asymmetry < 0.08:
+                return 1, f"正常 (不对称度{asymmetry:.2%})"
+            elif asymmetry < 0.18:
+                return 2, f"轻度异常 (不对称度{asymmetry:.2%})"
+            elif asymmetry < 0.30:
+                return 3, f"中度异常 (不对称度{asymmetry:.2%})"
+            elif asymmetry < 0.45:
+                return 4, f"重度异常 (不对称度{asymmetry:.2%})"
             else:
-                return 5, f"完全面瘫 (不对称度{asymmetry:.1%})"
+                return 5, f"完全面瘫 (不对称度{asymmetry:.2%})"
+
+    # ========== 没有基线时，回退到当前距离的不对称度 ==========
+    left_dist = exc.get("left_distance", 0)
+    right_dist = exc.get("right_distance", 0)
+
+    avg_dist = (left_dist + right_dist) / 2
+    if avg_dist > 1:
+        asymmetry = abs(left_dist - right_dist) / avg_dist
+
+        if asymmetry < 0.03:
+            return 1, f"正常 (距离不对称{asymmetry:.1%})"
+        elif asymmetry < 0.08:
+            return 2, f"轻度异常 (距离不对称{asymmetry:.1%})"
+        elif asymmetry < 0.15:
+            return 3, f"中度异常 (距离不对称{asymmetry:.1%})"
+        elif asymmetry < 0.25:
+            return 4, f"重度异常 (距离不对称{asymmetry:.1%})"
+        else:
+            return 5, f"完全面瘫 (距离不对称{asymmetry:.1%})"
 
     return 1, "无有效数据"
 
@@ -547,7 +558,7 @@ def visualize_smile(frame: np.ndarray, landmarks, w: int, h: int,
             # 标注距离
             mid_y = (ly + int(eye_line_y)) // 2
             cv2.putText(img, f"L:{left_dist:.0f}", (lx - 60, mid_y),
-                        FONT, 0.5, (255, 0, 0), 2)
+                        FONT, 1, (255, 0, 0), 2)
 
         if right_corner is not None and eye_line_y is not None:
             rx, ry = int(right_corner[0]), int(right_corner[1])
@@ -557,7 +568,8 @@ def visualize_smile(frame: np.ndarray, landmarks, w: int, h: int,
             # 标注距离
             mid_y = (ry + int(eye_line_y)) // 2
             cv2.putText(img, f"R:{right_dist:.0f}", (rx + 10, mid_y),
-                        FONT, 0.5, (0, 0, 255), 2)
+                        FONT, 1, (0, 0, 255), 2)
+
 
     # 绘制嘴角点
     if result.oral_angle:
@@ -591,15 +603,14 @@ def visualize_smile(frame: np.ndarray, landmarks, w: int, h: int,
                 FONT, FONT_SCALE_NORMAL, (255, 255, 255), THICKNESS_NORMAL)
     y += LINE_HEIGHT
 
-    asym = oral_angle.get('asymmetry', 0)
-    asym_color = (0, 255, 0) if asym < 5 else ((0, 165, 255) if asym < 10 else (0, 0, 255))
-    cv2.putText(img, f"Asymmetry: {asym:.1f} deg", (25, y),
-                FONT, FONT_SCALE_NORMAL, asym_color, THICKNESS_NORMAL)
-    y += LINE_HEIGHT + 10
-
     # 嘴角到眼线距离
     if "eye_line_excursion" in smile_metrics:
         exc = smile_metrics["eye_line_excursion"]
+        asym = exc.get("asymmetry", 0)
+        asym_color = (0, 255, 0) if asym < 5 else ((0, 165, 255) if asym < 10 else (0, 0, 255))
+        cv2.putText(img, f"Asymmetry: {asym:.1f} deg", (25, y),
+                    FONT, FONT_SCALE_NORMAL, asym_color, THICKNESS_NORMAL)
+        y += LINE_HEIGHT + 10
         cv2.putText(img, "=== Corner-to-EyeLine ===", (25, y),
                     FONT, FONT_SCALE_NORMAL, (0, 255, 255), THICKNESS_NORMAL)
         y += LINE_HEIGHT
@@ -678,7 +689,7 @@ def process(landmarks_seq: List, frames_seq: List, w: int, h: int,
     # 计算微笑特有指标
     smile_metrics = compute_smile_metrics(peak_landmarks, w, h, baseline_landmarks)
 
-    # 检测面瘫侧别
+    # 检测面瘫侧别（不需要基线！）
     palsy_detection = detect_palsy_side(smile_metrics)
 
     # 检测联动

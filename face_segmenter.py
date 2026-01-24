@@ -256,8 +256,8 @@ def main():
     测试脚本 - 批量处理keyframes + 更新数据库中的 segmented 路径
     """
     # 配置路径
-    KEYFRAMES_DIR = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes")
-    OUTPUT_DIR = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes_segmented")
+    KEYFRAMES_DIR = Path("/Users/cuijinglei/Documents/facial_palsy/HGFA/keyframes")
+    OUTPUT_DIR = Path("/Users/cuijinglei/Documents/facial_palsy/HGFA/keyframes_segmented")
     MODEL_PATH = "/Users/cuijinglei/PycharmProjects/medicalProject/models/selfie_multiclass_256x256.tflite"
     DB_PATH = "facialPalsy.db"
 

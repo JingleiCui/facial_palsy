@@ -467,15 +467,15 @@ def import_metadata(
 
     if stats['videos_updated'] > 0 or stats['features_deleted'] > 0:
         print("💡 提示:")
-        print("   部分视频的时间段已更新,建议运行 video_pipeline.py 重新提取特征")
+        print("   update_mode=部分视频的时间段已更新,建议运行 video_pipeline.py 重新提取特征")
         print()
 
 
 if __name__ == '__main__':
     import_metadata(
         db_path='facialPalsy.db',
-        videos_base_path='/Users/cuijinglei/Documents/facialPalsy/videos',
+        videos_base_path='/Users/cuijinglei/Documents/facial_palsy/videos',
         update_mode='smart',
-        start_patient_id='XW000427',  # 指定开始
-        end_patient_id='XW000437'  # 指定结束
+        start_patient_id='XW000001',  # 指定开始
+        end_patient_id='XW000555'  # 指定结束
     )

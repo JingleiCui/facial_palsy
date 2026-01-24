@@ -362,7 +362,7 @@ class WrinkleBatchProcessor:
 def main():
     # 请根据实际情况修改路径
     DB_PATH = 'facialPalsy.db'
-    WRINKLE_OUTPUT_ROOT = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes_wrinkles")
+    WRINKLE_OUTPUT_ROOT = Path("/Users/cuijinglei/Documents/facial_palsy/HGFA/keyframes_wrinkles")
     MODEL_PATH = "/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"
 
     processor = WrinkleBatchProcessor(

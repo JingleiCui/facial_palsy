@@ -1139,7 +1139,7 @@ def main():
     # 基本路径配置 - 根据实际环境修改
     db_path = 'facialPalsy.db'
     model_path = '/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task'
-    keyframe_dir = '/Users/cuijinglei/Documents/facialPalsy/HGFA/keyframes_new'
+    keyframe_dir = '/Users/cuijinglei/Documents/facial_palsy/HGFA/keyframes_new'
     os.makedirs(keyframe_dir, exist_ok=True)
 
     # 运行模式

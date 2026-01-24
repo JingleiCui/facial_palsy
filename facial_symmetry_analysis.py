@@ -1645,7 +1645,7 @@ def main():
     )
 
     analyzer.batch_process_database(
-        output_dir='/Users/cuijinglei/Documents/facialPalsy/HGFA/symmetry_analysis',
+        output_dir='/Users/cuijinglei/Documents/facial_palsy/HGFA/symmetry_analysis',
         limit=None,
         action_filter=None,
         use_multiprocessing=True,

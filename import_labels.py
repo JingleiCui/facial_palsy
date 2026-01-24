@@ -394,7 +394,7 @@ def import_labels(
 if __name__ == '__main__':
     import_labels(
         db_path='facialPalsy.db',
-        excel_path='/Users/cuijinglei/Documents/facialPalsy/notes/HospitalLabels/labels.xlsx',
+        excel_path='/Users/cuijinglei/Documents/facial_palsy/notes/HospitalLabels/labels.xlsx',
         sheet_name='labels',
         reset_tables=True
     )

@@ -61,7 +61,7 @@ import shrug_nose
 
 DATABASE_PATH = r"/Users/cuijinglei/PycharmProjects/medicalProject/facial_palsy/facialPalsy.db"
 MEDIAPIPE_MODEL_PATH = r"/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"
-OUTPUT_DIR = r"/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading"
+OUTPUT_DIR = r"/Users/cuijinglei/Documents/facial_palsy/HGFA/clinical_grading"
 PATIENT_LIMIT = None
 TARGET_EXAM_ID = None
 
@@ -75,7 +75,7 @@ TARGET_EXAM_IDS = []
 
 ENABLED_ACTIONS = [
 "NeutralFace",
-"ShrugNose",
+"LipPucker",
 ]
 
 # ENABLED_ACTIONS = [

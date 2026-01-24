@@ -1317,7 +1317,7 @@ def main():
     # ========= 路径配置 =========
     db_path = "/facial_palsy/facialPalsy.db"
     model_path = "/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"
-    output_dir = "/Users/cuijinglei/Documents/facialPalsy/HGFA/symmetry_pose_robust_3d"
+    output_dir = "/Users/cuijinglei/Documents/facial_palsy/HGFA/symmetry_pose_robust_3d"
     # ============================
 
     analyzer = FacialSymmetryAnalyzer3D(

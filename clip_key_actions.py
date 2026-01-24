@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 
 # ========== 配置区 ==========
-BASE_DIR = "/Users/cuijinglei/Documents/facialPalsy/videos"  # 数据根目录
+BASE_DIR = "/Users/cuijinglei/Documents/facial_palsy/videos"  # 数据根目录
 
 START_PATIENT_ID = "XW000427"  # 设置为 None 则不限制
 END_PATIENT_ID = "XW000437"    # 设置为 None 则不限制

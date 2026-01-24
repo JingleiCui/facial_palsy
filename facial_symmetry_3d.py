@@ -605,7 +605,7 @@ def main():
     # ⚠️ 这里按你本地环境改路径
     DB_PATH = "/facial_palsy/facialPalsy.db"
     MODEL_PATH = "/Users/cuijinglei/PycharmProjects/medicalProject/models/face_landmarker.task"
-    OUT_DIR = "/Users/cuijinglei/Documents/facialPalsy/HGFA/symmetry_pnp"
+    OUT_DIR = "/Users/cuijinglei/Documents/facial_palsy/HGFA/symmetry_pnp"
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()

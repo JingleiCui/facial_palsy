@@ -11,7 +11,6 @@ collect_keyframes.py
 3. 生成错误案例分析报告
 4. 支持阈值边界案例识别
 
-运行方式：PyCharm 直接点运行即可
 """
 
 import json
@@ -25,12 +24,13 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 
 # =============================================================================
 # 配置
 # =============================================================================
-SRC_ROOT = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading")
-DST_ROOT = Path("/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading_debug")
+SRC_ROOT = Path("/Users/cuijinglei/Documents/facial_palsy/HGFA/clinical_grading")
+DST_ROOT = Path("/Users/cuijinglei/Documents/facial_palsy/HGFA/clinical_grading_debug")
 
 # 11个标准动作
 ACTIONS = [
@@ -2668,8 +2668,6 @@ def setup_matplotlib_chinese_font():
     except Exception:
         pass
 
-    from matplotlib import font_manager
-
     # Mac / Windows / Linux 常见中文字体候选
     preferred = [
         "PingFang SC",        # macOS
@@ -2716,7 +2714,7 @@ def main():
 
     for exam_dir in find_exam_dirs(SRC_ROOT):
         total_exam += 1
-        c, s, records, session_record = collect_one_exam(exam_dir)  # 修改：解包4个值
+        c, s, records, session_record = collect_one_exam(exam_dir)
         total_copied += c
         total_skipped += s
         all_palsy_records.extend(records)
@@ -2745,7 +2743,7 @@ def main():
     stats = compute_statistics(all_palsy_records)
 
     # 打印统计摘要
-    print(f"\n{'Action':<20} {'Total':>5} {'OK':>5} {'WRONG':>6} {'FN':>4} {'Strict':>8} {'Relaxed':>8}")
+    print(f"\n{'Action':<20} {'Total':>5} {'OK':>5} {'WRONG':>6} {'FN':>4} {'FP':>4} {'Strict':>8} {'Relaxed':>8}")
     print("-" * 65)
 
     for action in ACTIONS:
@@ -2754,14 +2752,15 @@ def main():
             strict_acc = f"{s['side_accuracy']:.1%}" if s['side_accuracy'] is not None else "N/A"
             relaxed_acc = f"{s['relaxed_accuracy']:.1%}" if s['relaxed_accuracy'] is not None else "N/A"
             print(
-                f"{action:<20} {s['total']:>5} {s['OK']:>5} {s['WRONG']:>6} {s['FN']:>4} {strict_acc:>8} {relaxed_acc:>8}")
+                f"{action:<20} {s['total']:>5} {s['OK']:>5} {s['WRONG']:>6} {s['FN']:>4} {s['FP']:>4} {strict_acc:>8} {relaxed_acc:>8}")
 
     # 打印汇总
-    print("-" * 65)
+    print("-" * 70)
     total_ok = sum(stats[a]["OK"] for a in stats if a != "NeutralFace")
     total_wrong = sum(stats[a]["WRONG"] for a in stats if a != "NeutralFace")
     total_fn = sum(stats[a]["FN"] for a in stats if a != "NeutralFace")
     total_palsy = total_ok + total_wrong + total_fn
+    total_fp = sum(stats[a]["FP"] for a in stats if a != "NeutralFace")
 
     if total_palsy > 0:
         overall_strict = total_ok / total_palsy

@@ -10,8 +10,8 @@ from typing import Dict, List, Any
 import numpy as np
 
 
-ERROR_PATH = "/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading_debug/error_cases/error_cases.json"
-OUT_PATH = "/Users/cuijinglei/Documents/facialPalsy/HGFA/clinical_grading_debug/error_cases/error_analysis_summary.json"
+ERROR_PATH = "/Users/cuijinglei/Documents/facial_palsy/HGFA/clinical_grading_debug/error_cases/error_cases.json"
+OUT_PATH = "/Users/cuijinglei/Documents/facial_palsy/HGFA/clinical_grading_debug/error_cases/error_analysis_summary.json"
 
 def load_error_cases(filepath: str) -> Dict[str, List[Dict]]:
     """加载错误案例"""

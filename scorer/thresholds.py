@@ -115,7 +115,7 @@ class Thresholds:
     LIP_PUCKER_CORNER_ASYM_SEVERE: float = 0.50
 
     # 嘴角收缩不对称阈值 - 降低以提高敏感度
-    LIP_PUCKER_PALSY_ASYMMETRY_THRESHOLD: float = 0.06  # 6%差异判定不对称
+    LIP_PUCKER_PALSY_ASYMMETRY_THRESHOLD: float = 0.04  # %差异判定不对称
 
     # 最小收缩量阈值 - 降低以捕获更多运动
     LIP_PUCKER_PALSY_MIN_CONTRACTION: float = 1.0  # 1px即可分析
@@ -213,7 +213,7 @@ class Thresholds:
     RAISE_EYEBROW_SMOOTH_WIN: int = 5
 
     # 面瘫检测阈值
-    RAISE_EYEBROW_ASYM_NORMAL: float = 0.08  # 不对称 < 10% 正常
+    RAISE_EYEBROW_ASYM_NORMAL: float = 0.01  # 不对称 < % 正常
 
     # 严重度分级
     RAISE_EYEBROW_CHANGE_SEVERE: float = 0.20
@@ -233,7 +233,7 @@ class Thresholds:
     SMILE_SYMMETRY: float = 0.20
 
     # 面瘫检测阈值
-    SMILE_ASYM_SYMMETRIC: float = 0.08  # 不对称 < 15% 对称
+    SMILE_ASYM_SYMMETRIC: float = 0.009  # 不对称 < % 对称
 
     # 严重度分级 (基于嘴角上提不对称)
     SMILE_ASYM_TRACE: float = 0.02  # < 2% 完美
